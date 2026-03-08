@@ -3,12 +3,25 @@ from dotenv import dotenv_values, load_dotenv
 
 print("Loading .env file...")
 env_path = os.path.join(os.path.dirname(__file__), '.env')
+
+
+def _mask_secret(key, value):
+    if value is None:
+        return value
+    upper_key = key.upper()
+    if any(token in upper_key for token in ['API_KEY', 'AK', 'SK']):
+        if len(value) <= 8:
+            return '*' * len(value)
+        return f"{value[:4]}...{value[-4:]}"
+    return value
+
+
 if os.path.exists(env_path):
     env_dict = dotenv_values(env_path)
     
     print("Environment variables to be loaded:")
     for key, value in env_dict.items():
-        print(f"{key}={value}")
+        print(f"{key}={_mask_secret(key, value)}")
     print("-" * 50)
     
     os.environ.update(env_dict)
@@ -56,6 +69,11 @@ API_SETTINGS = {
         'base_url': os.getenv('GPT_BASE_URL', ''),
         'api_key': os.getenv('GPT_API_KEY', ''),
         'proxies': os.getenv('GPT_PROXIES', ''),
+        'reasoning_effort': os.getenv('GPT_REASONING_EFFORT', ''),
+        'temperature': os.getenv('GPT_TEMPERATURE', ''),
+        'top_p': os.getenv('GPT_TOP_P', ''),
+        'timeout': float(os.getenv('GPT_TIMEOUT_SECONDS', 3600)),
+        'max_retries': int(os.getenv('GPT_MAX_RETRIES', 3)),
         'available_models': os.getenv('GPT_AVAILABLE_MODELS', '').split(','),
         'max_tokens': 4096,
     },

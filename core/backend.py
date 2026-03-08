@@ -70,7 +70,7 @@ def call_write_long_novel(writer, setting):
                     'eval': 'call_accept(writer, setting)',
                 },
                 {
-                    'eval': 'call_write(writer, setting, True, "对整个情节进行重写，使其更加有故事性。")',
+                    'eval': 'call_write(writer, setting, False, "对整个情节进行重写，使其更加有故事性。")',
                     'title': '创作大纲',
                     'subtitle': '润色大纲',
                 },
@@ -88,7 +88,7 @@ def call_write_long_novel(writer, setting):
                     'eval': 'call_accept(writer, setting)',
                 },
                 {
-                    'eval': 'call_write(writer, setting, True, "对情节进行重写，使其有更多的剧情细节，同时更加有具有故事性。")',
+                    'eval': 'call_write(writer, setting, False, "对情节进行重写，使其有更多的剧情细节，同时更加有具有故事性。")',
                     'title': '创作剧情',
                     'subtitle': '扩充剧情',
                 },
@@ -106,7 +106,7 @@ def call_write_long_novel(writer, setting):
                     'eval': 'call_accept(writer, setting)',
                 },
                 {
-                    'eval': 'call_write(writer, setting, True, "润色正文")',
+                    'eval': 'call_write(writer, setting, False, "润色正文")',
                     'title': '创作正文',
                     'subtitle': '润色正文'
                 },

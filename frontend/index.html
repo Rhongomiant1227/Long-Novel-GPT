@@ -13,7 +13,14 @@
     <link rel="stylesheet" href="styles/novel_select.css">
     <link rel="stylesheet" href="styles/settings.css">
     <link rel="stylesheet" href="styles/bottom_bar.css">
-    <script>window._env_ = window._env_ || {}; window._env_.SERVER_URL = "/api" || "http://127.0.0.1:7869";</script>
+    <script>
+        window._env_ = window._env_ || {};
+        window._env_.SERVER_URL = window._env_.SERVER_URL || (
+            (window.location.protocol === 'file:' || ((window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost') && window.location.port && window.location.port !== '80' && window.location.port !== '443'))
+                ? 'http://127.0.0.1:7869'
+                : '/api'
+        );
+    </script>
 </head>
 <body>
     <div class="container">

@@ -89,6 +89,11 @@ def stream_chat(model_config: ModelConfig, messages: list, response_json=False) 
             api_key=model_config['api_key'],
             base_url=model_config.get('base_url'),
             proxies=model_config.get('proxies'),
+            reasoning_effort=model_config.get('reasoning_effort'),
+            temperature=model_config.get('temperature'),
+            top_p=model_config.get('top_p'),
+            timeout=model_config.get('timeout'),
+            max_retries=model_config.get('max_retries'),
             max_tokens=model_config['max_tokens'],
             response_json=response_json
         )
