@@ -99,6 +99,7 @@ const WINDOW_SIZES = {
 function updateWindowSizeOptions(mode) {
     const windowSizeSelect = document.querySelector('.context-window-select');
     windowSizeSelect.innerHTML = '';
+    if (!WINDOW_SIZES[mode]) return;
     
     WINDOW_SIZES[mode].forEach(size => {
         const option = document.createElement('option');
@@ -113,22 +114,55 @@ function initModeHandlers() {
     const leftHeader = document.querySelector('.left-header');
     const rightHeader = document.querySelector('.right-header');
     const modeTabs = document.querySelectorAll('.mode-tab');
+    const manualSections = document.querySelectorAll('.prompt-section, .guide-section, .examples-section, .content-section');
+    const chapterSelection = document.querySelector('.chapter-selection');
+
+    function setManualSectionsVisible(visible) {
+        manualSections.forEach(section => {
+            section.style.display = visible ? '' : 'none';
+        });
+    }
+
+    function showAutoMode() {
+        setManualSectionsVisible(false);
+        chapterSelection.style.display = 'none';
+        window.autoNovelGui?.show();
+    }
+
+    function hideAutoMode() {
+        window.autoNovelGui?.hide();
+        setManualSectionsVisible(true);
+    }
 
     // 初始化时设置第一个非novel tab为active
-    const firstNonNovelTab = Array.from(modeTabs).find(tab => !['novel', 'settings'].includes(tab.dataset.value));
+    const firstNonNovelTab = Array.from(modeTabs).find(tab => !['novel', 'settings', 'auto'].includes(tab.dataset.value));
     if (firstNonNovelTab) {
         firstNonNovelTab.classList.add('active');
         writeMode.value = firstNonNovelTab.dataset.value;
         updateWindowSizeOptions(firstNonNovelTab.dataset.value);
     }
+    hideAutoMode();
 
     modeTabs.forEach(tab => {
         tab.addEventListener('click', () => {
             const newMode = tab.dataset.value;
+            const currentMode = writeMode.value;
 
             // 调用content_section.js的处理函数
             if (!window.handleContentModeChange(newMode)) {
                 showToast('请先处理所有创作', 'warning');
+                return;
+            }
+
+            if (currentMode === 'auto' && newMode !== 'auto') {
+                hideAutoMode();
+            }
+
+            if (newMode === 'auto') {
+                modeTabs.forEach(t => t.classList.remove('active'));
+                tab.classList.add('active');
+                writeMode.value = newMode;
+                showAutoMode();
                 return;
             }
             
@@ -156,9 +190,8 @@ function initModeHandlers() {
             }
 
             // Save current state
-            const currentMode = writeMode.value;
             let currentChapter = currentMode === 'outline' ? null : document.getElementById('chapterSelect').value;
-            if (!['novel', 'settings'].includes(currentMode)) {
+            if (!['novel', 'settings', 'auto'].includes(currentMode)) {
                 const currentChunks = Array.from(document.querySelectorAll('.chunk-container')).map(chunk => [
                     chunk.querySelector('.x-input').value,
                     chunk.querySelector('.y-input').value,
@@ -191,7 +224,7 @@ function initModeHandlers() {
             if (['settings', ].includes(currentMode)) return;
             
             // 更新章节选择器
-            document.querySelector('.chapter-selection').style.display = 
+            chapterSelection.style.display = 
                 newMode === 'outline' ? 'none' : 'block';
             
 
@@ -262,6 +295,7 @@ function initPromptHandlers() {
 function updatePromptOptions(mode) {
     const promptSelect = document.querySelector('.prompt-actions .select-wrapper select');
     promptSelect.innerHTML = '';
+    if (!prompts || !prompts[mode]) return;
     
     if (prompts && prompts[mode]) {
         // Use prompt_names array for ordering if available, otherwise fallback to Object.keys

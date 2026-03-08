@@ -96,6 +96,7 @@ class AutoNovelRunner:
         self.manuscript_dir = ensure_dir(self.project_dir / 'manuscript')
         self.state_path = self.project_dir / 'state.json'
         self.events_path = self.logs_dir / 'events.log'
+        self.live_stage_path = self.logs_dir / 'live_stage.json'
         self.brief_path = self.project_dir / 'brief.md'
         self.full_manuscript_path = self.manuscript_dir / 'full_novel.txt'
         self.series_bible_path = self.memory_dir / 'series_bible.md'
@@ -109,6 +110,8 @@ class AutoNovelRunner:
         self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, name='auto_novel_heartbeat', daemon=True)
         self._heartbeat_error_logged = False
         self._last_heartbeat_write_ts = 0.0
+        self._last_live_stage_write_ts = 0.0
+        self._last_live_stage_payload_key = ''
         self._live_stream_available = True
         self._live_stream_error_logged = False
 
@@ -138,6 +141,12 @@ class AutoNovelRunner:
         self.state = self._load_or_init_state()
         self._sync_manuscript()
         self._write_heartbeat(force=True)
+        self._write_live_stage_snapshot(
+            label=self.state.get('current_stage', ''),
+            full_text='',
+            force=True,
+            finish=not bool(self.state.get('current_stage')),
+        )
         self._heartbeat_thread.start()
 
     def _build_logger(self) -> logging.Logger:
@@ -218,9 +227,76 @@ class AutoNovelRunner:
                 self._live_stream_error_logged = True
                 self.log(f'[live_stream] 控制台实时输出已关闭：{exc}')
 
+    def _extract_stage_chapter_number(self, label: str) -> int | None:
+        if not label:
+            return None
+        match = re.search('\u7b2c\\s*(\\d+)\\s*\u7ae0', label)
+        if match:
+            return int(match.group(1))
+        match = re.search(r'ch[_-]?(\d+)', label, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        return None
+
+    def _infer_stage_type(self, label: str) -> str:
+        lower_label = (label or '').lower()
+        if '正文' in label or 'draft' in lower_label:
+            return 'draft'
+        if '剧情' in label or 'plot' in lower_label:
+            return 'plot'
+        if '章节' in label or '大纲' in label or 'outline' in lower_label:
+            return 'outline'
+        if '设定' in label or '圣经' in label or 'bible' in lower_label:
+            return 'series_bible'
+        if '记忆' in label or 'memory' in lower_label:
+            return 'memory'
+        if '摘要' in label or '总结' in label or 'summary' in lower_label:
+            return 'summary'
+        if '规划' in label or '计划' in label or 'plan' in lower_label:
+            return 'plan'
+        return 'llm'
+
+    def _write_live_stage_snapshot(
+        self,
+        label: str,
+        full_text: str,
+        *,
+        reset: bool = False,
+        finish: bool = False,
+        force: bool = False,
+    ) -> None:
+        snapshot = {
+            'project': self.project_dir.name,
+            'label': label,
+            'stage_type': self._infer_stage_type(label),
+            'chapter_number': self._extract_stage_chapter_number(label),
+            'text': full_text or '',
+            'text_length': len(full_text or ''),
+            'active': bool(label) and not finish,
+            'finished': finish,
+            'reset': reset,
+            'status': self.state.get('status', ''),
+            'generated_chapters': self.state.get('generated_chapters', 0),
+            'generated_chars': self.state.get('generated_chars', 0),
+            'updated_at': now_str(),
+        }
+        payload_key = json.dumps({k: v for k, v in snapshot.items() if k != 'updated_at'}, ensure_ascii=False, sort_keys=True)
+        current_time = time.time()
+        if not force:
+            if payload_key == self._last_live_stage_payload_key and current_time - self._last_live_stage_write_ts < 0.4:
+                return
+            if current_time - self._last_live_stage_write_ts < 0.4 and not reset and not finish:
+                return
+        try:
+            tmp_path = self.live_stage_path.with_suffix('.json.tmp')
+            tmp_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding='utf-8')
+            tmp_path.replace(self.live_stage_path)
+            self._last_live_stage_write_ts = current_time
+            self._last_live_stage_payload_key = payload_key
+        except Exception as exc:
+            self._log_event_only(f'[live_stage] 写入失败：{exc}')
+
     def _stream_text(self, label: str, full_text: str, reset: bool = False, finish: bool = False) -> None:
-        if not self.args.live_stream:
-            return
 
         full_text = full_text or ''
         if reset or label not in self._stream_cache:
@@ -236,6 +312,9 @@ class AutoNovelRunner:
         if delta:
             self.live_print(delta)
             self._stream_cache[label] = full_text
+
+        if reset or delta or finish:
+            self._write_live_stage_snapshot(label, self._stream_cache.get(label, full_text), reset=reset, finish=finish)
 
         if finish and label in self._stream_cache:
             if self._stream_cache[label] and not self._stream_cache[label].endswith('\n'):
@@ -319,6 +398,7 @@ class AutoNovelRunner:
             self.state['last_stage_heartbeat_at'] = now_str()
             self._save_state()
             self._write_heartbeat(force=True)
+            self._write_live_stage_snapshot(label, self._stream_cache.get(label, ''), reset=True, force=True)
             self._last_stage_state_save_ts = current_time
             return
 
@@ -330,11 +410,13 @@ class AutoNovelRunner:
 
     def clear_stage(self) -> None:
         if self.state.get('current_stage') or self.state.get('stage_started_at') or self.state.get('last_stage_heartbeat_at'):
+            previous_label = self.state.get('current_stage', '')
             self.state['current_stage'] = ''
             self.state['stage_started_at'] = ''
             self.state['last_stage_heartbeat_at'] = now_str()
             self._save_state()
             self._write_heartbeat(force=True)
+            self._write_live_stage_snapshot(previous_label, self._stream_cache.get(previous_label, ''), finish=True, force=True)
             self._last_stage_state_save_ts = time.time()
 
     def _sync_manuscript(self) -> None:

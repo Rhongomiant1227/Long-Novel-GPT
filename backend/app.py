@@ -20,11 +20,13 @@ from core.outline_writer import OutlineWriter
 
 from setting import setting_bp
 from summary import process_novel
+from auto_novel_gui import auto_novel_gui_bp
 from backend_utils import get_model_config_from_provider_model
 from config import MAX_NOVEL_SUMMARY_LENGTH, MAX_THREAD_NUM, ENABLE_ONLINE_DEMO
 
 
 app.register_blueprint(setting_bp)
+app.register_blueprint(auto_novel_gui_bp)
 
 # 添加配置
 BACKEND_HOST = os.environ.get('BACKEND_HOST', '0.0.0.0')
