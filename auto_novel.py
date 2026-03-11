@@ -88,6 +88,9 @@ def parse_completion_report(text: str) -> dict:
         'missing': [],
         'remaining_chapters': 0,
         'remaining_chars': 0,
+        'conservative_remaining_chapters': 0,
+        'conservative_remaining_chars': 0,
+        'estimate_note': '',
         'summary': '',
         'next_phase_goal': '',
         'raw_text': (text or '').strip(),
@@ -124,6 +127,94 @@ def parse_completion_report(text: str) -> dict:
         report['missing'] = missing
 
     return report
+
+
+def derive_conservative_completion_estimate(
+    report: dict,
+    history: list[dict],
+    current_chapter: int,
+    average_chapter_chars: int,
+) -> dict:
+    optimistic_chapters = max(0, int(report.get('remaining_chapters', 0) or 0))
+    optimistic_chars = max(0, int(report.get('remaining_chars', 0) or 0))
+    if report.get('is_complete'):
+        return {
+            'conservative_remaining_chapters': 0,
+            'conservative_remaining_chars': 0,
+            'estimate_note': '已判定可自然完结，无需保守余量。',
+        }
+
+    missing = [str(item).strip() for item in (report.get('missing') or []) if str(item).strip()]
+    major_count = 0
+    minor_count = 0
+    epilogue_missing = False
+    afterstory_missing = False
+    for item in missing:
+        if '尾声' in item:
+            epilogue_missing = True
+            continue
+        if '后日谈' in item or '后记' in item:
+            afterstory_missing = True
+            continue
+        if any(keyword in item for keyword in (
+            '核心', '主线', '谜团', '真相', '源头', '责任链', '终局', '落判',
+            '主角', '真名', '原位', '资格', '命运', '胜负', '第一页', '首字',
+            '主签', '首签', '规则级',
+        )):
+            major_count += 1
+        else:
+            minor_count += 1
+
+    structural_floor = (
+        major_count
+        + math.ceil(minor_count / 2)
+        + int(epilogue_missing)
+        + int(afterstory_missing)
+    )
+
+    same_estimate_streak = 1 if optimistic_chapters > 0 else 0
+    earliest_same_estimate_chapter = current_chapter
+    for item in reversed(history):
+        if item.get('is_complete'):
+            break
+        if int(item.get('remaining_chapters', 0) or 0) != optimistic_chapters:
+            break
+        same_estimate_streak += 1
+        earliest_same_estimate_chapter = int(item.get('checked_at_chapter', current_chapter) or current_chapter)
+
+    stagnation_buffer = 0
+    if optimistic_chapters > 0 and same_estimate_streak > 1:
+        consumed = max(0, current_chapter - earliest_same_estimate_chapter)
+        stagnation_buffer = max(same_estimate_streak - 1, math.ceil(consumed / max(optimistic_chapters, 1)))
+
+    conservative_chapters = max(optimistic_chapters, structural_floor, optimistic_chapters + stagnation_buffer)
+    if conservative_chapters <= 0:
+        conservative_chapters = max(1, structural_floor or 1)
+
+    average_chars = max(1200, int(average_chapter_chars or 0))
+    conservative_chars = max(optimistic_chars, conservative_chapters * average_chars)
+
+    reasons = []
+    if major_count:
+        reasons.append(f'{major_count}项核心终局/真相收束未完成')
+    if minor_count:
+        reasons.append(f'{minor_count}项关系或配角收束未完成')
+    if epilogue_missing:
+        reasons.append('尾声尚未写出')
+    if afterstory_missing:
+        reasons.append('后日谈尚未写出')
+    if same_estimate_streak > 1 and optimistic_chapters > 0:
+        reasons.append(
+            f'“还需{optimistic_chapters}章”的乐观估计已连续{same_estimate_streak}次未下降'
+        )
+    if not reasons:
+        reasons.append('按最近章节体量补足安全收尾余量')
+
+    return {
+        'conservative_remaining_chapters': conservative_chapters,
+        'conservative_remaining_chars': conservative_chars,
+        'estimate_note': '；'.join(reasons),
+    }
 
 
 SERIES_BIBLE_PART_SPECS = [
@@ -548,7 +639,11 @@ class AutoNovelRunner:
 
         min_chars = self._effective_min_target_chars()
         completion_check = self.state.get('completion_check') or {}
-        remaining_chars = int(completion_check.get('remaining_chars', 0) or 0)
+        remaining_chars = int(
+            completion_check.get('conservative_remaining_chars')
+            or completion_check.get('remaining_chars', 0)
+            or 0
+        )
         if remaining_chars > 0:
             return max(current_chars, current_chars + remaining_chars)
         return max(current_chars, min_chars, current_chars + self.args.chapter_char_target)
@@ -563,7 +658,11 @@ class AutoNovelRunner:
             return max(1, math.ceil((min_chars - current_chars) / self.args.chapter_char_target))
 
         completion_check = self.state.get('completion_check') or {}
-        remaining_chapters = int(completion_check.get('remaining_chapters', 0) or 0)
+        remaining_chapters = int(
+            completion_check.get('conservative_remaining_chapters')
+            or completion_check.get('remaining_chapters', 0)
+            or 0
+        )
         return max(1, remaining_chapters or 1)
 
     def _estimated_total_chapters(self) -> int:
@@ -908,6 +1007,17 @@ class AutoNovelRunner:
             return self.state.get('generated_chapters', 0) > 0
         return self.state.get('generated_chars', 0) >= min_target
 
+    def _recent_average_chapter_chars(self, limit: int = 8) -> int:
+        completed = self.state.get('completed_chapters', [])
+        recent = [
+            int(item.get('chars', 0) or 0)
+            for item in completed[-limit:]
+            if int(item.get('chars', 0) or 0) > 0
+        ]
+        if not recent:
+            return max(1200, int(self.args.chapter_char_target))
+        return max(int(self.args.chapter_char_target), math.ceil(sum(recent) / len(recent)))
+
     def _ending_guidance_text(self, limit: int = 1200) -> str:
         blocks = []
 
@@ -931,10 +1041,21 @@ class AutoNovelRunner:
                 auto_lines.append('- 当前仍缺内容：' + '；'.join(str(item) for item in missing[:6]))
             remaining_chapters = int(completion_check.get('remaining_chapters', 0) or 0)
             remaining_chars = int(completion_check.get('remaining_chars', 0) or 0)
+            conservative_remaining_chapters = int(completion_check.get('conservative_remaining_chapters', 0) or 0)
+            conservative_remaining_chars = int(completion_check.get('conservative_remaining_chars', 0) or 0)
             if remaining_chapters > 0:
-                auto_lines.append(f'- 当前估计还需约 {remaining_chapters} 章完成自然收尾。')
+                auto_lines.append(f'- 当前工作估计还需约 {remaining_chapters} 章完成自然收尾。')
             if remaining_chars > 0:
-                auto_lines.append(f'- 当前估计还需约 {remaining_chars} 字完成自然收尾。')
+                auto_lines.append(f'- 当前工作估计还需约 {remaining_chars} 字完成自然收尾。')
+            if conservative_remaining_chapters > 0:
+                auto_lines.append(
+                    f'- 保守估计还需约 {conservative_remaining_chapters} 章，规划时应按这个余量避免机械三章收尾。'
+                )
+            if conservative_remaining_chars > 0:
+                auto_lines.append(f'- 保守估计还需约 {conservative_remaining_chars} 字。')
+            estimate_note = str(completion_check.get('estimate_note', '') or '').strip()
+            if estimate_note:
+                auto_lines.append(f'- 保守估计依据：{estimate_note}')
             next_phase_goal = str(completion_check.get('next_phase_goal', '') or '').strip()
             if next_phase_goal:
                 auto_lines.append(f'- 下一阶段目标：{next_phase_goal}')
@@ -994,6 +1115,10 @@ class AutoNovelRunner:
             '【最近章节摘要】',
             truncate_text(self.recent_chapter_summaries(limit=8), 1800) or '（暂无）',
         ]
+        sections.insert(
+            12,
+            '不要机械套用“一章揭晓、一章执行、一章尾声”的固定三段式模板；如果仍有多项独立收束任务，请把这些任务量折算进章节余量。',
+        )
 
         pending_outlines = self._recent_pending_outlines(limit=3)
         if pending_outlines:
@@ -1030,6 +1155,8 @@ class AutoNovelRunner:
             '',
             '## 仍缺内容',
         ]
+        lines.insert(6, f"- 保守估计还需章节：{report.get('conservative_remaining_chapters', 0)}")
+        lines.insert(7, f"- 保守估计还需字数：{report.get('conservative_remaining_chars', 0)}")
         missing = report.get('missing') or []
         if missing:
             lines.extend(f'- {item}' for item in missing)
@@ -1039,6 +1166,9 @@ class AutoNovelRunner:
             '',
             '## 说明',
             report.get('summary', '') or '（无）',
+            '',
+            '## 保守估计依据',
+            report.get('estimate_note', '') or '（无）',
             '',
             '## 下一阶段目标',
             report.get('next_phase_goal', '') or '无',
@@ -1057,13 +1187,35 @@ class AutoNovelRunner:
                 return existing
 
         prompt = self._build_completion_estimate_prompt()
+        history = list(self.state.get('completion_check_history') or [])
         report_text = self.with_retry(
             '完结评估',
             lambda: self.call_llm('完结评估', prompt, self.planner_model),
         )
         self.clear_error()
         report = parse_completion_report(report_text)
+        report.update(
+            derive_conservative_completion_estimate(
+                report=report,
+                history=history,
+                current_chapter=current_chapter,
+                average_chapter_chars=self._recent_average_chapter_chars(),
+            )
+        )
         report['checked_at_chapter'] = current_chapter
+        history = [
+            item for item in history
+            if int(item.get('checked_at_chapter', -1) or -1) != current_chapter
+        ]
+        history.append({
+            'checked_at_chapter': current_chapter,
+            'is_complete': bool(report.get('is_complete')),
+            'remaining_chapters': int(report.get('remaining_chapters', 0) or 0),
+            'remaining_chars': int(report.get('remaining_chars', 0) or 0),
+            'conservative_remaining_chapters': int(report.get('conservative_remaining_chapters', 0) or 0),
+            'conservative_remaining_chars': int(report.get('conservative_remaining_chars', 0) or 0),
+        })
+        self.state['completion_check_history'] = history[-20:]
         self.state['completion_check'] = {
             'checked_at_chapter': current_chapter,
             'is_complete': bool(report.get('is_complete')),
@@ -1071,6 +1223,9 @@ class AutoNovelRunner:
             'missing': list(report.get('missing') or []),
             'remaining_chapters': int(report.get('remaining_chapters', 0) or 0),
             'remaining_chars': int(report.get('remaining_chars', 0) or 0),
+            'conservative_remaining_chapters': int(report.get('conservative_remaining_chapters', 0) or 0),
+            'conservative_remaining_chars': int(report.get('conservative_remaining_chars', 0) or 0),
+            'estimate_note': str(report.get('estimate_note', '') or '').strip(),
             'summary': str(report.get('summary', '') or '').strip(),
             'next_phase_goal': str(report.get('next_phase_goal', '') or '').strip(),
         }
