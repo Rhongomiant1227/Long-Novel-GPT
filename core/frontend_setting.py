@@ -208,13 +208,17 @@ def render_setting(setting, setting_state):
                         model=main_model,
                         ak=baidu_access_key,
                         sk=baidu_secret_key,
-                        max_tokens=4096
+                        max_tokens=provider_config.get('max_output_tokens', 4096),
+                        max_input_tokens=provider_config.get('max_input_tokens', provider_config.get('max_output_tokens', 4096)),
+                        max_output_tokens=provider_config.get('max_output_tokens', 4096),
                     ) 
                     setting['sub_model'] = ModelConfig(
                         model=sub_model,
                         ak=baidu_access_key,
                         sk=baidu_secret_key,
-                        max_tokens=4096
+                        max_tokens=provider_config.get('max_output_tokens', 4096),
+                        max_input_tokens=provider_config.get('max_input_tokens', provider_config.get('max_output_tokens', 4096)),
+                        max_output_tokens=provider_config.get('max_output_tokens', 4096),
                     )
 
                 submit_event = dict(
@@ -239,13 +243,17 @@ def render_setting(setting, setting_state):
                         model=main_model,
                         api_key=doubao_api_key,
                         endpoint_id=main_endpoint_id,
-                        max_tokens=4096
+                        max_tokens=provider_config.get('max_output_tokens', 4096),
+                        max_input_tokens=provider_config.get('max_input_tokens', provider_config.get('max_output_tokens', 4096)),
+                        max_output_tokens=provider_config.get('max_output_tokens', 4096),
                     )
                     setting['sub_model'] = ModelConfig(
                         model=sub_model,
                         api_key=doubao_api_key,
                         endpoint_id=sub_endpoint_id,
-                        max_tokens=4096
+                        max_tokens=provider_config.get('max_output_tokens', 4096),
+                        max_input_tokens=provider_config.get('max_input_tokens', provider_config.get('max_output_tokens', 4096)),
+                        max_output_tokens=provider_config.get('max_output_tokens', 4096),
                     )
                 
                 submit_event = dict(    
@@ -270,14 +278,18 @@ def render_setting(setting, setting_state):
                         model=main_model,
                         api_key=provider_config['api_key'],
                         base_url=provider_config['base_url'],
-                        max_tokens=4096,
+                        max_tokens=provider_config.get('max_output_tokens', 4096),
+                        max_input_tokens=provider_config.get('max_input_tokens', provider_config.get('max_output_tokens', 4096)),
+                        max_output_tokens=provider_config.get('max_output_tokens', 4096),
                         proxies=provider_config.get('proxies', None),
                     )
                     setting['sub_model'] = ModelConfig(
                         model=sub_model,
                         api_key=provider_config['api_key'],
                         base_url=provider_config['base_url'],
-                        max_tokens=4096,
+                        max_tokens=provider_config.get('max_output_tokens', 4096),
+                        max_input_tokens=provider_config.get('max_input_tokens', provider_config.get('max_output_tokens', 4096)),
+                        max_output_tokens=provider_config.get('max_output_tokens', 4096),
                         proxies=provider_config.get('proxies', None),
                     )
                 
@@ -300,12 +312,16 @@ def render_setting(setting, setting_state):
                     setting['model'] = ModelConfig(
                         model=main_model,
                         api_key=zhipuai_api_key,
-                        max_tokens=4096
+                        max_tokens=provider_config.get('max_output_tokens', 4096),
+                        max_input_tokens=provider_config.get('max_input_tokens', provider_config.get('max_output_tokens', 4096)),
+                        max_output_tokens=provider_config.get('max_output_tokens', 4096),
                     )
                     setting['sub_model'] = ModelConfig(
                         model=sub_model,
                         api_key=zhipuai_api_key,
-                        max_tokens=4096
+                        max_tokens=provider_config.get('max_output_tokens', 4096),
+                        max_input_tokens=provider_config.get('max_input_tokens', provider_config.get('max_output_tokens', 4096)),
+                        max_output_tokens=provider_config.get('max_output_tokens', 4096),
                     )
                 
                 submit_event = dict(

@@ -6,6 +6,7 @@ import ctypes
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -150,7 +151,10 @@ def build_child_command(args: argparse.Namespace) -> list[str]:
         str(args.script_path),
         '--project-dir', str(args.project_dir),
         '--brief-file', str(args.brief_file),
+        '--completion-mode', args.completion_mode,
         '--target-chars', str(args.target_chars),
+        '--min-target-chars', str(args.min_target_chars),
+        '--max-target-chars', str(args.max_target_chars),
         '--chapter-char-target', str(args.chapter_char_target),
         '--chapters-per-volume', str(args.chapters_per_volume),
         '--chapters-per-batch', str(args.chapters_per_batch),
@@ -238,6 +242,7 @@ def run_once(args: argparse.Namespace, state_path: Path) -> bool:
     reader.start()
 
     last_output_time = time.time()
+    last_child_output_time = last_output_time
     next_heartbeat_at = last_output_time + args.heartbeat_interval_seconds
     eof_seen = False
 
@@ -254,6 +259,7 @@ def run_once(args: argparse.Namespace, state_path: Path) -> bool:
                 else:
                     tee_child_output(item)
                     last_output_time = time.time()
+                    last_child_output_time = last_output_time
                     next_heartbeat_at = last_output_time + args.heartbeat_interval_seconds
 
             if process.poll() is not None and eof_seen and output_queue.empty():
@@ -261,7 +267,7 @@ def run_once(args: argparse.Namespace, state_path: Path) -> bool:
 
             if process.poll() is None:
                 now = time.time()
-                idle_seconds = now - last_output_time
+                idle_seconds = now - last_child_output_time
                 state_snapshot = None
                 runner_heartbeat = None
                 runner_heartbeat_age = None
@@ -290,10 +296,20 @@ def run_once(args: argparse.Namespace, state_path: Path) -> bool:
                     next_heartbeat_at = now + args.heartbeat_interval_seconds
 
                 if idle_seconds >= args.stall_timeout_seconds:
+                    stage_runtime_allowed = (
+                        args.max_stage_runtime_seconds <= 0
+                        or stage_runtime is None
+                        or stage_runtime <= args.max_stage_runtime_seconds
+                    )
+                    hard_silence_hit = (
+                        args.max_silent_seconds > 0
+                        and idle_seconds >= args.max_silent_seconds
+                    )
                     if (
                         runner_heartbeat_age is not None
                         and runner_heartbeat_age <= args.runner_heartbeat_grace_seconds
-                        and (stage_runtime is None or stage_runtime <= args.max_stage_runtime_seconds)
+                        and stage_runtime_allowed
+                        and not hard_silence_hit
                     ):
                         log(
                             f'no child output for {int(idle_seconds)}s, but runner heartbeat is fresh '
@@ -308,8 +324,9 @@ def run_once(args: argparse.Namespace, state_path: Path) -> bool:
                     chars_count = state_snapshot['generated_chars'] if state_snapshot is not None else 0
                     next_chapter = state_snapshot['next_chapter_number'] if state_snapshot is not None else 0
                     last_error = state_snapshot['last_error'] if state_snapshot is not None else ''
+                    reason = 'max silent ceiling reached' if hard_silence_hit else 'stall timeout exceeded'
                     log(
-                        f'no output for {int(idle_seconds)}s; terminating child '
+                        f'no output for {int(idle_seconds)}s; terminating child [{reason}] '
                         f'(stage={stage_name}, status={status or "unknown"}, chapters={chapters}, chars={chars_count}, '
                         f'next={next_chapter}, last_error={last_error or "-"})'
                     )
@@ -343,26 +360,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--script-path', default='auto_novel.py')
     parser.add_argument('--project-dir', default=str(repo_root / 'auto_projects' / 'default_project'))
     parser.add_argument('--brief-file', default=str(repo_root / 'novel_brief.md'))
+    parser.add_argument('--completion-mode', choices=['hard_target', 'min_chars_and_story_end'], default='hard_target')
     parser.add_argument('--target-chars', type=int, default=2_000_000)
+    parser.add_argument('--min-target-chars', type=int, default=0)
+    parser.add_argument('--max-target-chars', type=int, default=0)
     parser.add_argument('--chapter-char-target', type=int, default=2200)
     parser.add_argument('--chapters-per-volume', type=int, default=30)
     parser.add_argument('--chapters-per-batch', type=int, default=5)
     parser.add_argument('--memory-refresh-interval', type=int, default=5)
     parser.add_argument('--main-model', default='gpt/gpt-5.4')
     parser.add_argument('--sub-model', default='gpt/gpt-5.4')
-    parser.add_argument('--planner-reasoning-effort', default='high')
-    parser.add_argument('--writer-reasoning-effort', default='high')
-    parser.add_argument('--sub-reasoning-effort', default='high')
-    parser.add_argument('--summary-reasoning-effort', default='high')
+    parser.add_argument('--planner-reasoning-effort', default='medium')
+    parser.add_argument('--writer-reasoning-effort', default='medium')
+    parser.add_argument('--sub-reasoning-effort', default='low')
+    parser.add_argument('--summary-reasoning-effort', default='low')
     parser.add_argument('--max-thread-num', type=int, default=1)
-    parser.add_argument('--max-retries', type=int, default=3)
+    parser.add_argument('--max-retries', type=int, default=0)
     parser.add_argument('--retry-backoff-seconds', type=int, default=15)
     parser.add_argument('--max-chapters', type=int, default=0)
     parser.add_argument('--stall-timeout-seconds', type=int, default=480)
     parser.add_argument('--restart-delay-seconds', type=int, default=15)
     parser.add_argument('--heartbeat-interval-seconds', type=int, default=30)
     parser.add_argument('--runner-heartbeat-grace-seconds', type=int, default=90)
-    parser.add_argument('--max-stage-runtime-seconds', type=int, default=1800)
+    parser.add_argument('--max-stage-runtime-seconds', type=int, default=0)
+    parser.add_argument('--max-silent-seconds', type=int, default=900)
     args = parser.parse_args()
     args.repo_root = Path(args.repo_root).resolve()
     args.python_exe = Path(args.python_exe).resolve()
@@ -385,8 +406,13 @@ def main() -> int:
     INSTANCE_LOCK_PATH = args.instance_lock_path
 
     if not args.python_exe.exists():
-        print(f'Python virtualenv not found: {args.python_exe}', file=sys.stderr)
-        return 1
+        python_on_path = shutil.which('python')
+        if python_on_path:
+            args.python_exe = Path(python_on_path).resolve()
+            print(f'Python virtualenv not found, fallback to PATH python: {args.python_exe}')
+        else:
+            print(f'Python virtualenv not found: {args.python_exe}', file=sys.stderr)
+            return 1
 
     claimed, existing_pid = claim_instance(args.instance_lock_path)
     if not claimed:

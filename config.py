@@ -5,6 +5,51 @@ print("Loading .env file...")
 env_path = os.path.join(os.path.dirname(__file__), '.env')
 
 
+def _read_int_env(name):
+    value = os.getenv(name, '').strip()
+    if not value:
+        return None
+    return int(value)
+
+
+def _read_float_env(name):
+    value = os.getenv(name, '').strip()
+    if not value:
+        return None
+    return float(value)
+
+
+def _default_token_limits(provider, available_models=None):
+    prefix = provider.upper()
+    legacy_max_tokens = _read_int_env(f'{prefix}_MAX_TOKENS')
+    max_input_tokens = _read_int_env(f'{prefix}_MAX_INPUT_TOKENS')
+    max_output_tokens = _read_int_env(f'{prefix}_MAX_OUTPUT_TOKENS')
+
+    models = [m.strip() for m in (available_models or []) if m and m.strip()]
+    default_input_tokens = 4096
+    default_output_tokens = 4096
+
+    if provider == 'gpt' and any(model.startswith('gpt-5') for model in models):
+        # ChatMessages uses a rough heuristic tokenizer and underestimates Chinese prompts.
+        # Keep a wide safety margin by default, while still using much more context than 200k.
+        context_window = _read_int_env('GPT_CONTEXT_WINDOW') or 1_000_000
+        input_budget_ratio = _read_float_env('GPT_INPUT_BUDGET_RATIO') or 0.35
+        default_input_tokens = max(200000, min(context_window, int(context_window * input_budget_ratio)))
+        default_output_tokens = 65536
+
+    if legacy_max_tokens is not None:
+        default_input_tokens = legacy_max_tokens
+        default_output_tokens = legacy_max_tokens
+
+    max_input_tokens = max_input_tokens or default_input_tokens
+    max_output_tokens = max_output_tokens or default_output_tokens
+    return {
+        'max_tokens': max_output_tokens,
+        'max_input_tokens': max_input_tokens,
+        'max_output_tokens': max_output_tokens,
+    }
+
+
 def _mask_secret(key, value):
     if value is None:
         return value
@@ -57,13 +102,13 @@ API_SETTINGS = {
         'ak': os.getenv('WENXIN_AK', ''),
         'sk': os.getenv('WENXIN_SK', ''),
         'available_models': os.getenv('WENXIN_AVAILABLE_MODELS', '').split(','),
-        'max_tokens': 4096,
+        **_default_token_limits('wenxin', os.getenv('WENXIN_AVAILABLE_MODELS', '').split(',')),
     },
     'doubao': {
         'api_key': os.getenv('DOUBAO_API_KEY', ''),
         'endpoint_ids': os.getenv('DOUBAO_ENDPOINT_IDS', '').split(','),
         'available_models': os.getenv('DOUBAO_AVAILABLE_MODELS', '').split(','),
-        'max_tokens': 4096,
+        **_default_token_limits('doubao', os.getenv('DOUBAO_AVAILABLE_MODELS', '').split(',')),
     },
     'gpt': {
         'base_url': os.getenv('GPT_BASE_URL', ''),
@@ -75,18 +120,18 @@ API_SETTINGS = {
         'timeout': float(os.getenv('GPT_TIMEOUT_SECONDS', 3600)),
         'max_retries': int(os.getenv('GPT_MAX_RETRIES', 3)),
         'available_models': os.getenv('GPT_AVAILABLE_MODELS', '').split(','),
-        'max_tokens': 4096,
+        **_default_token_limits('gpt', os.getenv('GPT_AVAILABLE_MODELS', '').split(',')),
     },
     'zhipuai': {
         'api_key': os.getenv('ZHIPUAI_API_KEY', ''),
         'available_models': os.getenv('ZHIPUAI_AVAILABLE_MODELS', '').split(','),
-        'max_tokens': 4096,
+        **_default_token_limits('zhipuai', os.getenv('ZHIPUAI_AVAILABLE_MODELS', '').split(',')),
     },
     'local': {
         'base_url': os.getenv('LOCAL_BASE_URL', ''),
         'api_key': os.getenv('LOCAL_API_KEY', ''),
         'available_models': os.getenv('LOCAL_AVAILABLE_MODELS', '').split(','),
-        'max_tokens': 4096,
+        **_default_token_limits('local', os.getenv('LOCAL_AVAILABLE_MODELS', '').split(',')),
     }
 }
 

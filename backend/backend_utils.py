@@ -1,7 +1,7 @@
 from llm_api import ModelConfig
 
 def get_model_config_from_provider_model(provider_model):
-    from config import API_SETTINGS
+    from config import API_SETTINGS, _default_token_limits
     provider, model = provider_model.split('/', 1)
     provider_config = API_SETTINGS[provider]
     
@@ -12,6 +12,8 @@ def get_model_config_from_provider_model(provider_model):
         model_config = {**provider_config, 'model': model, 'endpoint_id': endpoint_id}
     else:
         model_config = {**provider_config, 'model': model}
+
+    model_config.update(_default_token_limits(provider, [model]))
     
     # Remove lists from config before creating ModelConfig
     if 'available_models' in model_config:
