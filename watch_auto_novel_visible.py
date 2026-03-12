@@ -154,6 +154,7 @@ def build_child_command(args: argparse.Namespace) -> list[str]:
         '--completion-mode', args.completion_mode,
         '--target-chars', str(args.target_chars),
         '--min-target-chars', str(args.min_target_chars),
+        '--force-finish-chars', str(args.force_finish_chars),
         '--max-target-chars', str(args.max_target_chars),
         '--chapter-char-target', str(args.chapter_char_target),
         '--chapters-per-volume', str(args.chapters_per_volume),
@@ -363,6 +364,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--completion-mode', choices=['hard_target', 'min_chars_and_story_end'], default='hard_target')
     parser.add_argument('--target-chars', type=int, default=2_000_000)
     parser.add_argument('--min-target-chars', type=int, default=0)
+    parser.add_argument('--force-finish-chars', type=int, default=0)
     parser.add_argument('--max-target-chars', type=int, default=0)
     parser.add_argument('--chapter-char-target', type=int, default=2200)
     parser.add_argument('--chapters-per-volume', type=int, default=30)

@@ -43,6 +43,10 @@ Write-Host '--- State ---'
 Write-Host ("status                : {0}" -f $state.status)
 Write-Host ("generated_chapters    : {0}" -f $state.generated_chapters)
 Write-Host ("generated_chars       : {0}" -f $state.generated_chars)
+if ($state.target_chars) { Write-Host ("target_chars          : {0}" -f $state.target_chars) }
+if ($state.min_target_chars) { Write-Host ("min_target_chars      : {0}" -f $state.min_target_chars) }
+if ($state.force_finish_chars) { Write-Host ("force_finish_chars    : {0}" -f $state.force_finish_chars) }
+if ($state.max_target_chars) { Write-Host ("absolute_max_chars    : {0}" -f $state.max_target_chars) }
 Write-Host ("next_chapter_number   : {0}" -f $state.next_chapter_number)
 Write-Host ("pending_chapters      : {0}" -f $state.pending_chapters.Count)
 Write-Host ("current_volume        : {0}" -f $state.current_volume)

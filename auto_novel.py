@@ -522,6 +522,7 @@ class AutoNovelRunner:
         if self.state_path.exists():
             state = json.loads(self.state_path.read_text(encoding='utf-8'))
             state.setdefault('min_target_chars', 0)
+            state.setdefault('force_finish_chars', 0)
             state.setdefault('max_target_chars', 0)
             state.setdefault('completion_mode', 'hard_target')
             state.setdefault('completion_check', {})
@@ -538,6 +539,7 @@ class AutoNovelRunner:
             'sub_model': self.args.sub_model,
             'target_chars': self.args.target_chars,
             'min_target_chars': self.args.min_target_chars,
+            'force_finish_chars': self.args.force_finish_chars,
             'max_target_chars': self.args.max_target_chars,
             'completion_mode': self.args.completion_mode,
             'chapter_char_target': self.args.chapter_char_target,
@@ -995,9 +997,23 @@ class AutoNovelRunner:
         target_chars = int(getattr(self.args, 'target_chars', 0) or 0)
         return max(0, target_chars)
 
+    def _effective_force_finish_chars(self) -> int:
+        force_finish = int(getattr(self.args, 'force_finish_chars', 0) or 0)
+        if force_finish > 0:
+            return force_finish
+        target_chars = int(getattr(self.args, 'target_chars', 0) or 0)
+        if target_chars > 0:
+            return math.ceil(target_chars * 1.5)
+        return 0
+
     def _effective_max_target_chars(self) -> int:
         max_target = int(getattr(self.args, 'max_target_chars', 0) or 0)
-        return max(0, max_target)
+        if max_target > 0:
+            return max_target
+        force_finish = self._effective_force_finish_chars()
+        if force_finish > 0:
+            return math.ceil(force_finish * 1.5)
+        return 0
 
     def _in_finale_mode(self) -> bool:
         if self._completion_mode() != 'min_chars_and_story_end':
@@ -1006,6 +1022,14 @@ class AutoNovelRunner:
         if min_target <= 0:
             return self.state.get('generated_chapters', 0) > 0
         return self.state.get('generated_chars', 0) >= min_target
+
+    def _in_force_finish_mode(self) -> bool:
+        if self._completion_mode() != 'min_chars_and_story_end':
+            return False
+        force_finish = self._effective_force_finish_chars()
+        if force_finish <= 0:
+            return False
+        return int(self.state.get('generated_chars', 0) or 0) >= force_finish
 
     def _recent_average_chapter_chars(self, limit: int = 8) -> int:
         completed = self.state.get('completed_chapters', [])
@@ -1036,6 +1060,11 @@ class AutoNovelRunner:
                 '- 不要再新增需要多卷回收的新大坑、新地图、新主反派。',
                 '- 允许新信息，但只能服务当前终局回收与情绪收束。',
             ]
+            if self._in_force_finish_mode():
+                auto_lines.extend([
+                    '- 当前已超过强制收束阈值，后续章节必须高密度回收，不能再把终局拆成长段新篇章。',
+                    '- 如果单章足以完成一个关键终局环节、尾声或后日谈，可以直接完成，不强制为下一章留人工续命钩子。',
+                ])
             missing = completion_check.get('missing') or []
             if missing:
                 auto_lines.append('- 当前仍缺内容：' + '；'.join(str(item) for item in missing[:6]))
@@ -1119,6 +1148,11 @@ class AutoNovelRunner:
             12,
             '不要机械套用“一章揭晓、一章执行、一章尾声”的固定三段式模板；如果仍有多项独立收束任务，请把这些任务量折算进章节余量。',
         )
+        if self._in_force_finish_mode():
+            sections.insert(
+                13,
+                '当前文本已经超过强制收束阈值，后续估算必须按“高压缩完结”处理，不要继续按长篇常规节奏外扩。',
+            )
 
         pending_outlines = self._recent_pending_outlines(limit=3)
         if pending_outlines:
@@ -1294,6 +1328,10 @@ class AutoNovelRunner:
         if self.args.max_chapters:
             allowed_left = self.args.max_chapters - self.state['generated_chapters']
             batch_size = min(batch_size, allowed_left)
+        if self._in_force_finish_mode():
+            batch_size = min(batch_size, 1)
+        elif self._in_finale_mode():
+            batch_size = min(batch_size, 2)
         batch_size = max(1, batch_size)
 
         chapter_end = next_chapter + batch_size - 1
@@ -1314,6 +1352,23 @@ class AutoNovelRunner:
 - 新增信息只能服务于当前终局回收，不能再开启需要多卷回收的新主线
 - 如果剩余章节已经不多，必须提前把尾声与后日谈纳入规划
 """
+        if self._in_force_finish_mode():
+            finale_extra_rules += """
+- 当前已超过强制收束阈值，必须把剩余主线压缩到极少章节内完成
+- 不允许再设计“本来还能再写几十章”的终局分叉，必须尽快闭合责任链、主角终局、关系落点、尾声与后日谈
+- 如果一章足以完成一个关键终局环节，可以直接完成，不强制保留下一章钩子
+"""
+
+        chapter_shape_rule = '- 每章都要有明确目标、阻力、推进、变化与章末钩子'
+        if self._in_finale_mode():
+            chapter_shape_rule = '- 每章都要有明确目标、阻力、推进与变化；若承担终局/尾声/后日谈功能，可直接完成，不强制章末钩子'
+        if self._in_force_finish_mode():
+            chapter_shape_rule = '- 每章都要明确承担剩余终局任务之一，并高密度推进；不允许为了续章而空转或强行保留章末钩子'
+        chapter_end_rule = '- 每章都要有实质推进与章末卡点'
+        if self._in_finale_mode():
+            chapter_end_rule = '- 每章都要有实质推进；若本章承担终局、尾声或后日谈功能，可以直接完成该功能，不强制章末卡点'
+        if self._in_force_finish_mode():
+            chapter_end_rule = '- 每章都要高密度推进终局收束；若本章已经适合直接完成终局/尾声/后日谈，则直接完成，不得为了续章再留人工卡点'
 
         outline_prompt = f"""
 请规划接下来这一批章节的大纲：第 {next_chapter} 章 到 第 {chapter_end} 章。
@@ -1321,11 +1376,11 @@ class AutoNovelRunner:
 硬性要求：
 - 必须严格承接现有前情，不能重置人物状态
 - 题材、世界观、力量体系、冲突逻辑必须服从既有设定
-- 每章都要有明确目标、阻力、推进、变化与章末钩子
+- {chapter_shape_rule.lstrip('- ').strip()}
 - 兼顾主线推进、副线拉扯、人物关系变化与阶段性爽点
 - 单章必须服务长篇连载，不要写成孤立的无关插曲
 - 必须是中文番茄风长篇网文节奏
-- 每章都要有实质推进与章末卡点
+- {chapter_end_rule.lstrip('- ').strip()}
 - 单章定位是“章节大纲”，不是正文，不要写成小说正文
 {finale_extra_rules}
 
@@ -1402,6 +1457,16 @@ class AutoNovelRunner:
 - 当前已进入全书最终收束阶段，本章若承担终局、尾声或后日谈功能，应直接推进，不要继续拖大主线
 - 不要新增需要多卷回收的新谜团，只能回收当前主线伏笔并推进角色落点
 """
+        if self._in_force_finish_mode():
+            finale_plot_rules += """
+- 当前已超过强制收束阈值，本章必须高密度推进剩余终局任务，不允许再把终局拆成松散长段
+- 章末如需保留交接点，也只能服务于本书剩余极少章节的收束，不能制造新的大悬念
+"""
+        plot_ending_rule = '- 章末必须保留强卡点，为下一章续接'
+        if self._in_finale_mode():
+            plot_ending_rule = '- 章末可以保留轻交接点，但应优先服务终局收束，不强制强卡点'
+        if self._in_force_finish_mode():
+            plot_ending_rule = '- 若本章已适合直接完成一个终局环节、尾声或后日谈，可直接收住，不得为了续章制造强卡点'
         prompt = f"""
 请把这章大纲扩写成详细剧情梗概。
 
@@ -1412,7 +1477,7 @@ class AutoNovelRunner:
 - 充分体现本书既定题材、世界规则、人物关系与主线矛盾
 - 把关键冲突、人物决策、信息揭示、因果变化写清楚
 - 兼顾爽点、压迫感、情绪张力与阶段性推进
-- 章末必须保留强卡点，为下一章续接
+- {plot_ending_rule.lstrip('- ').strip()}
 - 目标长度：400~900 字
 {finale_plot_rules}
 """
@@ -1455,8 +1520,23 @@ class AutoNovelRunner:
 - 不要再扩展需要多卷回收的新大坑、新地图、新主反派
 - 允许保留章末钩子，但钩子必须服务于本书剩余收束，而不是开启新长篇
 """
+        if self._in_force_finish_mode():
+            finale_draft_rules += """
+- 当前已超过强制收束阈值，本章必须尽量完成关键终局任务，不要再把剩余收束拖成宽松长段
+- 如果本章已经适合直接完成一个终局环节、尾声或后日谈，就直接完成，不强制留出下一章的人工卡口
+"""
 
         def _draft(existing_text: str = '') -> str:
+            draft_tension_rule = '- 兼顾情绪张力、场面张力、信息揭露、人物关系拉扯与章末钩子'
+            if self._in_finale_mode():
+                draft_tension_rule = '- 兼顾情绪张力、场面张力、信息揭露与人物关系落点；若本章承担终局/尾声/后日谈功能，不强制章末钩子'
+            if self._in_force_finish_mode():
+                draft_tension_rule = '- 兼顾情绪张力、信息揭露、人物关系落点与终局完成度；不允许为了续章而额外制造章末钩子'
+            draft_ending_rule = '- 结尾必须卡住'
+            if self._in_finale_mode():
+                draft_ending_rule = '- 结尾可以保留轻微余波，但不强制卡住；若本章承担终局、尾声或后日谈功能，应允许自然收束'
+            if self._in_force_finish_mode():
+                draft_ending_rule = '- 结尾必须优先服务全书收束；如果本章已经适合自然收住，就直接收住，不得为了续章强行卡住'
             prompt = f"""
 请把这段剧情梗概写成可发布的中文长篇网文正文。
 
@@ -1465,10 +1545,10 @@ class AutoNovelRunner:
 - 风格：番茄风、强代入、强画面、强对白、强追读
 - 题材、世界观、力量体系、人物关系和冲突类型必须严格服从本书设定
 - 重点写清人物目标、阻力、选择、代价、反制与变化
-- 兼顾情绪张力、场面张力、信息揭露、人物关系拉扯与章末钩子
+- {draft_tension_rule.lstrip('- ').strip()}
 - 正文不是梗概，不要用“随后、然后、接着”堆流水账
 - 开头三段必须抓人
-- 结尾必须卡住
+- {draft_ending_rule.lstrip('- ').strip()}
 - 目标字数：{target_chars} 字左右，至少 {min_chars} 字，建议不超过 {max_chars} 字
 {finale_draft_rules}
 """
@@ -1487,8 +1567,11 @@ class AutoNovelRunner:
         draft_text = self.with_retry(f'第{chapter["chapter_number"]}章正文', lambda: _draft(''))
         self.clear_error()
         if len(draft_text) < min_chars:
+            expand_goal_line = '请在不改变这章主线事件与结尾卡点的前提下，对正文进行扩充和润色。'
+            if self._in_finale_mode():
+                expand_goal_line = '请在不改变这章主线事件与收束功能的前提下，对正文进行扩充和润色。'
             expand_prompt = f"""
-请在不改变这章主线事件与结尾卡点的前提下，对正文进行扩充和润色。
+{expand_goal_line}
 
 扩充方向：
 - 补强心理描写、动作过程、场景细节、对话博弈、氛围压迫感
@@ -1587,7 +1670,7 @@ class AutoNovelRunner:
 
         max_target_chars = self._effective_max_target_chars()
         if max_target_chars and self.state['generated_chars'] >= max_target_chars:
-            self.log(f'已达到最大安全字数上限：{max_target_chars}')
+            self.log(f'已达到最终绝对安全字数上限：{max_target_chars}')
             return True
 
         min_target_chars = self._effective_min_target_chars()
@@ -1606,14 +1689,16 @@ class AutoNovelRunner:
         self.state['status'] = 'running'
         self.state['target_chars'] = self.args.target_chars
         self.state['min_target_chars'] = self.args.min_target_chars
-        self.state['max_target_chars'] = self.args.max_target_chars
+        self.state['force_finish_chars'] = self._effective_force_finish_chars()
+        self.state['max_target_chars'] = self._effective_max_target_chars()
         self.state['completion_mode'] = self.args.completion_mode
         self._save_state()
         self.log('自动长篇模式启动')
         self.log(f'项目目录：{self.project_dir}')
         self.log(
             f'停止模式：{self.args.completion_mode}，硬目标：{self.args.target_chars}，'
-            f'最少字数：{self.args.min_target_chars}，最大安全字数：{self.args.max_target_chars}，'
+            f'最少字数：{self.args.min_target_chars}，强制收束阈值：{self._effective_force_finish_chars()}，'
+            f'最终绝对上限：{self._effective_max_target_chars()}，'
             f'单章目标：{self.args.chapter_char_target}'
         )
         self.log(f'主模型：{self.args.main_model}，副模型：{self.args.sub_model}')
@@ -1653,6 +1738,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--completion-mode', choices=['hard_target', 'min_chars_and_story_end'], default='hard_target')
     parser.add_argument('--target-chars', type=int, default=2_000_000)
     parser.add_argument('--min-target-chars', type=int, default=0)
+    parser.add_argument('--force-finish-chars', type=int, default=0)
     parser.add_argument('--max-target-chars', type=int, default=0)
     parser.add_argument('--chapter-char-target', type=int, default=2200)
     parser.add_argument('--chapters-per-volume', type=int, default=30)
