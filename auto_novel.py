@@ -1001,15 +1001,18 @@ class AutoNovelRunner:
         force_finish = int(getattr(self.args, 'force_finish_chars', 0) or 0)
         if force_finish > 0:
             return force_finish
-        target_chars = int(getattr(self.args, 'target_chars', 0) or 0)
-        if target_chars > 0:
-            return math.ceil(target_chars * 1.5)
+        state_force_finish = int(getattr(self, 'state', {}).get('force_finish_chars', 0) or 0)
+        if state_force_finish > 0:
+            return state_force_finish
         return 0
 
     def _effective_max_target_chars(self) -> int:
         max_target = int(getattr(self.args, 'max_target_chars', 0) or 0)
         if max_target > 0:
             return max_target
+        state_max_target = int(getattr(self, 'state', {}).get('max_target_chars', 0) or 0)
+        if state_max_target > 0:
+            return state_max_target
         force_finish = self._effective_force_finish_chars()
         if force_finish > 0:
             return math.ceil(force_finish * 1.5)
