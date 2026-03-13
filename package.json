@@ -1,0 +1,11 @@
+{
+  "name": "long-novel-gpt-tools",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "fanqie:upload": "node scripts/fanqie_upload.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.55.0"
+  }
+}

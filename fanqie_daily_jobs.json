@@ -1,0 +1,25 @@
+{
+  "tickSeconds": 30,
+  "retryMinutes": 30,
+  "logFile": ".run/fanqie_daily_scheduler.log",
+  "stateFile": ".run/fanqie_daily_scheduler_state.json",
+  "defaults": {
+    "startUrl": "https://fanqienovel.com/main/writer/?enter_from=author_zone",
+    "headless": true,
+    "seedProfileDir": "%USERPROFILE%/.openclaw/browser/openclaw/user-data",
+    "profileRoot": ".run/fanqie_daily_profiles",
+    "artifactsRoot": ".run/fanqie_daily_artifacts",
+    "chaptersPerRun": 1,
+    "publishTime": "12:00"
+  },
+  "jobs": [
+    {
+      "id": "inscribed_immortal",
+      "enabled": true,
+      "bookTitle": "删史成仙",
+      "chaptersDir": "auto_projects/inscribed_immortal/manuscript/chapters_txt",
+      "publishTime": "12:00",
+      "chaptersPerRun": 1
+    }
+  ]
+}

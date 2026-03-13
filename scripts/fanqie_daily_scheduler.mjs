@@ -1,0 +1,361 @@
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import path from "node:path";
+import process from "node:process";
+import readline from "node:readline";
+import { spawn } from "node:child_process";
+
+const DEFAULT_START_URL = "https://fanqienovel.com/main/writer/?enter_from=author_zone";
+
+function printHelp() {
+  console.log(`番茄小说日更调度器
+
+用法:
+  node scripts/fanqie_daily_scheduler.mjs --config fanqie_daily_jobs.json
+
+常用参数:
+  --config <path>   配置文件路径，默认 fanqie_daily_jobs.json
+  --once            只检查并执行一轮后退出
+  --run-now         忽略时间设置，立即执行符合筛选条件的任务
+  --dry-run         只打印将要执行的上传命令，不真的发章
+  --job <id>        只运行指定 job id
+  --help            显示帮助
+`);
+}
+
+function parseArgs(argv) {
+  const args = {
+    configPath: path.resolve(process.cwd(), "fanqie_daily_jobs.json"),
+    once: false,
+    runNow: false,
+    dryRun: false,
+    jobId: "",
+  };
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    const next = () => {
+      if (i + 1 >= argv.length) {
+        throw new Error(`缺少参数值: ${arg}`);
+      }
+      i += 1;
+      return argv[i];
+    };
+
+    switch (arg) {
+      case "--config":
+        args.configPath = path.resolve(next());
+        break;
+      case "--once":
+        args.once = true;
+        break;
+      case "--run-now":
+        args.runNow = true;
+        break;
+      case "--dry-run":
+        args.dryRun = true;
+        break;
+      case "--job":
+        args.jobId = next();
+        break;
+      case "--help":
+      case "-h":
+        args.help = true;
+        break;
+      default:
+        throw new Error(`未知参数: ${arg}`);
+    }
+  }
+
+  return args;
+}
+
+function ensureDir(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+function logFactory(logFile) {
+  return (message) => {
+    const stamp = new Date().toISOString().replace("T", " ").slice(0, 19);
+    const line = `${stamp} | ${message}`;
+    console.log(line);
+    fs.appendFileSync(logFile, `${line}\n`, "utf8");
+  };
+}
+
+function isUrl(value) {
+  return /^[a-z]+:\/\//i.test(value);
+}
+
+function expandPathVariables(value) {
+  if (!value) {
+    return value;
+  }
+
+  let expanded = value.replace(/%([^%]+)%/g, (_, name) => process.env[name] ?? `%${name}%`);
+  if (expanded.startsWith("~")) {
+    const home = process.env.USERPROFILE || process.env.HOME;
+    if (home) {
+      expanded = path.join(home, expanded.slice(1));
+    }
+  }
+  return expanded;
+}
+
+function resolvePathLike(configDir, value) {
+  if (!value) {
+    return "";
+  }
+  if (isUrl(value)) {
+    return value;
+  }
+  const expanded = expandPathVariables(value);
+  return path.isAbsolute(expanded) ? expanded : path.resolve(configDir, expanded);
+}
+
+function parsePublishTime(value) {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(value ?? "");
+  if (!match) {
+    throw new Error(`无效的 publishTime: ${value}`);
+  }
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
+    throw new Error(`无效的 publishTime: ${value}`);
+  }
+  return { hours, minutes };
+}
+
+function computeNextOccurrence(now, publishTime) {
+  const { hours, minutes } = parsePublishTime(publishTime);
+  const target = new Date(now);
+  target.setHours(hours, minutes, 0, 0);
+  if (target <= now) {
+    target.setDate(target.getDate() + 1);
+  }
+  return target;
+}
+
+function buildUploaderArgs(repoRoot, job) {
+  const args = [
+    path.join(repoRoot, "scripts", "fanqie_upload.mjs"),
+    "--book-title", job.bookTitle,
+    "--chapters-dir", job.chaptersDir,
+    "--auto-next-count", String(job.chaptersPerRun),
+    "--profile-dir", job.profileDir,
+    "--artifacts-dir", job.artifactsDir,
+    "--start-url", job.startUrl,
+  ];
+
+  if (job.seedProfileDir) {
+    args.push("--seed-profile-dir", job.seedProfileDir);
+  }
+  if (job.chromePath) {
+    args.push("--chrome-path", job.chromePath);
+  }
+  if (job.debug) {
+    args.push("--debug");
+  }
+  if (job.headless !== false) {
+    args.push("--headless");
+  }
+  return args;
+}
+
+async function loadJson(filePath, fallbackValue) {
+  try {
+    return JSON.parse(await fsp.readFile(filePath, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return fallbackValue;
+    }
+    throw error;
+  }
+}
+
+async function saveJson(filePath, value) {
+  ensureDir(path.dirname(filePath));
+  await fsp.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function normalizeJob(configDir, defaults, rawJob) {
+  const job = {
+    id: rawJob.id,
+    enabled: rawJob.enabled !== false,
+    bookTitle: rawJob.bookTitle,
+    chaptersDir: resolvePathLike(configDir, rawJob.chaptersDir),
+    publishTime: rawJob.publishTime ?? defaults.publishTime ?? "12:00",
+    chaptersPerRun: Number(rawJob.chaptersPerRun ?? defaults.chaptersPerRun ?? 1),
+    headless: rawJob.headless ?? defaults.headless ?? true,
+    startUrl: rawJob.startUrl ?? defaults.startUrl ?? DEFAULT_START_URL,
+    seedProfileDir: resolvePathLike(configDir, rawJob.seedProfileDir ?? defaults.seedProfileDir ?? ""),
+    chromePath: resolvePathLike(configDir, rawJob.chromePath ?? defaults.chromePath ?? ""),
+    profileDir: resolvePathLike(
+      configDir,
+      rawJob.profileDir ?? path.join(defaults.profileRoot ?? ".run/fanqie_daily_profiles", rawJob.id),
+    ),
+    artifactsDir: resolvePathLike(
+      configDir,
+      rawJob.artifactsDir ?? path.join(defaults.artifactsRoot ?? ".run/fanqie_daily_artifacts", rawJob.id),
+    ),
+    debug: rawJob.debug ?? defaults.debug ?? false,
+  };
+
+  if (!job.id) {
+    throw new Error("job.id 不能为空");
+  }
+  if (!job.bookTitle) {
+    throw new Error(`job ${job.id} 缺少 bookTitle`);
+  }
+  if (!job.chaptersDir) {
+    throw new Error(`job ${job.id} 缺少 chaptersDir`);
+  }
+  if (!Number.isFinite(job.chaptersPerRun) || job.chaptersPerRun <= 0) {
+    throw new Error(`job ${job.id} 的 chaptersPerRun 必须大于 0`);
+  }
+  parsePublishTime(job.publishTime);
+  return job;
+}
+
+async function runUploaderForJob(repoRoot, log, job, dryRun) {
+  const args = buildUploaderArgs(repoRoot, job);
+  const displayCommand = [process.execPath, ...args].join(" ");
+  if (dryRun) {
+    log(`[${job.id}] dry-run: ${displayCommand}`);
+    return 0;
+  }
+
+  log(`[${job.id}] 启动上传任务: ${displayCommand}`);
+  return await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, args, {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        PYTHONIOENCODING: "utf-8",
+        PYTHONUTF8: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const bindStream = (stream, label) => {
+      const rl = readline.createInterface({ input: stream });
+      rl.on("line", (line) => {
+        log(`[${job.id}] ${label}${line}`);
+      });
+    };
+    bindStream(child.stdout, "");
+    bindStream(child.stderr, "ERR ");
+
+    child.on("error", reject);
+    child.on("close", (code) => resolve(code ?? 1));
+  });
+}
+
+function isJobDue(stateEntry, now, runNow) {
+  if (runNow) {
+    return true;
+  }
+  if (!stateEntry.nextRunAt) {
+    return false;
+  }
+  return new Date(stateEntry.nextRunAt) <= now;
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  if (args.help) {
+    printHelp();
+    return;
+  }
+
+  const configPath = args.configPath;
+  const repoRoot = path.dirname(configPath);
+  const configDir = path.dirname(configPath);
+  const rawConfig = await loadJson(configPath, null);
+  if (!rawConfig) {
+    throw new Error(`配置文件不存在: ${configPath}`);
+  }
+
+  const defaults = rawConfig.defaults ?? {};
+  const statePath = resolvePathLike(configDir, rawConfig.stateFile ?? ".run/fanqie_daily_scheduler_state.json");
+  const logPath = resolvePathLike(configDir, rawConfig.logFile ?? ".run/fanqie_daily_scheduler.log");
+  const tickSeconds = Number(rawConfig.tickSeconds ?? 30);
+  const retryMinutes = Number(rawConfig.retryMinutes ?? defaults.retryMinutes ?? 30);
+
+  ensureDir(path.dirname(logPath));
+  const log = logFactory(logPath);
+
+  const jobs = (rawConfig.jobs ?? [])
+    .map((job) => normalizeJob(configDir, defaults, job))
+    .filter((job) => job.enabled)
+    .filter((job) => !args.jobId || job.id === args.jobId);
+
+  if (!jobs.length) {
+    log("没有启用的日更任务，调度器退出");
+    return;
+  }
+
+  const state = await loadJson(statePath, { jobs: {} });
+  state.jobs ??= {};
+  const now = new Date();
+  for (const job of jobs) {
+    const entry = state.jobs[job.id] ?? {};
+    if (!args.runNow) {
+      entry.nextRunAt = computeNextOccurrence(now, job.publishTime).toISOString();
+    }
+    entry.lastKnownPublishTime = job.publishTime;
+    state.jobs[job.id] = entry;
+  }
+  await saveJson(statePath, state);
+  log(`调度器启动，任务数=${jobs.length}，config=${configPath}`);
+  let forceRunNow = args.runNow;
+
+  while (true) {
+    const loopNow = new Date();
+    const latestState = await loadJson(statePath, { jobs: {} });
+    latestState.jobs ??= {};
+
+    for (const job of jobs) {
+      const entry = latestState.jobs[job.id] ?? {};
+      if (!args.runNow && !entry.nextRunAt) {
+        entry.nextRunAt = computeNextOccurrence(loopNow, job.publishTime).toISOString();
+        latestState.jobs[job.id] = entry;
+      }
+      if (!isJobDue(entry, loopNow, forceRunNow)) {
+        continue;
+      }
+
+      entry.lastAttemptAt = new Date().toISOString();
+      latestState.jobs[job.id] = entry;
+      await saveJson(statePath, latestState);
+
+      const exitCode = await runUploaderForJob(repoRoot, log, job, args.dryRun);
+      if (exitCode === 0) {
+        entry.lastSuccessAt = new Date().toISOString();
+        entry.lastExitCode = 0;
+        entry.nextRunAt = computeNextOccurrence(new Date(), job.publishTime).toISOString();
+        log(`[${job.id}] 本轮任务成功，下一次执行时间 ${entry.nextRunAt}`);
+      } else {
+        entry.lastFailureAt = new Date().toISOString();
+        entry.lastExitCode = exitCode;
+        entry.nextRunAt = new Date(Date.now() + retryMinutes * 60 * 1000).toISOString();
+        log(`[${job.id}] 本轮任务失败，exit=${exitCode}，将在 ${entry.nextRunAt} 重试`);
+      }
+      latestState.jobs[job.id] = entry;
+      await saveJson(statePath, latestState);
+    }
+
+    forceRunNow = false;
+
+    if (args.once) {
+      log("完成单轮检查，调度器退出");
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, tickSeconds * 1000));
+  }
+}
+
+main().catch((error) => {
+  console.error(error?.stack || String(error));
+  process.exitCode = 1;
+});
