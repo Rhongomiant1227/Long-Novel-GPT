@@ -11,9 +11,10 @@ import sys
 import threading
 import time
 import traceback
+import unicodedata
 from copy import deepcopy
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 from backend.backend_utils import get_model_config_from_provider_model
 from core.draft_writer import DraftWriter
@@ -22,6 +23,7 @@ from core.plot_writer import PlotWriter
 from core.writer_utils import KeyPointMsg
 from llm_api import ModelConfig, stream_chat
 from llm_api.chat_messages import ChatMessages
+from split_full_novel import split_full_novel
 
 
 DEFAULT_SYSTEM_PROMPT = "你是资深中文网文总编、商业策划和长篇连载统筹。"
@@ -236,6 +238,110 @@ SERIES_BIBLE_PART_SPECS = [
 ]
 
 
+CHAPTER_NUMBER_TOKEN_RE = r'[\d零〇一二两三四五六七八九十百千万IVXLCDMivxlcdmⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]+'
+CHAPTER_HEADING_PATTERNS = (
+    re.compile(
+        rf'^\s*第\s*(?P<number>{CHAPTER_NUMBER_TOKEN_RE})\s*章(?:\s+|[：:，,、.．。—-]\s*)?(?P<title>.*)$',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf'^\s*(?:chapter|chap\.?)\s*(?P<number>{CHAPTER_NUMBER_TOKEN_RE})\b(?:\s+|[：:，,、.．。—-]\s*)?(?P<title>.*)$',
+        re.IGNORECASE,
+    ),
+)
+ROMAN_NUMERAL_VALUES = {
+    'I': 1,
+    'V': 5,
+    'X': 10,
+    'L': 50,
+    'C': 100,
+    'D': 500,
+    'M': 1000,
+}
+
+
+def parse_chinese_number_token(text: str) -> int | None:
+    value = (text or '').strip().replace('〇', '零').replace('两', '二')
+    if not value:
+        return None
+    allowed = set(CN_DIGIT_MAP) | {'十', '百', '千', '万'}
+    if any(char not in allowed for char in value):
+        return None
+    if all(char in CN_DIGIT_MAP for char in value):
+        total = 0
+        for char in value:
+            total = total * 10 + CN_DIGIT_MAP[char]
+        return total
+
+    unit_map = {'十': 10, '百': 100, '千': 1000, '万': 10000}
+    total = 0
+    section = 0
+    number = 0
+    for char in value:
+        if char in CN_DIGIT_MAP:
+            number = CN_DIGIT_MAP[char]
+            continue
+        unit = unit_map[char]
+        if unit == 10000:
+            section = section + number
+            total += (section or 1) * unit
+            section = 0
+            number = 0
+            continue
+        if number == 0:
+            number = 1
+        section += number * unit
+        number = 0
+    return total + section + number
+
+
+def parse_roman_number_token(text: str) -> int | None:
+    value = unicodedata.normalize('NFKC', (text or '').strip()).upper()
+    if not value:
+        return None
+    if any(char not in ROMAN_NUMERAL_VALUES for char in value):
+        return None
+    total = 0
+    previous = 0
+    for char in reversed(value):
+        current = ROMAN_NUMERAL_VALUES[char]
+        if current < previous:
+            total -= current
+        else:
+            total += current
+            previous = current
+    return total or None
+
+
+def parse_chapter_number_token(text: str) -> int | None:
+    value = unicodedata.normalize('NFKC', (text or '').strip())
+    if not value:
+        return None
+    if value.isdigit():
+        return int(value)
+    chinese_value = parse_chinese_number_token(value)
+    if chinese_value is not None:
+        return chinese_value
+    return parse_roman_number_token(value)
+
+
+def parse_chapter_heading_line(text: str) -> tuple[int | None, str]:
+    line = re.sub(r'\s+', ' ', (text or '').strip())
+    if not line:
+        return None, ''
+    for pattern in CHAPTER_HEADING_PATTERNS:
+        match = pattern.match(line)
+        if not match:
+            continue
+        chapter_number = parse_chapter_number_token(match.group('number'))
+        if chapter_number is None:
+            continue
+        title = match.group('title') or ''
+        title = re.sub(r'\s+', ' ', title).strip(' \t\r\n-—:：，,、.．。')
+        return chapter_number, title
+    return None, line
+
+
 def safe_title(text: str) -> str:
     first_line = ''
     for line in text.splitlines():
@@ -245,15 +351,389 @@ def safe_title(text: str) -> str:
             break
     if not first_line:
         return '未命名章节'
-    return re.sub(r'\s+', ' ', first_line)
+    _, parsed_title = parse_chapter_heading_line(first_line)
+    clean_title = re.sub(r'\s+', ' ', parsed_title).strip(' \t\r\n-—:：，,、.．。')
+    if not clean_title:
+        return '未命名章节'
+    return clean_title
 
 
 def format_chapter_heading(chapter_number: int, title: str) -> str:
-    clean_title = re.sub(r'^\s*第\s*\d+\s*章\s*', '', (title or '').strip())
-    clean_title = re.sub(r'\s+', ' ', clean_title).strip()
-    if not clean_title:
-        clean_title = '未命名章节'
-    return f'第{chapter_number}章 {clean_title}'
+    return f'第{chapter_number}章 {safe_title(title)}'
+
+
+def extract_json_payload(text: str) -> dict[str, Any]:
+    raw = (text or '').strip()
+    if not raw:
+        raise ValueError('LLM did not return JSON content.')
+
+    fenced_match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', raw, re.DOTALL | re.IGNORECASE)
+    if fenced_match:
+        raw = fenced_match.group(1).strip()
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        brace_match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if not brace_match:
+            raise
+        payload = json.loads(brace_match.group(0))
+
+    if not isinstance(payload, dict):
+        raise ValueError('JSON response must be an object.')
+    return payload
+
+
+def normalize_chapter_draft_text(chapter_number: int, title: str, text: str) -> str:
+    heading = format_chapter_heading(chapter_number, title)
+    source = (text or '').strip()
+    body = source
+    lines = source.splitlines()
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        parsed_number, _ = parse_chapter_heading_line(line)
+        if parsed_number is not None:
+            body = '\n'.join(lines[index + 1:]).strip()
+        break
+    if not body:
+        body = source
+    if not body:
+        raise RuntimeError(f'第{chapter_number}章正文为空，无法写入。')
+    return f'{heading}\n\n{body}'.strip()
+
+
+def summarize_critic_issue(issue: dict[str, Any]) -> str:
+    issue_type = str(issue.get('type', 'objective_logic')).strip() or 'objective_logic'
+    explanation = str(issue.get('explanation', '')).strip()
+    excerpt = str(issue.get('excerpt', '')).strip()
+    snippet = explanation or excerpt or '未提供详情'
+    snippet = re.sub(r'\s+', ' ', snippet)
+    if len(snippet) > 36:
+        snippet = snippet[:36] + '...'
+    return f'{issue_type}:{snippet}'
+
+
+CN_DIGIT_MAP = {
+    '零': 0,
+    '〇': 0,
+    '一': 1,
+    '二': 2,
+    '两': 2,
+    '三': 3,
+    '四': 4,
+    '五': 5,
+    '六': 6,
+    '七': 7,
+    '八': 8,
+    '九': 9,
+}
+EXPLICIT_COUNT_CLAIM_RE = re.compile(r'(?P<prefix>[这那]?)(?P<count>[零〇一二三四五六七八九十两百\d]+)个字')
+
+
+def parse_small_number(text: str) -> int:
+    value = (text or '').strip()
+    if not value:
+        return 0
+    if value.isdigit():
+        return int(value)
+    value = value.replace('〇', '零').replace('两', '二')
+    while value.startswith('零'):
+        value = value[1:]
+    if not value:
+        return 0
+    if value in CN_DIGIT_MAP:
+        return CN_DIGIT_MAP[value]
+    if '百' in value:
+        head, tail = value.split('百', 1)
+        head_value = CN_DIGIT_MAP.get(head, 1 if head == '' else 0)
+        return head_value * 100 + parse_small_number(tail)
+    if '十' in value:
+        head, tail = value.split('十', 1)
+        head_value = CN_DIGIT_MAP.get(head, 1 if head == '' else 0)
+        tail_value = parse_small_number(tail)
+        return head_value * 10 + tail_value
+    total = 0
+    for char in value:
+        if char not in CN_DIGIT_MAP:
+            return 0
+        total = total * 10 + CN_DIGIT_MAP[char]
+    return total
+
+
+def number_to_chinese(value: int) -> str:
+    if value < 0:
+        raise ValueError('value must be >= 0')
+    if value < 10:
+        return '零一二三四五六七八九'[value]
+    if value < 100:
+        tens, ones = divmod(value, 10)
+        if tens == 1:
+            prefix = '十'
+        else:
+            prefix = f'{"零一二三四五六七八九"[tens]}十'
+        if ones == 0:
+            return prefix
+        return prefix + '零一二三四五六七八九'[ones]
+    if value < 1000:
+        hundreds, rem = divmod(value, 100)
+        prefix = f'{"零一二三四五六七八九"[hundreds]}百'
+        if rem == 0:
+            return prefix
+        if rem < 10:
+            return prefix + '零' + number_to_chinese(rem)
+        return prefix + number_to_chinese(rem)
+    return str(value)
+
+
+def render_number_like(template: str, value: int) -> str:
+    template = (template or '').strip()
+    if template.isdigit():
+        return str(value)
+    if value == 2:
+        return '两'
+    return number_to_chinese(value)
+
+
+def count_meaningful_chars(text: str) -> int:
+    return len(re.findall(r'[\u4e00-\u9fffA-Za-z0-9]', text or ''))
+
+
+def _line_bounds_for_index(text: str, index: int) -> tuple[int, int]:
+    start = text.rfind('\n', 0, index) + 1
+    end = text.find('\n', index)
+    if end == -1:
+        end = len(text)
+    return start, end
+
+
+def _previous_nonempty_line(text: str, before_index: int) -> str:
+    cursor = max(0, before_index)
+    while cursor > 0:
+        line_end = cursor
+        line_start = text.rfind('\n', 0, line_end - 1) + 1 if line_end > 0 else 0
+        line = text[line_start:line_end].strip()
+        if line:
+            return line
+        cursor = max(0, line_start - 1)
+    return ''
+
+
+def _next_nonempty_line(text: str, after_index: int) -> str:
+    cursor = max(0, after_index)
+    length = len(text)
+    while cursor < length:
+        line_end = text.find('\n', cursor)
+        if line_end == -1:
+            line_end = length
+        line = text[cursor:line_end].strip()
+        if line:
+            return line
+        cursor = line_end + 1
+    return ''
+
+
+def _next_nonempty_lines(text: str, after_index: int, limit: int = 2) -> list[str]:
+    lines: list[str] = []
+    cursor = max(0, after_index)
+    length = len(text)
+    while cursor < length and len(lines) < limit:
+        line_end = text.find('\n', cursor)
+        if line_end == -1:
+            line_end = length
+        line = text[cursor:line_end].strip()
+        if line:
+            lines.append(line)
+        cursor = line_end + 1
+    return lines
+
+
+def _extract_candidate_from_fragment(fragment: str) -> str:
+    candidate = re.sub(r'^[\s:：—\-“”"‘’「」『』（）()]+', '', fragment or '').strip()
+    if not candidate:
+        return ''
+    line = candidate.splitlines()[0].strip()
+    return line[:80]
+
+
+def _extract_tail_candidate_from_line(line: str) -> str:
+    text = (line or '').strip()
+    if not text:
+        return ''
+    for separator in ('——', '—', ':', '：'):
+        if separator in text:
+            tail = text.rsplit(separator, 1)[-1].strip()
+            if tail:
+                return tail
+    return text
+
+
+def _extract_inline_reference_candidate(prefix_text: str) -> str:
+    text = (prefix_text or '').strip()
+    if not text:
+        return ''
+    parts = [part.strip() for part in re.split(r'[，,。！？；;：:“”"‘’「」『』（）()\s]+', text) if part.strip()]
+    if not parts:
+        return ''
+    candidate = parts[-1]
+    if 0 < count_meaningful_chars(candidate) <= 12:
+        return candidate
+    return ''
+
+
+def _extract_previous_reference_candidate(text: str, line_start: int) -> str:
+    prev_line = _previous_nonempty_line(text, line_start - 1)
+    if not prev_line:
+        return ''
+    tail = _extract_tail_candidate_from_line(prev_line)
+    tail_count = count_meaningful_chars(tail)
+    prev_count = count_meaningful_chars(prev_line)
+    if tail and tail_count <= 12 and (tail != prev_line or prev_count <= 12):
+        return tail
+    return ''
+
+
+def scan_explicit_count_mismatch_issues(text: str) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for match in EXPLICIT_COUNT_CLAIM_RE.finditer(text or ''):
+        expected = parse_small_number(match.group('count'))
+        if expected <= 0:
+            continue
+
+        line_start, line_end = _line_bounds_for_index(text, match.start())
+        current_line = text[line_start:line_end]
+        current_line_stripped = current_line.strip()
+        line_before_match = current_line[:match.start() - line_start]
+        line_after_match = current_line[match.end() - line_start:]
+        candidate = ''
+        pattern_type = ''
+
+        if re.match(r'^\s*[：:—\-“"‘「『]', line_after_match):
+            candidate = _extract_candidate_from_fragment(line_after_match)
+            if candidate:
+                pattern_type = 'inline_delimited'
+
+        if not candidate:
+            stripped_after = line_after_match.strip()
+            if stripped_after == '' or re.fullmatch(r'[：:—\-]+', stripped_after):
+                next_lines = _next_nonempty_lines(text, line_end + 1, limit=2)
+                if next_lines:
+                    candidate = next_lines[0]
+                    if len(next_lines) > 1 and re.match(r'^(或是|或者|抑或|亦或|还是)', next_lines[1]):
+                        candidate = ''
+                    elif candidate:
+                        pattern_type = 'next_line_delimited'
+
+        if (
+            not candidate
+            and match.group('prefix') in ('这', '那')
+            and re.match(
+                r'^\s*(像|一出|一落|一响|一出来|一出口|一出现|一现|一下|一旦|刚|才|便|就|直接|瞬间)',
+                line_after_match.strip(),
+            )
+        ):
+            inline_candidate = _extract_inline_reference_candidate(line_before_match)
+            previous_candidate = _extract_previous_reference_candidate(text, line_start)
+            if inline_candidate:
+                candidate = inline_candidate
+                pattern_type = 'backref_inline'
+            elif previous_candidate:
+                candidate = previous_candidate
+                pattern_type = 'backref_previous'
+
+        if not candidate:
+            continue
+
+        actual = count_meaningful_chars(candidate)
+        if actual <= 0 or actual == expected or actual > 24:
+            continue
+
+        old_line = current_line_stripped
+        line_relative_start = match.start() - line_start
+        line_relative_end = match.end() - line_start
+        old_claim = current_line[line_relative_start:line_relative_end]
+        new_claim = old_claim.replace(match.group('count'), render_number_like(match.group('count'), actual), 1)
+        new_line = (current_line[:line_relative_start] + new_claim + current_line[line_relative_end:]).strip()
+        if old_line == new_line:
+            continue
+
+        issue_key = (old_line, new_line)
+        if issue_key in seen:
+            continue
+        seen.add(issue_key)
+        issues.append(
+            {
+                'type': 'count_mismatch',
+                'severity': 'high',
+                'source': 'local_rule',
+                'pattern_type': pattern_type or 'unknown',
+                'auto_fix_safe': pattern_type in {'inline_delimited', 'next_line_delimited'},
+                'objective': True,
+                'excerpt': old_line,
+                'location_hint': current_line_stripped[:80],
+                'explanation': f'“{candidate.strip()}”按可见中文/字母数字计数为 {actual} 个字，与前文“{match.group("count")}个字”不符。',
+                'fix_instruction': f'将“{match.group("count")}个字”修正为“{render_number_like(match.group("count"), actual)}个字”。',
+                'confidence': 100,
+                'expected_count': expected,
+                'actual_count': actual,
+                'candidate_text': candidate.strip(),
+                'old_text': old_line,
+                'new_text': new_line,
+            }
+        )
+
+    return issues
+
+
+def apply_explicit_count_fixes(text: str) -> tuple[str, list[dict[str, Any]]]:
+    current = text or ''
+    applied: list[dict[str, Any]] = []
+
+    while True:
+        issues = scan_explicit_count_mismatch_issues(current)
+        if not issues:
+            break
+
+        changed = False
+        for issue in issues:
+            if not bool(issue.get('auto_fix_safe')):
+                continue
+            old_text = str(issue.get('old_text', '')).strip()
+            new_text = str(issue.get('new_text', '')).strip()
+            if not old_text or not new_text or old_text == new_text:
+                continue
+            if old_text not in current:
+                continue
+            current = current.replace(old_text, new_text, 1)
+            applied.append(issue)
+            changed = True
+
+        if not changed:
+            break
+
+    return current, applied
+
+
+def apply_replacement_operations(text: str, operations: list[dict[str, Any]]) -> tuple[str, int]:
+    current = text
+    applied_count = 0
+    for operation in operations:
+        old_text = str(operation.get('old_text', '')).strip()
+        new_text = str(operation.get('new_text', '')).strip()
+        if not old_text or old_text == new_text:
+            continue
+        occurrences = current.count(old_text)
+        if occurrences == 0:
+            if new_text and new_text in current:
+                continue
+            raise RuntimeError(f'critic patch old_text not found: {old_text[:60]}')
+        if occurrences > 1:
+            raise RuntimeError(f'critic patch old_text is not unique: {old_text[:60]}')
+        current = current.replace(old_text, new_text, 1)
+        applied_count += 1
+    return current, applied_count
 
 
 class AutoNovelRunner:
@@ -265,6 +745,7 @@ class AutoNovelRunner:
         self.memory_dir = ensure_dir(self.project_dir / 'memory')
         self.volumes_dir = ensure_dir(self.project_dir / 'volumes')
         self.manuscript_dir = ensure_dir(self.project_dir / 'manuscript')
+        self.manuscript_chapters_dir = ensure_dir(self.manuscript_dir / 'chapters_txt')
         self.state_path = self.project_dir / 'state.json'
         self.events_path = self.logs_dir / 'events.log'
         self.live_stage_path = self.logs_dir / 'live_stage.json'
@@ -294,6 +775,7 @@ class AutoNovelRunner:
 
         base_main = get_model_config_from_provider_model(args.main_model)
         base_sub = get_model_config_from_provider_model(args.sub_model)
+        base_critic = get_model_config_from_provider_model(args.critic_model or args.main_model)
 
         self.writer_model = clone_model_config(
             base_main,
@@ -314,6 +796,17 @@ class AutoNovelRunner:
             reasoning_effort=args.summary_reasoning_effort,
             **cap_model_output_tokens(base_sub, 6_000),
         )
+        self.critic_model = clone_model_config(
+            base_critic,
+            reasoning_effort=args.critic_reasoning_effort,
+            **cap_model_output_tokens(base_critic, 8_000),
+        )
+        critic_model_name = str(args.critic_model or args.main_model or '').strip().lower()
+        critic_interval = int(args.critic_every_chapters or 0)
+        critic_max_passes = int(args.critic_max_passes or 0)
+        self.critic_enabled = critic_model_name not in {'', '0', 'false', 'off', 'none', 'disable', 'disabled'}
+        if critic_interval < 0 or critic_max_passes < 0:
+            self.critic_enabled = False
 
         self.state = self._load_or_init_state()
         self._sync_manuscript()
@@ -417,6 +910,8 @@ class AutoNovelRunner:
 
     def _infer_stage_type(self, label: str) -> str:
         lower_label = (label or '').lower()
+        if '审校' in label or '校审' in label or 'critic' in lower_label:
+            return 'critic'
         if '正文' in label or 'draft' in lower_label:
             return 'draft'
         if '剧情' in label or 'plot' in lower_label:
@@ -623,6 +1118,48 @@ class AutoNovelRunner:
             self.state['manuscript_last_appended_chapter'] += 1
         self._save_state()
 
+    def export_full_novel_chapters_txt(self) -> None:
+        if not self.full_manuscript_path.exists():
+            return
+        text = read_text(self.full_manuscript_path)
+        chapters = split_full_novel(text)
+        if not chapters:
+            return
+        for path in self.manuscript_chapters_dir.glob('ch_*.txt'):
+            path.unlink()
+        for chapter in chapters:
+            chapter_number = int(chapter['source_number'])
+            chapter_text = str(chapter['text'])
+            write_text(
+                self.manuscript_chapters_dir / f'ch_{chapter_number:04d}.txt',
+                chapter_text.rstrip() + '\n',
+            )
+
+    def rebuild_full_manuscript(self, export_chapters_txt: bool = True) -> None:
+        completed = sorted(
+            self.state.get('completed_chapters', []),
+            key=lambda item: int(item.get('chapter_number', 0) or 0),
+        )
+        chunks: list[str] = []
+        for item in completed:
+            draft_path = Path(item['draft_file'])
+            if not draft_path.exists():
+                self.log(f'[manuscript] 跳过缺失章稿：{draft_path}')
+                continue
+            text = read_text(draft_path).strip()
+            if text:
+                chunks.append(text)
+
+        if chunks:
+            write_text(self.full_manuscript_path, '\n\n'.join(chunks).rstrip() + '\n')
+        elif self.full_manuscript_path.exists():
+            self.full_manuscript_path.unlink()
+
+        self.state['manuscript_last_appended_chapter'] = len(completed)
+        self._save_state()
+        if export_chapters_txt:
+            self.export_full_novel_chapters_txt()
+
     def _volume_dir(self, volume_number: int) -> Path:
         return ensure_dir(self.volumes_dir / f'vol_{volume_number:03d}')
 
@@ -673,7 +1210,16 @@ class AutoNovelRunner:
     def _estimated_total_volumes(self) -> int:
         return max(1, math.ceil(self._estimated_total_chapters() / self.args.chapters_per_volume))
 
-    def call_llm(self, label: str, user_prompt: str, model: ModelConfig, system_prompt: str = DEFAULT_SYSTEM_PROMPT) -> str:
+    def _call_llm_raw(
+        self,
+        label: str,
+        user_prompt: str,
+        model: ModelConfig,
+        system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        *,
+        response_json: bool = False,
+        stream_output: bool = True,
+    ) -> str:
         messages = [
             {'role': 'system', 'content': system_prompt.strip()},
             {'role': 'user', 'content': user_prompt.strip()},
@@ -686,7 +1232,7 @@ class AutoNovelRunner:
         final_messages: ChatMessages | None = None
 
         self.mark_stage(label, force=True)
-        gen = stream_chat(model, messages)
+        gen = stream_chat(model, messages, response_json=response_json)
         while True:
             try:
                 current = next(gen)
@@ -701,8 +1247,10 @@ class AutoNovelRunner:
                     reason = getattr(current, 'stream_fallback_reason', '') or 'stream transport error'
                     self.log(f'[{label}] 流式链路异常，已自动降级为非流式补全：{reason}')
                     fallback_logged = True
-                if response_text:
+                if response_text and stream_output:
                     self._stream_text(label, response_text)
+                    self.mark_stage(label)
+                elif response_text:
                     self.mark_stage(label)
                 if response_text and time.time() - last_log_time >= 8 and len(response_text) != last_length:
                     self.log(f'[{label}] 正在生成，当前约 {len(response_text)} 字')
@@ -713,10 +1261,302 @@ class AutoNovelRunner:
             raise RuntimeError(f'{label} 未返回有效内容。')
 
         response = final_messages.response.strip()
-        self._stream_text(label, response, finish=True)
+        if stream_output:
+            self._stream_text(label, response, finish=True)
         self.clear_stage()
         self.log(f'[{label}] 完成，用时 {time.time() - start_time:.1f}s，输出 {len(response)} 字，成本 {final_messages.cost_info}')
         return response
+
+    def call_llm(self, label: str, user_prompt: str, model: ModelConfig, system_prompt: str = DEFAULT_SYSTEM_PROMPT) -> str:
+        return self._call_llm_raw(
+            label,
+            user_prompt,
+            model,
+            system_prompt=system_prompt,
+            response_json=False,
+            stream_output=True,
+        )
+
+    def call_llm_json(self, label: str, user_prompt: str, model: ModelConfig, system_prompt: str = DEFAULT_SYSTEM_PROMPT) -> dict[str, Any]:
+        raw = self._call_llm_raw(
+            label,
+            user_prompt,
+            model,
+            system_prompt=system_prompt,
+            response_json=True,
+            stream_output=False,
+        )
+        return extract_json_payload(raw)
+
+    def _should_run_critic_for_chapter(self, chapter_number: int, force: bool = False) -> bool:
+        if force:
+            return True
+        if not self.critic_enabled:
+            return False
+        interval = max(0, int(self.args.critic_every_chapters or 0))
+        if interval > 0:
+            return chapter_number % interval == 0
+        pending = self.state.get('pending_chapters') or []
+        if not pending:
+            return False
+        batch_tail = int(pending[-1].get('chapter_number', 0) or 0)
+        return chapter_number == batch_tail
+
+    def _normalize_critic_report(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raw_issues = payload.get('issues') or []
+        issues: list[dict[str, Any]] = []
+        if isinstance(raw_issues, list):
+            for raw_issue in raw_issues:
+                if not isinstance(raw_issue, dict):
+                    continue
+                if raw_issue.get('objective', True) is False:
+                    continue
+                issue_type = str(raw_issue.get('type', 'objective_logic')).strip() or 'objective_logic'
+                severity = str(raw_issue.get('severity', 'medium')).strip().lower()
+                if severity not in {'high', 'medium', 'low'}:
+                    severity = 'medium'
+                excerpt = str(raw_issue.get('excerpt', '')).strip()
+                explanation = str(raw_issue.get('explanation', '')).strip()
+                fix_instruction = str(raw_issue.get('fix_instruction', '')).strip()
+                location_hint = str(raw_issue.get('location_hint', '')).strip()
+                if not (excerpt or explanation or fix_instruction):
+                    continue
+                confidence_raw = raw_issue.get('confidence', 0)
+                try:
+                    confidence = max(0, min(100, int(confidence_raw)))
+                except (TypeError, ValueError):
+                    confidence = 0
+                issues.append(
+                    {
+                        'type': issue_type,
+                        'severity': severity,
+                        'excerpt': excerpt,
+                        'explanation': explanation,
+                        'fix_instruction': fix_instruction,
+                        'location_hint': location_hint,
+                        'confidence': confidence,
+                    }
+                )
+
+        needs_fix = bool(payload.get('needs_fix')) or bool(issues)
+        return {
+            'needs_fix': needs_fix,
+            'issues': issues,
+            'clean_note': str(payload.get('clean_note', '')).strip(),
+        }
+
+    def _normalize_patch_operations(self, payload: dict[str, Any]) -> list[dict[str, str]]:
+        raw_operations = payload.get('operations') or []
+        operations: list[dict[str, str]] = []
+        if not isinstance(raw_operations, list):
+            return operations
+        for raw_operation in raw_operations:
+            if not isinstance(raw_operation, dict):
+                continue
+            old_text = str(raw_operation.get('old_text', '')).strip()
+            new_text = str(raw_operation.get('new_text', '')).strip()
+            reason = str(raw_operation.get('reason', '')).strip()
+            if not old_text or not new_text or old_text == new_text:
+                continue
+            operations.append(
+                {
+                    'old_text': old_text,
+                    'new_text': new_text,
+                    'reason': reason,
+                }
+            )
+        return operations
+
+    def critic_review_draft(self, chapter: dict, plot_text: str, draft_text: str, pass_index: int = 1) -> dict[str, Any]:
+        prompt = f"""
+你是中文长篇连载的“客观事实 critic”。请只检查这章正文中的客观、可验证、无需主观判断的语言逻辑错误。
+
+只允许报告以下类型：
+1. 明确计数错误：如“三个字/七个人/两次/第八条”与实际内容不符。
+2. 引号内短句与前文声称的字数不符。
+3. 同章内人名、称谓、身份、数量、顺序、时序、位置或动作结果发生直接矛盾。
+4. 明确的枚举数量、先后关系、左右/上下/内外等空间关系自相矛盾。
+5. 其他能从当前章节文本直接证明的硬性逻辑错误。
+
+执行要求：
+- 必须尽量穷举全部可证明问题，不要只报最明显的一条。
+- 凡是出现“X个字 / X个人 / X次 / 第X条 / 第X页 / 第X签 / X步 / X层 / X息”等显式数量宣称，都要逐一核对。
+- 如果同一章里有多处独立问题，要分别列出，不要合并成一句模糊描述。
+- 输出前再自检一遍，确认没有遗漏同类显式计数错误。
+
+禁止事项：
+- 不要提文风、节奏、爽点、情绪浓度、设定喜好等主观建议。
+- 不要把“故意留白”“尚未解释”当成错误。
+- 如果不确定，就不要报。
+
+请返回严格 JSON，对象结构如下：
+{{
+  "needs_fix": true,
+  "issues": [
+    {{
+      "type": "count_mismatch",
+      "severity": "high",
+      "objective": true,
+      "excerpt": "原文中的关键句",
+      "location_hint": "可选，位置提示",
+      "explanation": "为什么这是客观错误",
+      "fix_instruction": "最小修复指令，告诉作者应如何改",
+      "confidence": 95
+    }}
+  ],
+  "clean_note": "如果无问题，用一句话说明已通过。"
+}}
+
+如果没有客观问题：
+- "needs_fix" 必须为 false
+- "issues" 必须为空数组
+
+【章节信息】
+- 章节号：第 {chapter['chapter_number']} 章
+- 标题：{chapter['title']}
+- 第 {pass_index} 轮审校
+
+【本章剧情梗概】
+{plot_text.strip() or '（无）'}
+
+【本章正文】
+{draft_text.strip()}
+"""
+        payload = self.call_llm_json(
+            f'第{chapter["chapter_number"]}章审校第{pass_index}轮',
+            prompt,
+            self.critic_model,
+            system_prompt='你是只抓客观语言逻辑硬伤的严格审校员。',
+        )
+        return self._normalize_critic_report(payload)
+
+    def critic_rewrite_draft(
+        self,
+        chapter: dict,
+        plot_text: str,
+        draft_text: str,
+        report: dict[str, Any],
+        pass_index: int = 1,
+    ) -> str:
+        issues_json = json.dumps(report.get('issues', []), ensure_ascii=False, indent=2)
+        prompt = f"""
+请在不改变本章核心事件、人物立场、世界规则、章节节奏和风格的前提下，对这一章给出“最小必要替换操作”，只修复下面这些已经确认的客观逻辑问题。
+
+硬性要求：
+- 不要重写整章，只返回局部替换操作。
+- 每个 old_text 必须是原文中真实存在、且足够唯一的原句或短段。
+- 每个 new_text 只能做最小修正，不要顺手润色或扩写。
+- 如果一个问题只需改一个数字或一句话，就不要输出更大范围。
+- 返回严格 JSON：
+{{
+  "operations": [
+    {{
+      "old_text": "原文中需要被替换的唯一片段",
+      "new_text": "替换后的片段",
+      "reason": "一句话说明修了什么"
+    }}
+  ],
+  "note": "可选"
+}}
+- 如果所有问题都已在现有文本中被修复，返回空 operations。
+
+【本章剧情梗概】
+{plot_text.strip() or '（无）'}
+
+【待修复问题】
+{issues_json}
+
+【原章节正文】
+{draft_text.strip()}
+"""
+        payload = self.call_llm_json(
+            f'第{chapter["chapter_number"]}章修订第{pass_index}轮',
+            prompt,
+            self.critic_model,
+            system_prompt='你是只做局部替换修订的长篇正文修稿编辑。',
+        )
+        operations = self._normalize_patch_operations(payload)
+        if not operations:
+            raise RuntimeError(f'第{chapter["chapter_number"]}章 critic 未返回可应用的局部替换操作。')
+        patched_text, applied_count = apply_replacement_operations(draft_text, operations)
+        if applied_count <= 0:
+            raise RuntimeError(f'第{chapter["chapter_number"]}章 critic 局部替换未实际生效。')
+        return normalize_chapter_draft_text(chapter['chapter_number'], chapter['title'], patched_text)
+
+    def apply_chapter_critic(self, chapter: dict, plot_text: str, draft_text: str, force: bool = False) -> str:
+        chapter_number = int(chapter['chapter_number'])
+        current_text = normalize_chapter_draft_text(chapter_number, chapter['title'], draft_text)
+        if not self._should_run_critic_for_chapter(chapter_number, force=force):
+            return current_text
+
+        current_text, local_issues = apply_explicit_count_fixes(current_text)
+        if local_issues:
+            preview = '；'.join(summarize_critic_issue(issue) for issue in local_issues[:3])
+            self.log(f'[第{chapter_number}章critic] 本地规则先修复 {len(local_issues)} 处显式计数字问题：{preview}')
+
+        max_passes = max(0, int(self.args.critic_max_passes or 0))
+        repeated_issue_signatures: dict[str, int] = {}
+        pass_index = 1
+        while True:
+            review = self.with_retry(
+                f'第{chapter_number}章审校第{pass_index}轮',
+                lambda pass_index=pass_index: self.critic_review_draft(
+                    chapter,
+                    plot_text,
+                    current_text,
+                    pass_index=pass_index,
+                ),
+            )
+            issues = review.get('issues', [])
+            if not review.get('needs_fix') or not issues:
+                clean_note = review.get('clean_note') or '未发现客观语言逻辑问题。'
+                self.log(f'[第{chapter_number}章critic] 第 {pass_index} 轮通过：{clean_note}')
+                return current_text
+
+            issue_signature = json.dumps(
+                [
+                    {
+                        'type': str(issue.get('type', '')).strip(),
+                        'excerpt': str(issue.get('excerpt', '')).strip(),
+                        'fix_instruction': str(issue.get('fix_instruction', '')).strip(),
+                    }
+                    for issue in issues
+                ],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            repeated_issue_signatures[issue_signature] = repeated_issue_signatures.get(issue_signature, 0) + 1
+            if repeated_issue_signatures[issue_signature] >= 3:
+                raise RuntimeError(
+                    f'第{chapter_number}章 critic 连续多轮返回同一组问题，判定为无收敛进展，停止自动复检。'
+                )
+
+            issue_preview = '；'.join(summarize_critic_issue(issue) for issue in issues[:3])
+            self.log(f'[第{chapter_number}章critic] 第 {pass_index} 轮发现 {len(issues)} 个客观问题：{issue_preview}')
+            if max_passes > 0 and pass_index >= max_passes:
+                raise RuntimeError(
+                    f'第{chapter_number}章 critic 在 {max_passes} 轮后仍有 {len(issues)} 个客观问题未解决。'
+                )
+
+            previous_text = current_text
+            current_text = self.with_retry(
+                f'第{chapter_number}章修订第{pass_index}轮',
+                lambda pass_index=pass_index, review=review: self.critic_rewrite_draft(
+                    chapter,
+                    plot_text,
+                    current_text,
+                    review,
+                    pass_index=pass_index,
+                ),
+            )
+            if current_text == previous_text:
+                raise RuntimeError(f'第{chapter_number}章 critic 修订未对正文产生任何变化，停止自动复检。')
+            current_text, local_issues = apply_explicit_count_fixes(current_text)
+            if local_issues:
+                preview = '；'.join(summarize_critic_issue(issue) for issue in local_issues[:3])
+                self.log(f'[第{chapter_number}章critic] 第 {pass_index} 轮后本地规则追加修正 {len(local_issues)} 处：{preview}')
+            self.log(f'[第{chapter_number}章critic] 第 {pass_index} 轮已完成最小修订，准备复检。')
+            pass_index += 1
 
     def run_writer(self, label: str, writer, user_prompt: str, pair_span: tuple[int, int] | None = None) -> list[tuple[str, str]]:
         start_time = time.time()
@@ -760,7 +1600,10 @@ class AutoNovelRunner:
                         merged_parts.append(text_part)
                 merged_text = '\n'.join(part for part in merged_parts if part)
                 if merged_text.strip():
-                    self._stream_text(current_stream_label, merged_text)
+                    # Mapping/json stages are internal program steps; showing raw token text
+                    # leaks tool-oriented responses into the live novel stream.
+                    if '映射文本' not in current_stream_label:
+                        self._stream_text(current_stream_label, merged_text)
                     self.mark_stage(current_stream_label)
 
             if time.time() - last_log_time >= 8:
@@ -1034,6 +1877,27 @@ class AutoNovelRunner:
             return False
         return int(self.state.get('generated_chars', 0) or 0) >= force_finish
 
+    def _terminal_finish_runway_chars(self) -> int:
+        max_target_chars = self._effective_max_target_chars()
+        if max_target_chars <= 0:
+            return 0
+        recent_average = self._recent_average_chapter_chars()
+        return max(180_000, min(320_000, recent_average * 40))
+
+    def _remaining_absolute_runway_chars(self) -> int:
+        max_target_chars = self._effective_max_target_chars()
+        if max_target_chars <= 0:
+            return 0
+        return max(0, max_target_chars - int(self.state.get('generated_chars', 0) or 0))
+
+    def _in_terminal_finish_mode(self) -> bool:
+        if not self._in_force_finish_mode():
+            return False
+        max_target_chars = self._effective_max_target_chars()
+        if max_target_chars <= 0:
+            return False
+        return self._remaining_absolute_runway_chars() <= self._terminal_finish_runway_chars()
+
     def _recent_average_chapter_chars(self, limit: int = 8) -> int:
         completed = self.state.get('completed_chapters', [])
         recent = [
@@ -1067,6 +1931,14 @@ class AutoNovelRunner:
                 auto_lines.extend([
                     '- 当前已超过强制收束阈值，后续章节必须高密度回收，不能再把终局拆成长段新篇章。',
                     '- 如果单章足以完成一个关键终局环节、尾声或后日谈，可以直接完成，不强制为下一章留人工续命钩子。',
+                ])
+            if self._in_terminal_finish_mode():
+                auto_lines.extend([
+                    f'- 当前距离最终绝对上限仅剩约 {self._remaining_absolute_runway_chars()} 字，后续已经不是常规收尾，而是最后冲刺。',
+                    '- 从现在开始，章节功能只允许是“终局落判 / 命运落点 / 尾声 / 后日谈”之一或其组合。',
+                    '- 禁止再引入新的主反派、新证人、新地图、新制度分支、新悬案；若仍有解释空白，必须选择最能闭环的一种解释直接落槌。',
+                    '- 每章至少完整关闭一个未解决事项；若一章能够同时关闭多项终局任务，必须合并完成。',
+                    '- 若正文终局已经成立，本章或下一章应直接转入尾声；若尾声已成立，下一章应直接进入后日谈并准备全文结束。',
                 ])
             missing = completion_check.get('missing') or []
             if missing:
@@ -1155,6 +2027,11 @@ class AutoNovelRunner:
             sections.insert(
                 13,
                 '当前文本已经超过强制收束阈值，后续估算必须按“高压缩完结”处理，不要继续按长篇常规节奏外扩。',
+            )
+        if self._in_terminal_finish_mode():
+            sections.insert(
+                14,
+                f'当前距离最终绝对上限仅剩约 {self._remaining_absolute_runway_chars()} 字，后续估算必须保证在这段字数内完成全文终局、尾声与后日谈；若常规写法装不下，必须主动合并任务并压缩完结。',
             )
 
         pending_outlines = self._recent_pending_outlines(limit=3)
@@ -1361,17 +2238,29 @@ class AutoNovelRunner:
 - 不允许再设计“本来还能再写几十章”的终局分叉，必须尽快闭合责任链、主角终局、关系落点、尾声与后日谈
 - 如果一章足以完成一个关键终局环节，可以直接完成，不强制保留下一章钩子
 """
+        if self._in_terminal_finish_mode():
+            finale_extra_rules += f"""
+- 当前已进入最终绝对上限前的最后冲刺区，剩余可用字数仅约 {self._remaining_absolute_runway_chars()} 字
+- 后续章节只允许承担“终局落判 / 命运落点 / 尾声 / 后日谈”之一或其组合，不再允许任何过渡型拖延章节
+- 禁止引入新角色职责、新证词支线、新地点、新制度分支；如存在空白，直接采用最能闭环的解释落判
+- 每章必须至少完整关闭一个未解事项；如果一章能够关闭两项以上，就必须合并，不得拆章续命
+- 如果本章已经适合成为正文终章、尾声章或后日谈章，就直接写到位，不得再为后续保留人工悬念
+"""
 
         chapter_shape_rule = '- 每章都要有明确目标、阻力、推进、变化与章末钩子'
         if self._in_finale_mode():
             chapter_shape_rule = '- 每章都要有明确目标、阻力、推进与变化；若承担终局/尾声/后日谈功能，可直接完成，不强制章末钩子'
         if self._in_force_finish_mode():
             chapter_shape_rule = '- 每章都要明确承担剩余终局任务之一，并高密度推进；不允许为了续章而空转或强行保留章末钩子'
+        if self._in_terminal_finish_mode():
+            chapter_shape_rule = '- 每章只能承担终局落判、人物命运落点、尾声、后日谈之一或其组合；必须直接关闭未解事项，不得铺垫任何新枝线'
         chapter_end_rule = '- 每章都要有实质推进与章末卡点'
         if self._in_finale_mode():
             chapter_end_rule = '- 每章都要有实质推进；若本章承担终局、尾声或后日谈功能，可以直接完成该功能，不强制章末卡点'
         if self._in_force_finish_mode():
             chapter_end_rule = '- 每章都要高密度推进终局收束；若本章已经适合直接完成终局/尾声/后日谈，则直接完成，不得为了续章再留人工卡点'
+        if self._in_terminal_finish_mode():
+            chapter_end_rule = '- 每章都必须显著减少全书剩余未解事项；若本章已适合成为正文终章、尾声章或后日谈章，必须直接收束到位，不得拖延'
 
         outline_prompt = f"""
 请规划接下来这一批章节的大纲：第 {next_chapter} 章 到 第 {chapter_end} 章。
@@ -1383,6 +2272,7 @@ class AutoNovelRunner:
 - 兼顾主线推进、副线拉扯、人物关系变化与阶段性爽点
 - 单章必须服务长篇连载，不要写成孤立的无关插曲
 - 必须是中文番茄风长篇网文节奏
+- 章节编号必须使用阿拉伯数字格式“第1章”，禁止写成“第一章”“第Ⅰ章”“Chapter 1”
 - {chapter_end_rule.lstrip('- ').strip()}
 - 单章定位是“章节大纲”，不是正文，不要写成小说正文
 {finale_extra_rules}
@@ -1465,11 +2355,19 @@ class AutoNovelRunner:
 - 当前已超过强制收束阈值，本章必须高密度推进剩余终局任务，不允许再把终局拆成松散长段
 - 章末如需保留交接点，也只能服务于本书剩余极少章节的收束，不能制造新的大悬念
 """
+        if self._in_terminal_finish_mode():
+            finale_plot_rules += """
+- 当前已进入最终绝对上限前的最后冲刺，本章只允许写“终局落判 / 命运落点 / 尾声 / 后日谈”之一或其组合
+- 禁止引入任何新的大谜团、新反派、新证人、新地点；如存在未说明空白，直接选取最能闭环的解释落槌
+- 本章必须至少实质性关闭一项未解事项；若能在一章内同时关闭多项，就必须合并完成
+"""
         plot_ending_rule = '- 章末必须保留强卡点，为下一章续接'
         if self._in_finale_mode():
             plot_ending_rule = '- 章末可以保留轻交接点，但应优先服务终局收束，不强制强卡点'
         if self._in_force_finish_mode():
             plot_ending_rule = '- 若本章已适合直接完成一个终局环节、尾声或后日谈，可直接收住，不得为了续章制造强卡点'
+        if self._in_terminal_finish_mode():
+            plot_ending_rule = '- 若本章适合直接写成正文终章、尾声章或后日谈章，则直接收束，不得为了续章保留任何人工悬念'
         prompt = f"""
 请把这章大纲扩写成详细剧情梗概。
 
@@ -1516,6 +2414,10 @@ class AutoNovelRunner:
         min_chars = max(1400, int(self.args.chapter_char_target * 0.8))
         target_chars = self.args.chapter_char_target
         max_chars = max(target_chars + 600, 2600)
+        if self._in_terminal_finish_mode():
+            min_chars = 1200
+            target_chars = min(target_chars, 1800)
+            max_chars = min(max_chars, 2200)
         finale_draft_rules = ''
         if self._in_finale_mode():
             finale_draft_rules = """
@@ -1528,6 +2430,12 @@ class AutoNovelRunner:
 - 当前已超过强制收束阈值，本章必须尽量完成关键终局任务，不要再把剩余收束拖成宽松长段
 - 如果本章已经适合直接完成一个终局环节、尾声或后日谈，就直接完成，不强制留出下一章的人工卡口
 """
+        if self._in_terminal_finish_mode():
+            finale_draft_rules += """
+- 当前已进入最终绝对上限前的最后冲刺，本章只允许承担“终局落判 / 命运落点 / 尾声 / 后日谈”之一或其组合
+- 禁止新增任何需要后续再解释的新设定、新势力、新证词、新地点；如有未说明空白，直接用最稳的解释收束
+- 本章必须至少写实一个终局落点；如果已经具备全文完结条件，就直接把本章写成正文终章、尾声章或后日谈章
+"""
 
         def _draft(existing_text: str = '') -> str:
             draft_tension_rule = '- 兼顾情绪张力、场面张力、信息揭露、人物关系拉扯与章末钩子'
@@ -1535,16 +2443,21 @@ class AutoNovelRunner:
                 draft_tension_rule = '- 兼顾情绪张力、场面张力、信息揭露与人物关系落点；若本章承担终局/尾声/后日谈功能，不强制章末钩子'
             if self._in_force_finish_mode():
                 draft_tension_rule = '- 兼顾情绪张力、信息揭露、人物关系落点与终局完成度；不允许为了续章而额外制造章末钩子'
+            if self._in_terminal_finish_mode():
+                draft_tension_rule = '- 只保留对终局有直接作用的情绪张力、信息揭露与人物落点；每段内容都必须服务于结案、落命、尾声或后日谈'
             draft_ending_rule = '- 结尾必须卡住'
             if self._in_finale_mode():
                 draft_ending_rule = '- 结尾可以保留轻微余波，但不强制卡住；若本章承担终局、尾声或后日谈功能，应允许自然收束'
             if self._in_force_finish_mode():
                 draft_ending_rule = '- 结尾必须优先服务全书收束；如果本章已经适合自然收住，就直接收住，不得为了续章强行卡住'
+            if self._in_terminal_finish_mode():
+                draft_ending_rule = '- 结尾必须朝全文结束直接推进；若本章已适合成为正文终章、尾声章或后日谈章，就直接写到位，不得再留新的程序性悬念'
             prompt = f"""
 请把这段剧情梗概写成可发布的中文长篇网文正文。
 
 要求：
 - 这是第 {chapter['chapter_number']} 章，必须保留并优化章节标题感
+- 最终正文标题行必须使用阿拉伯数字格式“第{chapter['chapter_number']}章 标题”，禁止写成“第一章”“第Ⅰ章”“Chapter 1”
 - 风格：番茄风、强代入、强画面、强对白、强追读
 - 题材、世界观、力量体系、人物关系和冲突类型必须严格服从本书设定
 - 重点写清人物目标、阻力、选择、代价、反制与变化
@@ -1602,9 +2515,9 @@ class AutoNovelRunner:
             draft_text = self.with_retry(f'第{chapter["chapter_number"]}章扩写', _expand)
             self.clear_error()
 
-        heading = format_chapter_heading(chapter['chapter_number'], chapter['title'])
-        draft_body = re.sub(r'^\s*第\s*\d+\s*章[^\n]*', '', draft_text, count=1).strip()
-        draft_text = f'{heading}\n\n{draft_body}'.strip()
+        draft_text = normalize_chapter_draft_text(chapter['chapter_number'], chapter['title'], draft_text)
+        draft_text = self.apply_chapter_critic(chapter, plot_text, draft_text)
+        draft_text = normalize_chapter_draft_text(chapter['chapter_number'], chapter['title'], draft_text)
         write_text(draft_path, draft_text)
         chapter['status'] = 'drafted'
         self._save_state()
@@ -1705,6 +2618,18 @@ class AutoNovelRunner:
             f'单章目标：{self.args.chapter_char_target}'
         )
         self.log(f'主模型：{self.args.main_model}，副模型：{self.args.sub_model}')
+        critic_model_name = self.args.critic_model or self.args.main_model
+        if not self.critic_enabled:
+            critic_status = '关闭'
+        elif int(self.args.critic_every_chapters or 0) > 0:
+            critic_status = f'每 {self.args.critic_every_chapters} 章'
+        else:
+            critic_status = f'按批次尾章触发（当前每批 {self.args.chapters_per_batch} 章）'
+        critic_pass_limit = '不限轮数（无进展自动停止）' if int(self.args.critic_max_passes or 0) <= 0 else str(self.args.critic_max_passes)
+        self.log(
+            f'critic：{critic_status}，模型：{critic_model_name}，'
+            f'推理：{self.args.critic_reasoning_effort}，最大复检轮数：{critic_pass_limit}'
+        )
 
         self.ensure_series_bible()
 
@@ -1725,6 +2650,7 @@ class AutoNovelRunner:
             self.refresh_story_memory()
 
         self.refresh_story_memory(force=True)
+        self.export_full_novel_chapters_txt()
         self.state['status'] = 'completed'
         self.state['last_error'] = ''
         self._save_state()
@@ -1751,6 +2677,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--writer-reasoning-effort', default='medium')
     parser.add_argument('--sub-reasoning-effort', default='low')
     parser.add_argument('--summary-reasoning-effort', default='low')
+    parser.add_argument('--critic-model', default='')
+    parser.add_argument('--critic-every-chapters', type=int, default=0)
+    parser.add_argument('--critic-reasoning-effort', default='xhigh')
+    parser.add_argument('--critic-max-passes', type=int, default=0)
     parser.add_argument('--max-thread-num', type=int, default=1)
     parser.add_argument('--max-retries', type=int, default=0)
     parser.add_argument('--retry-backoff-seconds', type=int, default=15)

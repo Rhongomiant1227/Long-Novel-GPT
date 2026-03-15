@@ -1,8 +1,47 @@
+import json
 import os
+from pathlib import Path
 from dotenv import dotenv_values, load_dotenv
 
 print("Loading .env file...")
 env_path = os.path.join(os.path.dirname(__file__), '.env')
+
+
+def _load_openai_fallback_env():
+    if not os.getenv('GPT_API_KEY', '').strip():
+        openai_api_key = os.getenv('OPENAI_API_KEY', '').strip()
+        if openai_api_key:
+            os.environ['GPT_API_KEY'] = openai_api_key
+
+    if not os.getenv('GPT_BASE_URL', '').strip():
+        openai_base_url = os.getenv('OPENAI_BASE_URL', '').strip()
+        if openai_base_url:
+            os.environ['GPT_BASE_URL'] = openai_base_url
+
+    if os.getenv('GPT_API_KEY', '').strip():
+        return
+
+    auth_candidates = [
+        Path.home() / '.codex' / 'auth.json',
+        Path(os.getenv('USERPROFILE', '')).expanduser() / '.codex' / 'auth.json',
+    ]
+    seen = set()
+    for candidate in auth_candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        if str(resolved) in seen or not resolved.exists():
+            continue
+        seen.add(str(resolved))
+        try:
+            payload = json.loads(resolved.read_text(encoding='utf-8'))
+        except Exception:
+            continue
+        api_key = str(payload.get('OPENAI_API_KEY', '')).strip()
+        if api_key:
+            os.environ['GPT_API_KEY'] = api_key
+            break
 
 
 def _read_int_env(name):
@@ -73,6 +112,8 @@ if os.path.exists(env_path):
     print(f"Loaded environment variables from: {env_path}")
 else:
     print("Warning: .env file not found")
+
+_load_openai_fallback_env()
 
 
 # Thread Configuration

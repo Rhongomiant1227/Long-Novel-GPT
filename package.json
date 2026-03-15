@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "fanqie:upload": "node scripts/fanqie_upload.mjs"
+    "fanqie:upload": "node scripts/fanqie_upload.mjs",
+    "番茄:上传": "node scripts/fanqie_upload.mjs"
   },
   "dependencies": {
     "playwright-core": "^1.55.0"

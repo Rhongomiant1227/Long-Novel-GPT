@@ -1,60 +1,113 @@
 import difflib
 import json
-import yaml
-import chardet
-from jinja2 import Environment, FileSystemLoader  
-
+import os
 import re
-import sys, os
+import sys
+
+import chardet
+import yaml
+from jinja2 import Environment, FileSystemLoader
+
 root_path = os.path.abspath(os.path.join(os.path.abspath(__file__), "../.."))
 if root_path not in sys.path:
     sys.path.append(root_path)
 
 from llm_api.chat_messages import ChatMessages
 
+
 def can_parse_json(response):
     try:
         json.loads(response)
         return True
-    except:
+    except Exception:
         return False
 
+
+def extract_first_balanced_json(response):
+    start_positions = []
+    for index, char in enumerate(response):
+        if char == "{":
+            start_positions.append((index, "{", "}"))
+        elif char == "[":
+            start_positions.append((index, "[", "]"))
+
+    for start_index, open_char, close_char in start_positions:
+        depth = 0
+        in_string = False
+        escaped = False
+
+        for index in range(start_index, len(response)):
+            char = response[index]
+
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+                continue
+
+            if char == open_char:
+                depth += 1
+            elif char == close_char:
+                depth -= 1
+                if depth == 0:
+                    candidate = response[start_index:index + 1].strip()
+                    if can_parse_json(candidate):
+                        return candidate
+                    break
+
+    return None
+
+
 def match_first_json_block(response):
+    response = response.strip()
     if can_parse_json(response):
         return response
-    
+
     pattern = r"(?<=[\r\n])```json(.*?)```(?=[\r\n])"
-    matches = re.findall(pattern, '\n' + response + '\n', re.DOTALL)
+    matches = re.findall(pattern, "\n" + response + "\n", re.DOTALL)
     if not matches:
         pattern = r"(?<=[\r\n])```(.*?)```(?=[\r\n])"
-        matches = re.findall(pattern, '\n' + response + '\n', re.DOTALL)
-        
+        matches = re.findall(pattern, "\n" + response + "\n", re.DOTALL)
+
     if matches:
         json_block = matches[0]
         if can_parse_json(json_block):
             return json_block
-        else:
-            json_block = json_block.replace('\r\n', '')  # 在continue generate情况下，不同部分之间可能有多出的换行符，导致合起来之后json解析失败
-            if can_parse_json(json_block):
-                return json_block
-            else:
-                raise Exception(f"无法解析JSON代码块")
-    else:
-        raise Exception(f"没有匹配到JSON代码块")
-    
+
+        json_block = json_block.replace("\r\n", "")
+        if can_parse_json(json_block):
+            return json_block
+        raise Exception("无法解析JSON代码块")
+
+    json_block = extract_first_balanced_json(response)
+    if json_block is not None:
+        return json_block
+    raise Exception("没有匹配到JSON代码块")
+
+
 def parse_first_json_block(response_msgs: ChatMessages):
-    assert response_msgs[-1]['role'] == 'assistant'
-    return json.loads(match_first_json_block(response_msgs[-1]['content']))
+    assert response_msgs[-1]["role"] == "assistant"
+    return json.loads(match_first_json_block(response_msgs[-1]["content"]))
+
 
 def match_code_block(response):
-    response = re.sub(r'\r\n', r'\n', response)
-    response = re.sub(r'\r', r'\n', response)
+    response = re.sub(r"\r\n", r"\n", response)
+    response = re.sub(r"\r", r"\n", response)
     pattern = r"```(?:\S*\s)(.*?)```"
-    matches = re.findall(pattern, response + '```', re.DOTALL)
+    matches = re.findall(pattern, response + "```", re.DOTALL)
     return matches
+
 
 def json_dumps(json_object):
     return json.dumps(json_object, ensure_ascii=False, indent=1)
+
 
 def parse_chunks_by_separators(string, separators):
     separator_pattern = r"^\s*###\s*(" + "|".join(separators) + r")\s*\n"
@@ -62,11 +115,10 @@ def parse_chunks_by_separators(string, separators):
     chunks = re.split(separator_pattern, string, flags=re.MULTILINE)
 
     ret = {}
-
     current_title = None
-    
+
     for i, chunk in enumerate(chunks):
-        if i % 2 == 1: 
+        if i % 2 == 1:
             current_title = chunk.strip()
             ret[current_title] = ""
         elif current_title:
@@ -74,8 +126,10 @@ def parse_chunks_by_separators(string, separators):
 
     return ret
 
+
 def construct_chunks_and_separators(chunk2separator):
     return "\n\n".join([f"### {k}\n{v}" for k, v in chunk2separator.items()])
+
 
 def match_chunk_span_in_text(chunk, text):
     diff = difflib.Differ().compare(chunk, text)
@@ -84,45 +138,41 @@ def match_chunk_span_in_text(chunk, text):
     text_i = 0
 
     for tag in diff:
-        if tag.startswith(' '):
+        if tag.startswith(" "):
             chunk_i += 1
             text_i += 1
-        elif tag.startswith('+'):
+        elif tag.startswith("+"):
             text_i += 1
         else:
             chunk_i += 1
-        
+
         if chunk_i == 1:
             l = text_i - 1
-        
+
         if chunk_i == len(chunk):
             r = text_i
             return l, r
 
-def load_yaml(file_path):
-    with open(file_path, 'r', encoding='utf-8') as file:  
-        return yaml.safe_load(file)  
 
-def load_text(file_path, read_size=None): 
-    # Read the raw bytes first
-    with open(file_path, 'rb') as file:
+def load_yaml(file_path):
+    with open(file_path, "r", encoding="utf-8") as file:
+        return yaml.safe_load(file)
+
+
+def load_text(file_path, read_size=None):
+    with open(file_path, "rb") as file:
         raw_data = file.read(read_size)
-    
-    # Detect the encoding
+
     result = chardet.detect(raw_data[:10000])
-    encoding = result['encoding'] or 'utf-8'  # Fallback to utf-8 if detection fails
-    
-    # Decode the content with detected encoding
+    encoding = result["encoding"] or "utf-8"
+
     try:
-        return raw_data.decode(encoding, errors='ignore')
+        return raw_data.decode(encoding, errors="ignore")
     except UnicodeDecodeError:
-        # Fallback to utf-8 if the detected encoding fails
-        return raw_data.decode('utf-8', errors='ignore')
+        return raw_data.decode("utf-8", errors="ignore")
+
 
 def load_jinja2_template(file_path):
     env = Environment(loader=FileSystemLoader(os.path.dirname(file_path)))
-    template = env.get_template(os.path.basename(file_path)) 
-
-    return template 
-
-
+    template = env.get_template(os.path.basename(file_path))
+    return template

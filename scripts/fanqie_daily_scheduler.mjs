@@ -6,6 +6,7 @@ import readline from "node:readline";
 import { spawn } from "node:child_process";
 
 const DEFAULT_START_URL = "https://fanqienovel.com/main/writer/?enter_from=author_zone";
+const WEEKDAY_KEYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 
 function printHelp() {
   console.log(`番茄小说日更调度器
@@ -17,6 +18,7 @@ function printHelp() {
   --config <path>   配置文件路径，默认 fanqie_daily_jobs.json
   --once            只检查并执行一轮后退出
   --run-now         忽略时间设置，立即执行符合筛选条件的任务
+  --skip-delay      忽略随机延迟窗口，立刻执行
   --dry-run         只打印将要执行的上传命令，不真的发章
   --job <id>        只运行指定 job id
   --help            显示帮助
@@ -28,8 +30,10 @@ function parseArgs(argv) {
     configPath: path.resolve(process.cwd(), "fanqie_daily_jobs.json"),
     once: false,
     runNow: false,
+    skipDelay: false,
     dryRun: false,
     jobId: "",
+    chapterCount: 0,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -52,11 +56,17 @@ function parseArgs(argv) {
       case "--run-now":
         args.runNow = true;
         break;
+      case "--skip-delay":
+        args.skipDelay = true;
+        break;
       case "--dry-run":
         args.dryRun = true;
         break;
       case "--job":
         args.jobId = next();
+        break;
+      case "--chapter-count":
+        args.chapterCount = Number(next());
         break;
       case "--help":
       case "-h":
@@ -136,12 +146,78 @@ function computeNextOccurrence(now, publishTime) {
   return target;
 }
 
-function buildUploaderArgs(repoRoot, job) {
+function formatLocalDateKey(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function computePublishAnchor(now, publishTime) {
+  const { hours, minutes } = parsePublishTime(publishTime);
+  const anchor = new Date(now);
+  anchor.setHours(hours, minutes, 0, 0);
+  return anchor;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeWeekdayCounts(rawMap) {
+  const counts = {};
+  if (!rawMap || typeof rawMap !== "object") {
+    return counts;
+  }
+  for (const key of WEEKDAY_KEYS) {
+    if (rawMap[key] === undefined || rawMap[key] === null || rawMap[key] === "") {
+      continue;
+    }
+    const value = Number(rawMap[key]);
+    if (!Number.isFinite(value) || value < 0) {
+      throw new Error(`weekday 章节数无效: ${key}=${rawMap[key]}`);
+    }
+    counts[key] = value;
+  }
+  return counts;
+}
+
+function normalizeAiUsage(rawValue, sourceLabel = "aiUsage") {
+  if (typeof rawValue === "boolean") {
+    return rawValue ? "yes" : "no";
+  }
+  const value = String(rawValue ?? "").trim().toLowerCase();
+  if (!value) {
+    return "no";
+  }
+  if (["yes", "true", "1", "y", "ai", "是"].includes(value)) {
+    return "yes";
+  }
+  if (["no", "false", "0", "n", "human", "manual", "否"].includes(value)) {
+    return "no";
+  }
+  throw new Error(`${sourceLabel} 只支持 yes/no`);
+}
+
+function getWeekdayKey(date) {
+  return WEEKDAY_KEYS[date.getDay()];
+}
+
+function resolveChapterCountForDate(job, date) {
+  const weekdayKey = getWeekdayKey(date);
+  if (job.chaptersPerRunByWeekday[weekdayKey] !== undefined) {
+    return Number(job.chaptersPerRunByWeekday[weekdayKey]);
+  }
+  return Number(job.chaptersPerRun);
+}
+
+function buildUploaderArgs(repoRoot, job, chapterCount) {
   const args = [
     path.join(repoRoot, "scripts", "fanqie_upload.mjs"),
     "--book-title", job.bookTitle,
     "--chapters-dir", job.chaptersDir,
-    "--auto-next-count", String(job.chaptersPerRun),
+    "--auto-next-count", String(chapterCount),
+    "--ai-usage", job.aiUsage,
     "--profile-dir", job.profileDir,
     "--artifacts-dir", job.artifactsDir,
     "--start-url", job.startUrl,
@@ -179,13 +255,21 @@ async function saveJson(filePath, value) {
 }
 
 function normalizeJob(configDir, defaults, rawJob) {
+  const chaptersPerRun = Number(rawJob.chaptersPerRun ?? defaults.chaptersPerRun ?? 0);
+  const chaptersPerRunByWeekday = {
+    ...normalizeWeekdayCounts(defaults.chaptersPerRunByWeekday),
+    ...normalizeWeekdayCounts(rawJob.chaptersPerRunByWeekday),
+  };
   const job = {
     id: rawJob.id,
     enabled: rawJob.enabled !== false,
     bookTitle: rawJob.bookTitle,
     chaptersDir: resolvePathLike(configDir, rawJob.chaptersDir),
     publishTime: rawJob.publishTime ?? defaults.publishTime ?? "12:00",
-    chaptersPerRun: Number(rawJob.chaptersPerRun ?? defaults.chaptersPerRun ?? 1),
+    chaptersPerRun,
+    chaptersPerRunByWeekday,
+    publishWindowMinutes: Number(rawJob.publishWindowMinutes ?? defaults.publishWindowMinutes ?? 0),
+    aiUsage: normalizeAiUsage(rawJob.aiUsage ?? defaults.aiUsage ?? "no", `job ${rawJob.id} 的 aiUsage`),
     headless: rawJob.headless ?? defaults.headless ?? true,
     startUrl: rawJob.startUrl ?? defaults.startUrl ?? DEFAULT_START_URL,
     seedProfileDir: resolvePathLike(configDir, rawJob.seedProfileDir ?? defaults.seedProfileDir ?? ""),
@@ -210,22 +294,38 @@ function normalizeJob(configDir, defaults, rawJob) {
   if (!job.chaptersDir) {
     throw new Error(`job ${job.id} 缺少 chaptersDir`);
   }
-  if (!Number.isFinite(job.chaptersPerRun) || job.chaptersPerRun <= 0) {
-    throw new Error(`job ${job.id} 的 chaptersPerRun 必须大于 0`);
+  if (!Number.isFinite(job.chaptersPerRun) || job.chaptersPerRun < 0) {
+    throw new Error(`job ${job.id} 的 chaptersPerRun 不能小于 0`);
+  }
+  if (!Number.isFinite(job.publishWindowMinutes) || job.publishWindowMinutes < 0) {
+    throw new Error(`job ${job.id} 的 publishWindowMinutes 不能小于 0`);
+  }
+  const availableCounts = [job.chaptersPerRun, ...Object.values(job.chaptersPerRunByWeekday)];
+  if (!availableCounts.some((value) => Number(value) > 0)) {
+    throw new Error(`job ${job.id} 没有任何有效的每日上传章数配置`);
   }
   parsePublishTime(job.publishTime);
   return job;
 }
 
-async function runUploaderForJob(repoRoot, log, job, dryRun) {
-  const args = buildUploaderArgs(repoRoot, job);
-  const displayCommand = [process.execPath, ...args].join(" ");
-  if (dryRun) {
-    log(`[${job.id}] dry-run: ${displayCommand}`);
+async function runUploaderForJob(repoRoot, log, job, dryRun, runDate, chapterCountOverride = 0) {
+  const chapterCount = chapterCountOverride > 0
+    ? Number(chapterCountOverride)
+    : resolveChapterCountForDate(job, runDate);
+  const weekdayKey = getWeekdayKey(runDate);
+  if (chapterCount <= 0) {
+    log(`[${job.id}] ${weekdayKey} 配置为 0 章，今日跳过`);
     return 0;
   }
 
-  log(`[${job.id}] 启动上传任务: ${displayCommand}`);
+  const args = buildUploaderArgs(repoRoot, job, chapterCount);
+  const displayCommand = [process.execPath, ...args].join(" ");
+  if (dryRun) {
+    log(`[${job.id}] dry-run (${weekdayKey}=${chapterCount}章): ${displayCommand}`);
+    return 0;
+  }
+
+  log(`[${job.id}] 启动上传任务 (${weekdayKey}=${chapterCount}章): ${displayCommand}`);
   return await new Promise((resolve, reject) => {
     const child = spawn(process.execPath, args, {
       cwd: repoRoot,
@@ -251,6 +351,36 @@ async function runUploaderForJob(repoRoot, log, job, dryRun) {
   });
 }
 
+function getRandomizedExecutionState(entry, job, now, log) {
+  const anchor = computePublishAnchor(now, job.publishTime);
+  const dateKey = formatLocalDateKey(anchor);
+
+  if (
+    entry.randomizedExecution &&
+    entry.randomizedExecution.dateKey === dateKey &&
+    entry.randomizedExecution.publishTime === job.publishTime &&
+    Number(entry.randomizedExecution.windowMinutes) === Number(job.publishWindowMinutes)
+  ) {
+    return entry.randomizedExecution;
+  }
+
+  const delayMinutes = Math.floor(Math.random() * (job.publishWindowMinutes + 1));
+  const executeAt = new Date(anchor.getTime() + delayMinutes * 60 * 1000);
+  entry.randomizedExecution = {
+    dateKey,
+    publishTime: job.publishTime,
+    windowMinutes: job.publishWindowMinutes,
+    delayMinutes,
+    executeAt: executeAt.toISOString(),
+  };
+  log(`[${job.id}] 已生成随机延迟：${delayMinutes} 分钟，预计执行时间 ${executeAt.toLocaleString("zh-CN", { hour12: false })}`);
+  return entry.randomizedExecution;
+}
+
+function clearRandomizedExecution(entry) {
+  delete entry.randomizedExecution;
+}
+
 function isJobDue(stateEntry, now, runNow) {
   if (runNow) {
     return true;
@@ -266,6 +396,9 @@ async function main() {
   if (args.help) {
     printHelp();
     return;
+  }
+  if (args.chapterCount && (!Number.isFinite(args.chapterCount) || args.chapterCount < 0)) {
+    throw new Error(`invalid --chapter-count: ${args.chapterCount}`);
   }
 
   const configPath = args.configPath;
@@ -329,11 +462,39 @@ async function main() {
       latestState.jobs[job.id] = entry;
       await saveJson(statePath, latestState);
 
-      const exitCode = await runUploaderForJob(repoRoot, log, job, args.dryRun);
+      if (!args.skipDelay && !args.dryRun && job.publishWindowMinutes > 0) {
+        const randomized = getRandomizedExecutionState(entry, job, loopNow, log);
+        latestState.jobs[job.id] = entry;
+        await saveJson(statePath, latestState);
+
+        const executeAt = new Date(randomized.executeAt);
+        if (executeAt > loopNow) {
+          if (args.once) {
+            const waitMs = executeAt.getTime() - loopNow.getTime();
+            log(`[${job.id}] 等待随机窗口，到 ${executeAt.toLocaleString("zh-CN", { hour12: false })} 后执行`);
+            await sleep(waitMs);
+          } else {
+            entry.nextRunAt = randomized.executeAt;
+            latestState.jobs[job.id] = entry;
+            await saveJson(statePath, latestState);
+            continue;
+          }
+        }
+      }
+
+      const exitCode = await runUploaderForJob(
+        repoRoot,
+        log,
+        job,
+        args.dryRun,
+        new Date(),
+        args.chapterCount,
+      );
       if (exitCode === 0) {
         entry.lastSuccessAt = new Date().toISOString();
         entry.lastExitCode = 0;
         entry.nextRunAt = computeNextOccurrence(new Date(), job.publishTime).toISOString();
+        clearRandomizedExecution(entry);
         log(`[${job.id}] 本轮任务成功，下一次执行时间 ${entry.nextRunAt}`);
       } else {
         entry.lastFailureAt = new Date().toISOString();

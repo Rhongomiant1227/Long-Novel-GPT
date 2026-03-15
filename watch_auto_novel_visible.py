@@ -166,6 +166,10 @@ def build_child_command(args: argparse.Namespace) -> list[str]:
         '--writer-reasoning-effort', args.writer_reasoning_effort,
         '--sub-reasoning-effort', args.sub_reasoning_effort,
         '--summary-reasoning-effort', args.summary_reasoning_effort,
+        '--critic-model', args.critic_model,
+        '--critic-every-chapters', str(args.critic_every_chapters),
+        '--critic-reasoning-effort', args.critic_reasoning_effort,
+        '--critic-max-passes', str(args.critic_max_passes),
         '--max-thread-num', str(args.max_thread_num),
         '--max-retries', str(args.max_retries),
         '--retry-backoff-seconds', str(args.retry_backoff_seconds),
@@ -376,6 +380,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--writer-reasoning-effort', default='medium')
     parser.add_argument('--sub-reasoning-effort', default='low')
     parser.add_argument('--summary-reasoning-effort', default='low')
+    parser.add_argument('--critic-model', default='gpt/gpt-5.4')
+    parser.add_argument('--critic-every-chapters', type=int, default=0)
+    parser.add_argument('--critic-reasoning-effort', default='xhigh')
+    parser.add_argument('--critic-max-passes', type=int, default=0)
     parser.add_argument('--max-thread-num', type=int, default=1)
     parser.add_argument('--max-retries', type=int, default=0)
     parser.add_argument('--retry-backoff-seconds', type=int, default=15)
