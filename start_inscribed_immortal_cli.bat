@@ -73,7 +73,10 @@ echo Output budget: %GPT_MAX_OUTPUT_TOKENS%
 echo Retry: infinite
 echo Completion mode: min_chars_and_story_end
 echo Min chars: 2000000
-echo Critic: gpt/gpt-5.4 xhigh every 1 chapter, max 3 passes
+echo Force finish chars: 3000000
+echo Max chars: 4500000
+echo Critic: gpt/gpt-5.4 high every 1 chapter, max 2 passes
+echo Ending polish: gpt/gpt-5.4 xhigh, max 3 cycles
 echo.
 echo This window shows live LLM output and auto-restarts on crashes or stalls.
 echo Close this window to stop the watchdog.
@@ -85,10 +88,11 @@ echo.
   --completion-mode min_chars_and_story_end ^
   --target-chars 2000000 ^
   --min-target-chars 2000000 ^
-  --max-target-chars 0 ^
+  --force-finish-chars 3000000 ^
+  --max-target-chars 4500000 ^
   --chapter-char-target 2200 ^
   --chapters-per-volume 30 ^
-  --chapters-per-batch 5 ^
+  --chapters-per-batch 1 ^
   --memory-refresh-interval 5 ^
   --main-model gpt/gpt-5.4 ^
   --sub-model gpt/gpt-5.4 ^
@@ -98,13 +102,18 @@ echo.
   --summary-reasoning-effort low ^
   --critic-model gpt/gpt-5.4 ^
   --critic-every-chapters 1 ^
-  --critic-reasoning-effort xhigh ^
-  --critic-max-passes 3 ^
+  --critic-reasoning-effort high ^
+  --critic-max-passes 2 ^
+  --ending-polish-model gpt/gpt-5.4 ^
+  --ending-polish-reasoning-effort xhigh ^
+  --ending-polish-max-cycles 3 ^
   --max-thread-num 1 ^
   --max-retries 0 ^
   --retry-backoff-seconds 15 ^
-  --stall-timeout-seconds 480 ^
+  --stall-timeout-seconds 600 ^
   --restart-delay-seconds 15 ^
+  --runner-heartbeat-grace-seconds 120 ^
+  --max-silent-seconds 1800 ^
   --max-stage-runtime-seconds 0 %*
 
 set "EXIT_CODE=%ERRORLEVEL%"

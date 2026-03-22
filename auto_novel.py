@@ -23,10 +23,37 @@ from core.plot_writer import PlotWriter
 from core.writer_utils import KeyPointMsg
 from llm_api import ModelConfig, stream_chat
 from llm_api.chat_messages import ChatMessages
-from split_full_novel import split_full_novel
+from split_full_novel import normalize_heading_line, split_full_novel
+
+
+PROJECT_TEXT_REPLACEMENTS: dict[str, tuple[tuple[str, str], ...]] = {
+    'lychee_prelude': (
+        ('\u82b1\u82bd\u8354\u679d', '\u8354\u679d'),
+        ('\u82b1\u82bd', '\u8354\u679d'),
+    ),
+}
+
+PROJECT_ROLE_ONLY_RULES: dict[str, dict[str, Any]] = {
+    'watcher_origin_short': {
+        'allowed_names': ('神木',),
+        'preserved_labels': ('守夜人',),
+        'role_labels': ('主管', '风控员', '值班同事', '接线员', '求助者', '审计员', '急救员', '男人', '对方'),
+        'fallback_label': '那名同事',
+    },
+}
 
 
 DEFAULT_SYSTEM_PROMPT = "你是资深中文网文总编、商业策划和长篇连载统筹。"
+
+ENDING_CRAFT_RESEARCH_SUMMARY = """
+【外部收尾经验摘要】
+- 读者对故事的最终记忆会被峰值场面与最后收束显著放大；高潮之后若继续重复落锤、反复解释，会快速磨损整本书的尾劲。
+- 高评价结尾通常同时满足两个条件：一是“来自前文，因而成立”，二是“在最后一击里略高于预期”，也就是意料之外但情理之中。
+- 结尾最忌讳把情绪峰值写成说明会、条款会、总结会；解释可以有，但要服务最后的画面、选择、代价与反照，而不是替代它们。
+- 长篇连载收尾要避免同构验证反复出现。更稳的结构通常是：一次真正落锤、一次普通层面的现实验证、一个极短的余韵画面。
+- 余味不是靠关键义务悬而不决制造出来的，而是在主线已兑现后，只留下少量让读者自己停留和回想的空间。
+- 最后一屏最好是一个可停留的具体画面、动作、选择或反讽，而不是“从此以后制度如何运行”的继续讲解。
+""".strip()
 
 
 def now_str() -> str:
@@ -44,9 +71,49 @@ def read_text(path: Path, default: str = '') -> str:
     return path.read_text(encoding='utf-8')
 
 
+def project_name_from_path(path: Path | None) -> str:
+    if path is None:
+        return ''
+    parts = path.parts
+    lowered = [part.lower() for part in parts]
+    if 'auto_projects' not in lowered:
+        return ''
+    index = lowered.index('auto_projects')
+    if index + 1 >= len(parts):
+        return ''
+    return parts[index + 1]
+
+
+def lookup_project_override(mapping: dict[str, Any], project_name: str) -> Any:
+    if not mapping or not project_name:
+        return None
+    if project_name in mapping:
+        return mapping[project_name]
+    best_key = ''
+    best_value = None
+    for key, value in mapping.items():
+        if project_name.startswith(f'{key}_') and len(key) > len(best_key):
+            best_key = key
+            best_value = value
+    return best_value
+
+
+def sanitize_project_text(text: str, *, project_name: str = '', path: Path | None = None) -> str:
+    if not text:
+        return text
+    target_project = project_name or project_name_from_path(path)
+    replacements = lookup_project_override(PROJECT_TEXT_REPLACEMENTS, target_project) or ()
+    if not replacements:
+        return text
+    sanitized = text
+    for source, target in replacements:
+        sanitized = sanitized.replace(source, target)
+    return sanitized
+
+
 def write_text(path: Path, text: str) -> None:
     ensure_dir(path.parent)
-    path.write_text(text, encoding='utf-8')
+    path.write_text(sanitize_project_text(text, path=path), encoding='utf-8')
 
 
 def truncate_text(text: str, limit: int) -> str:
@@ -63,6 +130,10 @@ def tail_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return '...(前略)...\n' + text[-limit:]
+
+
+def ending_craft_research_text(limit: int = 1200) -> str:
+    return truncate_text(ENDING_CRAFT_RESEARCH_SUMMARY, limit)
 
 
 def clone_model_config(model_config: ModelConfig, **overrides) -> ModelConfig:
@@ -219,7 +290,7 @@ def derive_conservative_completion_estimate(
     }
 
 
-SERIES_BIBLE_PART_SPECS = [
+LONG_SERIES_BIBLE_PART_SPECS = [
     (
         '设定总纲',
         '本部分只负责：推荐书名/备选书名、核心卖点、一句话宣传语、世界观、核心规则、力量体系、作品气质。'
@@ -234,6 +305,24 @@ SERIES_BIBLE_PART_SPECS = [
         '主线与长篇路线',
         '本部分只负责：主线谜团、阶段性冲突、终局方向、长篇节奏策略、卷级路线图、文风提醒与禁忌清单。'
         '要求适合超长连载推进，目标 1800~2600 字。',
+    ),
+]
+
+SHORT_STORY_BIBLE_PART_SPECS = [
+    (
+        '故事核与最后一屏',
+        '本部分只负责：推荐书名/备选书名、核心卖点、一句话梗概、作品气质、主题反差、最后一屏意象。'
+        '要求锋利具体，目标 1000~1600 字。',
+    ),
+    (
+        '人物关系与生活残片',
+        '本部分只负责：主角、被救者、关键配角、私人亏欠、关系张力、必须保留的生活残片、关键物件/动作。'
+        '要求人物先成立，目标 1000~1600 字。',
+    ),
+    (
+        '冲突推进与收束禁忌',
+        '本部分只负责：主冲突、关键场景推进、情绪递进、真相落点、结尾收束方式、文风提醒与禁忌清单。'
+        '要求服务单篇闭环，目标 1000~1600 字。',
     ),
 ]
 
@@ -384,23 +473,72 @@ def extract_json_payload(text: str) -> dict[str, Any]:
     return payload
 
 
-def normalize_chapter_draft_text(chapter_number: int, title: str, text: str) -> str:
-    heading = format_chapter_heading(chapter_number, title)
+def normalize_heading_compare_text(text: str) -> str:
+    normalized = unicodedata.normalize('NFKC', text or '').strip().lower()
+    normalized = normalized.strip('#')
+    normalized = normalized.replace('《', '').replace('》', '')
+    normalized = re.sub(r'[\s:：\-—_]+', '', normalized)
+    return normalized
+
+
+def normalize_chapter_draft_text(
+    chapter_number: int,
+    title: str,
+    text: str,
+    heading_mode: str = 'chapter',
+) -> str:
+    heading_mode = str(heading_mode or 'chapter').strip().lower()
+    if heading_mode == 'title_only':
+        heading = (title or '').strip() or format_chapter_heading(chapter_number, title)
+    else:
+        heading = format_chapter_heading(chapter_number, title)
     source = (text or '').strip()
     body = source
     lines = source.splitlines()
+    normalized_title = normalize_heading_compare_text(title)
     for index, line in enumerate(lines):
         if not line.strip():
             continue
         parsed_number, _ = parse_chapter_heading_line(line)
         if parsed_number is not None:
             body = '\n'.join(lines[index + 1:]).strip()
+        elif heading_mode == 'title_only':
+            normalized_line = normalize_heading_compare_text(line)
+            if normalized_line and normalized_line == normalized_title:
+                body = '\n'.join(lines[index + 1:]).strip()
         break
     if not body:
         body = source
     if not body:
         raise RuntimeError(f'第{chapter_number}章正文为空，无法写入。')
     return f'{heading}\n\n{body}'.strip()
+
+
+def strip_generated_draft_heading(
+    chapter_number: int,
+    title: str,
+    text: str,
+) -> str:
+    source = (text or '').strip()
+    if not source:
+        return ''
+
+    body = source
+    lines = source.splitlines()
+    normalized_title = normalize_heading_compare_text(title)
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        parsed_number, _ = parse_chapter_heading_line(line)
+        if parsed_number is not None:
+            body = '\n'.join(lines[index + 1:]).strip()
+        else:
+            normalized_line = normalize_heading_compare_text(line)
+            if normalized_line and normalized_line == normalized_title:
+                body = '\n'.join(lines[index + 1:]).strip()
+        break
+
+    return body or source
 
 
 def summarize_critic_issue(issue: dict[str, Any]) -> str:
@@ -755,7 +893,12 @@ class AutoNovelRunner:
         self.series_bible_short_path = self.memory_dir / 'series_bible_short.md'
         self.series_bible_parts_dir = ensure_dir(self.memory_dir / 'series_bible_parts')
         self.story_memory_path = self.memory_dir / 'story_memory.md'
+        self.opening_promise_path = self.memory_dir / 'opening_promise.md'
         self.ending_guidance_path = self.memory_dir / 'ending_guidance.md'
+        self.auto_ending_guidance_path = self.memory_dir / 'auto_ending_guidance.md'
+        self.auto_ending_quality_guidance_path = self.memory_dir / 'auto_ending_quality_guidance.md'
+        self.ending_quality_review_path = self.memory_dir / 'ending_quality_review.md'
+        self.ending_polish_brief_path = self.memory_dir / 'ending_polish_brief.md'
         self.completion_report_path = self.memory_dir / 'completion_report.md'
         self.logger = self._build_logger()
         self._stream_cache: dict[str, str] = {}
@@ -776,6 +919,7 @@ class AutoNovelRunner:
         base_main = get_model_config_from_provider_model(args.main_model)
         base_sub = get_model_config_from_provider_model(args.sub_model)
         base_critic = get_model_config_from_provider_model(args.critic_model or args.main_model)
+        base_ending_polish = get_model_config_from_provider_model(args.ending_polish_model or args.critic_model or args.main_model)
 
         self.writer_model = clone_model_config(
             base_main,
@@ -800,6 +944,11 @@ class AutoNovelRunner:
             base_critic,
             reasoning_effort=args.critic_reasoning_effort,
             **cap_model_output_tokens(base_critic, 8_000),
+        )
+        self.ending_polish_model = clone_model_config(
+            base_ending_polish,
+            reasoning_effort=args.ending_polish_reasoning_effort,
+            **cap_model_output_tokens(base_ending_polish, 10_000),
         )
         critic_model_name = str(args.critic_model or args.main_model or '').strip().lower()
         critic_interval = int(args.critic_every_chapters or 0)
@@ -897,6 +1046,120 @@ class AutoNovelRunner:
                 self._live_stream_error_logged = True
                 self.log(f'[live_stream] 控制台实时输出已关闭：{exc}')
 
+    def _sanitize_text(self, text: str) -> str:
+        return sanitize_project_text(text or '', project_name=self.project_dir.name)
+
+    def _sanitize_pairs(self, pairs: Iterable[tuple[str, str]]) -> list[tuple[str, str]]:
+        sanitized_pairs: list[tuple[str, str]] = []
+        for x_value, y_value in pairs:
+            sanitized_pairs.append((x_value, self._sanitize_text(y_value or '')))
+        return sanitized_pairs
+
+    def _draft_heading_mode(self) -> str:
+        return 'title_only' if bool(getattr(self.args, 'title_only_story', False)) else 'chapter'
+
+    def _project_book_title(self) -> str:
+        brief_text = read_text(self.brief_path)
+        title_match = re.search(r'《([^》]+)》', brief_text)
+        if title_match:
+            return title_match.group(1).strip()
+        title = str(self.state.get('book_title', '') or '').strip()
+        if title:
+            return title.strip('《》').strip() or title
+        return ''
+
+    def _story_heading_title(self, fallback_title: str) -> str:
+        if self._draft_heading_mode() != 'title_only':
+            return fallback_title
+        book_title = self._project_book_title()
+        if book_title:
+            return f'《{book_title.strip("《》").strip()}》'
+        return fallback_title
+
+    def _is_title_only_story(self) -> bool:
+        return self._draft_heading_mode() == 'title_only'
+
+    def _series_bible_part_specs(self) -> list[tuple[str, str]]:
+        return SHORT_STORY_BIBLE_PART_SPECS if self._is_title_only_story() else LONG_SERIES_BIBLE_PART_SPECS
+
+    def _plan_stage_label(self, volume_number: int) -> str:
+        return '单篇路线图' if self._is_title_only_story() else f'第{volume_number}卷规划'
+
+    def _project_role_only_rule(self) -> str:
+        config = lookup_project_override(PROJECT_ROLE_ONLY_RULES, self.project_dir.name)
+        if not config:
+            return ''
+        allowed_names = '、'.join(config.get('allowed_names') or ())
+        preserved_labels = '、'.join(config.get('preserved_labels') or ())
+        role_labels = '、'.join(config.get('role_labels') or ())
+        rule = (
+            f'除主角“{allowed_names}”外，任何角色都不得使用专有姓名；'
+            f'一律使用身份称呼，如“{role_labels}”。'
+            '如果需要新增配角，只能新增身份称呼，绝不允许临时命名。'
+        )
+        if preserved_labels:
+            rule += f'允许保留的固定称呼/代号只有“{preserved_labels}”。'
+        return rule
+
+    def _project_critic_hard_rules(self) -> str:
+        lines: list[str] = []
+        config = lookup_project_override(PROJECT_ROLE_ONLY_RULES, self.project_dir.name)
+        if config:
+            allowed_names = '、'.join(config.get('allowed_names') or ())
+            lines.append(
+                f'除“{allowed_names}”外，若正文里出现任何其他角色专有姓名，按客观硬伤处理。'
+            )
+        if self.project_dir.name == 'watcher_origin_short' or self.project_dir.name.startswith('watcher_origin_short_'):
+            lines.append('正文中必须真实出现一次完整字样“守夜人”，若全文未出现则按客观硬伤处理。')
+            lines.append('“守夜人”必须出现在正文后段的自然叙事句子里，不能只出现在说明、备注或标题中。')
+            lines.append('“守夜人”必须至少有一次出现在带引号的对白中，否则按客观硬伤处理。')
+            lines.append('正文里第一次出现“守夜人”的位置，必须位于全文最后1200字内，否则按客观硬伤处理。')
+            lines.append('从第一次出现“守夜人”的段落开始，到正文结尾，最多只允许保留4个非空段落，否则按客观硬伤处理。')
+        if self._draft_heading_mode() == 'title_only':
+            book_title = self._project_book_title()
+            if book_title:
+                lines.append(
+                    f'首个非空行必须是《{book_title.strip("《》").strip()}》，若不是则按客观硬伤处理。'
+                )
+        return '\n'.join(f'- {line}' for line in lines if line)
+
+    def _enforce_project_role_labels(self, label: str, text: str) -> str:
+        config = lookup_project_override(PROJECT_ROLE_ONLY_RULES, self.project_dir.name)
+        source = (text or '').strip()
+        if not config or not source:
+            return source
+
+        allowed_names = '、'.join(config.get('allowed_names') or ())
+        preserved_labels = '、'.join(config.get('preserved_labels') or ())
+        role_labels = '、'.join(config.get('role_labels') or ())
+        fallback_label = str(config.get('fallback_label') or '那名角色').strip()
+        prompt = f"""
+请把下面这段中文小说文本做一次“角色称谓约束校正”。
+
+硬规则：
+- 允许保留的专有姓名只有：{allowed_names}
+- 允许原样保留的固定称呼/代号只有：{preserved_labels or '（无）'}
+- 除此之外，任何人物都不允许保留专有姓名
+- 其余人物必须改写为身份称呼，只能优先使用这些称呼：{role_labels}
+- 如果原文已经出现允许保留的固定称呼/代号，必须保留，不要删掉，不要改写
+- 如果上下文无法精确判断身份，就改成“{fallback_label}”或“对方”之类的无名身份称呼
+- 不要新增任何新姓名
+- 不要改变剧情、不删减信息、不改写事件顺序、不改标题
+- 只输出修订后的完整文本，不要解释
+
+原文如下：
+{source}
+"""
+
+        def _rewrite() -> str:
+            revised = self.call_llm(f'{label}角色称谓校正', prompt, self.critic_model)
+            revised = (revised or '').strip()
+            if not revised:
+                raise RuntimeError(f'{label} 角色称谓校正返回空文本。')
+            return revised
+
+        return self.with_retry(f'{label}角色称谓校正', _rewrite)
+
     def _extract_stage_chapter_number(self, label: str) -> int | None:
         if not label:
             return None
@@ -970,7 +1233,7 @@ class AutoNovelRunner:
 
     def _stream_text(self, label: str, full_text: str, reset: bool = False, finish: bool = False) -> None:
 
-        full_text = full_text or ''
+        full_text = self._sanitize_text(full_text or '')
         if reset or label not in self._stream_cache:
             self._stream_cache[label] = ''
             self.live_print(f'\n===== [{label}] 实时输出开始 =====\n')
@@ -1015,12 +1278,20 @@ class AutoNovelRunner:
 
     def _load_or_init_state(self) -> dict:
         if self.state_path.exists():
-            state = json.loads(self.state_path.read_text(encoding='utf-8'))
+            state = json.loads(self.state_path.read_text(encoding='utf-8-sig'))
             state.setdefault('min_target_chars', 0)
             state.setdefault('force_finish_chars', 0)
             state.setdefault('max_target_chars', 0)
             state.setdefault('completion_mode', 'hard_target')
             state.setdefault('completion_check', {})
+            state.setdefault('last_opening_promise_refresh_chapter', 0)
+            state.setdefault('last_ending_guidance_refresh_chapter', 0)
+            state.setdefault('last_ending_quality_guidance_refresh_chapter', 0)
+            state.setdefault('rewrite_required_from_chapter', 0)
+            state.setdefault('ending_quality_check', {})
+            state.setdefault('ending_quality_history', [])
+            state.setdefault('ending_polish_cycles', 0)
+            state.setdefault('ending_polish_last_rewrite_from_chapter', 0)
             self.log(f'检测到已有项目状态，准备续跑：{self.state_path}')
             return state
 
@@ -1049,12 +1320,20 @@ class AutoNovelRunner:
             'completed_chapters': [],
             'manuscript_last_appended_chapter': 0,
             'last_memory_refresh_chapter': 0,
+            'last_opening_promise_refresh_chapter': 0,
+            'last_ending_guidance_refresh_chapter': 0,
+            'last_ending_quality_guidance_refresh_chapter': 0,
+            'rewrite_required_from_chapter': 0,
             'book_title': '',
             'last_error': '',
             'current_stage': '',
             'stage_started_at': '',
             'last_stage_heartbeat_at': '',
             'completion_check': {},
+            'ending_quality_check': {},
+            'ending_quality_history': [],
+            'ending_polish_cycles': 0,
+            'ending_polish_last_rewrite_from_chapter': 0,
         }
         self._save_state(state)
         return state
@@ -1112,21 +1391,79 @@ class AutoNovelRunner:
             draft_path = Path(item['draft_file'])
             if not draft_path.exists():
                 continue
-            text = read_text(draft_path)
+            text = self._sanitize_text(read_text(draft_path)).strip()
+            if not text:
+                self.state['manuscript_last_appended_chapter'] += 1
+                continue
             with self.full_manuscript_path.open('a', encoding='utf-8') as handle:
                 handle.write(text.rstrip() + '\n\n')
             self.state['manuscript_last_appended_chapter'] += 1
         self._save_state()
 
+    def _completed_manuscript_chapters(self) -> list[dict[str, object]]:
+        completed = sorted(
+            self.state.get('completed_chapters', []),
+            key=lambda item: int(item.get('chapter_number', 0) or 0),
+        )
+        chapters: list[dict[str, object]] = []
+        for item in completed:
+            chapter_number = int(item.get('chapter_number', 0) or 0)
+            draft_path = Path(item.get('draft_file', ''))
+            if not draft_path.exists():
+                self.log(f'[manuscript] 跳过缺失章稿：{draft_path}')
+                continue
+            text = self._sanitize_text(read_text(draft_path)).strip()
+            if not text:
+                continue
+            lines = text.splitlines()
+            heading_line = lines[0].strip() if lines else ''
+            chapters.append(
+                {
+                    'chapter_number': chapter_number,
+                    'text': text,
+                    'heading_line': normalize_heading_line(heading_line, new_number=chapter_number),
+                }
+            )
+        return chapters
+
     def export_full_novel_chapters_txt(self) -> None:
+        for path in self.manuscript_chapters_dir.glob('ch_*.txt'):
+            path.unlink()
+        manifest_path = self.manuscript_chapters_dir / 'chapters_manifest.json'
+
+        completed_chapters = self._completed_manuscript_chapters()
+        if completed_chapters:
+            manifest: list[dict[str, object]] = []
+            for chapter in completed_chapters:
+                chapter_number = int(chapter['chapter_number'])
+                chapter_text = str(chapter['text'])
+                heading_line = str(chapter['heading_line'])
+                write_text(
+                    self.manuscript_chapters_dir / f'ch_{chapter_number:04d}.txt',
+                    chapter_text.rstrip() + '\n',
+                )
+                manifest.append(
+                    {
+                        'source_number': chapter_number,
+                        'output_number': chapter_number,
+                        'heading_line': heading_line,
+                    }
+                )
+            write_text(
+                manifest_path,
+                json.dumps(manifest, ensure_ascii=False, indent=2) + '\n',
+            )
+            return
+
+        if manifest_path.exists():
+            manifest_path.unlink()
         if not self.full_manuscript_path.exists():
             return
         text = read_text(self.full_manuscript_path)
         chapters = split_full_novel(text)
         if not chapters:
             return
-        for path in self.manuscript_chapters_dir.glob('ch_*.txt'):
-            path.unlink()
+        manifest: list[dict[str, object]] = []
         for chapter in chapters:
             chapter_number = int(chapter['source_number'])
             chapter_text = str(chapter['text'])
@@ -1134,21 +1471,21 @@ class AutoNovelRunner:
                 self.manuscript_chapters_dir / f'ch_{chapter_number:04d}.txt',
                 chapter_text.rstrip() + '\n',
             )
+            manifest.append(
+                {
+                    'source_number': chapter_number,
+                    'output_number': chapter_number,
+                    'heading_line': str(chapter['heading_line']),
+                }
+            )
+        write_text(
+            manifest_path,
+            json.dumps(manifest, ensure_ascii=False, indent=2) + '\n',
+        )
 
     def rebuild_full_manuscript(self, export_chapters_txt: bool = True) -> None:
-        completed = sorted(
-            self.state.get('completed_chapters', []),
-            key=lambda item: int(item.get('chapter_number', 0) or 0),
-        )
-        chunks: list[str] = []
-        for item in completed:
-            draft_path = Path(item['draft_file'])
-            if not draft_path.exists():
-                self.log(f'[manuscript] 跳过缺失章稿：{draft_path}')
-                continue
-            text = read_text(draft_path).strip()
-            if text:
-                chunks.append(text)
+        completed = self.state.get('completed_chapters', [])
+        chunks = [str(item['text']) for item in self._completed_manuscript_chapters()]
 
         if chunks:
             write_text(self.full_manuscript_path, '\n\n'.join(chunks).rstrip() + '\n')
@@ -1242,7 +1579,7 @@ class AutoNovelRunner:
 
             if isinstance(current, ChatMessages):
                 final_messages = current
-                response_text = current.response or ''
+                response_text = self._sanitize_text(current.response or '')
                 if getattr(current, 'stream_fallback', False) and not fallback_logged:
                     reason = getattr(current, 'stream_fallback_reason', '') or 'stream transport error'
                     self.log(f'[{label}] 流式链路异常，已自动降级为非流式补全：{reason}')
@@ -1260,7 +1597,7 @@ class AutoNovelRunner:
         if not final_messages or not (final_messages.response or '').strip():
             raise RuntimeError(f'{label} 未返回有效内容。')
 
-        response = final_messages.response.strip()
+        response = self._sanitize_text(final_messages.response or '').strip()
         if stream_output:
             self._stream_text(label, response, finish=True)
         self.clear_stage()
@@ -1368,8 +1705,10 @@ class AutoNovelRunner:
         return operations
 
     def critic_review_draft(self, chapter: dict, plot_text: str, draft_text: str, pass_index: int = 1) -> dict[str, Any]:
+        project_hard_rules = self._project_critic_hard_rules()
+        critic_kind = '中文短篇小说' if self._is_title_only_story() else '中文长篇连载'
         prompt = f"""
-你是中文长篇连载的“客观事实 critic”。请只检查这章正文中的客观、可验证、无需主观判断的语言逻辑错误。
+你是{critic_kind}的“客观事实 critic”。请只检查这章正文中的客观、可验证、无需主观判断的语言逻辑错误。
 
 只允许报告以下类型：
 1. 明确计数错误：如“三个字/七个人/两次/第八条”与实际内容不符。
@@ -1383,6 +1722,7 @@ class AutoNovelRunner:
 - 凡是出现“X个字 / X个人 / X次 / 第X条 / 第X页 / 第X签 / X步 / X层 / X息”等显式数量宣称，都要逐一核对。
 - 如果同一章里有多处独立问题，要分别列出，不要合并成一句模糊描述。
 - 输出前再自检一遍，确认没有遗漏同类显式计数错误。
+{project_hard_rules if project_hard_rules else ''}
 
 禁止事项：
 - 不要提文风、节奏、爽点、情绪浓度、设定喜好等主观建议。
@@ -1447,6 +1787,7 @@ class AutoNovelRunner:
 - 每个 old_text 必须是原文中真实存在、且足够唯一的原句或短段。
 - 每个 new_text 只能做最小修正，不要顺手润色或扩写。
 - 如果一个问题只需改一个数字或一句话，就不要输出更大范围。
+- 在修这些问题时，顺手把同一处能一并修掉的同类显式计数、引号字数宣称、称谓/时间/位置硬冲突一起修掉，不要把本可同轮解决的问题拆到下一轮。
 - 返回严格 JSON：
 {{
   "operations": [
@@ -1473,7 +1814,7 @@ class AutoNovelRunner:
             f'第{chapter["chapter_number"]}章修订第{pass_index}轮',
             prompt,
             self.critic_model,
-            system_prompt='你是只做局部替换修订的长篇正文修稿编辑。',
+            system_prompt='你是只做局部替换修订的正文修稿编辑。',
         )
         operations = self._normalize_patch_operations(payload)
         if not operations:
@@ -1481,11 +1822,83 @@ class AutoNovelRunner:
         patched_text, applied_count = apply_replacement_operations(draft_text, operations)
         if applied_count <= 0:
             raise RuntimeError(f'第{chapter["chapter_number"]}章 critic 局部替换未实际生效。')
-        return normalize_chapter_draft_text(chapter['chapter_number'], chapter['title'], patched_text)
+        return normalize_chapter_draft_text(
+            chapter['chapter_number'],
+            chapter['title'],
+            patched_text,
+            heading_mode=self._draft_heading_mode(),
+        )
+
+    def critic_rewrite_full_draft(
+        self,
+        chapter: dict,
+        plot_text: str,
+        draft_text: str,
+        report: dict[str, Any],
+        pass_index: int = 1,
+    ) -> str:
+        issues_json = json.dumps(report.get('issues', []), ensure_ascii=False, indent=2)
+        project_hard_rules = self._project_critic_hard_rules()
+        prompt = f"""
+你正在做“整章强修复”。
+
+前面的局部替换策略不足以让这一章快速收敛。请在不改变本章核心事件、人物立场、世界规则、关键因果、章节功能和整体风格的前提下，直接输出一版“完整修订后的章节正文”，一次性修复下面这些已确认的客观问题，并主动顺手排查同类硬伤。
+
+硬性要求：
+- 直接输出修订后的完整正文，不要 JSON，不要解释，不要批注。
+- 优先保留原有段落、句式和叙事节奏，只在必要位置改动。
+- 如果局部小修会引发新的矛盾，可以直接重写受影响的整段，但不要把整章写成另一篇。
+- 必须一次性修掉以下问题，并主动自检：
+  1. 所有“几个字 / 几个人 / 几次 / 第X条 / 第X页 / 第X签 / X步 / X层 / X息”等显式数量宣称与实际一致。
+  2. 引号内短句的字数宣称与实际一致。
+  3. 同一章内同一事实只保留一种说法，不得再出现身份、称谓、时间、位置、动作结果前后打架。
+  4. 若存在项目硬规则，必须一并满足。
+- 不要新增新角色姓名、新设定、新支线或额外解释。
+- 输出前自行再检查一遍，不要把本轮已知问题拆成下一轮。
+{project_hard_rules if project_hard_rules else ''}
+
+【章节信息】
+- 章节号：第 {chapter['chapter_number']} 章
+- 标题：{chapter['title']}
+- 第 {pass_index} 轮强修复
+
+【本章剧情梗概】
+{plot_text.strip() or '（无）'}
+
+【已确认问题】
+{issues_json}
+
+【当前正文】
+{draft_text.strip()}
+"""
+        revised = self._call_llm_raw(
+            f'第{chapter["chapter_number"]}章强修复第{pass_index}轮',
+            prompt,
+            self.critic_model,
+            system_prompt='你是擅长一次性消除客观逻辑硬伤的中文正文强修复编辑。',
+            response_json=False,
+            stream_output=False,
+        ).strip()
+        if not revised:
+            raise RuntimeError(f'第{chapter["chapter_number"]}章 critic 强修复返回空文本。')
+        normalized = normalize_chapter_draft_text(
+            chapter['chapter_number'],
+            chapter['title'],
+            revised,
+            heading_mode=self._draft_heading_mode(),
+        )
+        if len(normalized) < max(400, int(len(draft_text) * 0.55)):
+            raise RuntimeError(f'第{chapter["chapter_number"]}章 critic 强修复后文本异常变短。')
+        return normalized
 
     def apply_chapter_critic(self, chapter: dict, plot_text: str, draft_text: str, force: bool = False) -> str:
         chapter_number = int(chapter['chapter_number'])
-        current_text = normalize_chapter_draft_text(chapter_number, chapter['title'], draft_text)
+        current_text = normalize_chapter_draft_text(
+            chapter_number,
+            chapter['title'],
+            draft_text,
+            heading_mode=self._draft_heading_mode(),
+        )
         if not self._should_run_critic_for_chapter(chapter_number, force=force):
             return current_text
 
@@ -1538,17 +1951,40 @@ class AutoNovelRunner:
                     f'第{chapter_number}章 critic 在 {max_passes} 轮后仍有 {len(issues)} 个客观问题未解决。'
                 )
 
-            previous_text = current_text
-            current_text = self.with_retry(
-                f'第{chapter_number}章修订第{pass_index}轮',
-                lambda pass_index=pass_index, review=review: self.critic_rewrite_draft(
-                    chapter,
-                    plot_text,
-                    current_text,
-                    review,
-                    pass_index=pass_index,
-                ),
+            issue_types = {str(issue.get('type', '')).strip() for issue in issues}
+            use_full_rewrite = (
+                len(issues) >= 4
+                or pass_index >= 2
+                or any(issue_type.startswith('required_') for issue_type in issue_types)
+                or any('contradiction' in issue_type for issue_type in issue_types)
             )
+            previous_text = current_text
+            if use_full_rewrite:
+                self.log(
+                    f'[第{chapter_number}章critic] 第 {pass_index} 轮升级为整章强修复，'
+                    f'避免长时间分轮打补丁。'
+                )
+                current_text = self.with_retry(
+                    f'第{chapter_number}章强修复第{pass_index}轮',
+                    lambda pass_index=pass_index, review=review: self.critic_rewrite_full_draft(
+                        chapter,
+                        plot_text,
+                        current_text,
+                        review,
+                        pass_index=pass_index,
+                    ),
+                )
+            else:
+                current_text = self.with_retry(
+                    f'第{chapter_number}章修订第{pass_index}轮',
+                    lambda pass_index=pass_index, review=review: self.critic_rewrite_draft(
+                        chapter,
+                        plot_text,
+                        current_text,
+                        review,
+                        pass_index=pass_index,
+                    ),
+                )
             if current_text == previous_text:
                 raise RuntimeError(f'第{chapter_number}章 critic 修订未对正文产生任何变化，停止自动复检。')
             current_text, local_issues = apply_explicit_count_fixes(current_text)
@@ -1603,7 +2039,7 @@ class AutoNovelRunner:
                     # Mapping/json stages are internal program steps; showing raw token text
                     # leaks tool-oriented responses into the live novel stream.
                     if '映射文本' not in current_stream_label:
-                        self._stream_text(current_stream_label, merged_text)
+                        self._stream_text(current_stream_label, self._sanitize_text(merged_text))
                     self.mark_stage(current_stream_label)
 
             if time.time() - last_log_time >= 8:
@@ -1613,9 +2049,10 @@ class AutoNovelRunner:
 
         self._stream_text(current_stream_label, self._stream_cache.get(current_stream_label, ''), finish=True)
         self.clear_stage()
-        total_y = ''.join(pair[1] for pair in writer.xy_pairs)
+        sanitized_pairs = self._sanitize_pairs(writer.xy_pairs)
+        total_y = ''.join(pair[1] for pair in sanitized_pairs)
         self.log(f'[{label}] 完成，用时 {time.time() - start_time:.1f}s，输出 {len(total_y)} 字')
-        return list(writer.xy_pairs)
+        return sanitized_pairs
 
     def with_retry(self, label: str, func: Callable[[], str | list | dict], retries: int | None = None):
         retries = self.args.max_retries if retries is None else retries
@@ -1666,19 +2103,48 @@ class AutoNovelRunner:
         part_focus: str,
         previous_parts: list[str],
     ) -> str:
+        part_specs = self._series_bible_part_specs()
         previous_context = ''
         if previous_parts:
             snippets = []
             for prev_index, prev_text in enumerate(previous_parts, start=1):
-                prev_title = SERIES_BIBLE_PART_SPECS[prev_index - 1][0]
+                prev_title = part_specs[prev_index - 1][0]
                 snippets.append(
                     f'【已完成部分 {prev_index}：{prev_title}】\n'
                     f'{truncate_text(prev_text, 900)}'
                 )
             previous_context = '\n\n已完成部分摘要（用于保持命名、设定、人物关系一致，不要整段复写）：\n' + '\n\n'.join(snippets)
 
+        if self._is_title_only_story():
+            return f"""
+你正在为一篇单篇中文短篇小说制作“短篇工作圣经”的分部分草稿，本次只生成其中一个部分，而不是整份总稿。
+
+当前任务：
+- 当前部分：第 {part_index} 部分《{part_title}》
+- 本部分职责：{part_focus}
+
+硬性目标：
+- 目标总字数：{self.args.target_chars} 字（这是单篇成稿体量参考，不代表要拆成卷或长篇）
+- 必须严格服从用户设定，不得偏题、换题材、换文风
+- 风格必须适配单篇短篇小说：人物先于设定、情绪穿透优先于连载悬念、结尾要落在最后一屏的余味上
+- 本部分只输出当前职责范围内的内容，不要越界包办其他部分
+- 必须与已完成部分的书名、术语、人物称谓、意象称谓保持完全一致
+- 请使用 Markdown 小标题，首行固定写：## 第{part_index}部分：{part_title}
+- 输出信息密度高，避免空话和重复，长度尽量控制在 1000~1800 字
+
+补充要求：
+- 所有信息都必须服务于“同一篇内完成建立人物、压上冲突、付出代价、留下最后一屏”
+- 禁止使用“卷、长篇路线、连载节奏、阶段性爽点、卷末钩子、后续再展开”等长篇术语
+- 优先给出能直接指导单篇成稿的具体信息，而不是泛泛抽象判断
+- 如果用户设定里有创新点，务必把创新点落实为具体矛盾、具体物件、具体动作或具体画面
+{previous_context}
+
+用户设定如下：
+{brief}
+"""
+
         return f"""
-你正在为一部长篇中文网络小说制作《系列圣经》的分卷稿，本次只生成其中一个部分，而不是整份总稿。
+你正在为一部{'单篇中文短篇小说' if self._is_title_only_story() else '长篇中文网络小说'}制作《系列圣经》的分卷稿，本次只生成其中一个部分，而不是整份总稿。
 
 当前任务：
 - 当前部分：第 {part_index} 部分《{part_title}》
@@ -1687,7 +2153,7 @@ class AutoNovelRunner:
 硬性目标：
 - 目标总字数：{self.args.target_chars} 字
 - 必须严格服从用户设定，不得偏题、换题材、换文风
-- 风格必须适配中文网文连载：强钩子、强冲突、强追读、强悬念
+- 风格必须适配{'单篇短篇小说：人物先于设定、情绪穿透优先于连载悬念、结尾要落在最后一屏的余味上' if self._is_title_only_story() else '中文网文连载：强钩子、强冲突、强追读、强悬念'}
 - 本部分只输出当前职责范围内的内容，不要越界包办其他部分
 - 必须与已完成部分的书名、术语、人物称谓、势力称谓保持完全一致
 - 请使用 Markdown 小标题，首行固定写：## 第{part_index}部分：{part_title}
@@ -1695,7 +2161,7 @@ class AutoNovelRunner:
 
 补充要求：
 - 如果当前部分需要引用前面已经定下的设定，可以简短承接，但不要大段重复
-- 优先给出真正能支撑 200 万字连载的可执行信息，而不是泛泛而谈
+- 优先给出真正能支撑目标量级连载的可执行信息，而不是泛泛而谈
 - 如果用户设定里有创新点，务必把创新点落实为明确规则、矛盾和长线钩子
 {previous_context}
 
@@ -1704,8 +2170,9 @@ class AutoNovelRunner:
 """
 
     def _generate_series_bible_from_parts(self, brief: str) -> str:
+        part_specs = self._series_bible_part_specs()
         parts: list[str] = []
-        for part_index, (part_title, part_focus) in enumerate(SERIES_BIBLE_PART_SPECS, start=1):
+        for part_index, (part_title, part_focus) in enumerate(part_specs, start=1):
             part_path = self._series_bible_part_path(part_index)
             existing_text = read_text(part_path).strip()
             if existing_text:
@@ -1742,7 +2209,17 @@ class AutoNovelRunner:
             brief = read_text(self.brief_path)
             bible_text = self._generate_series_bible_from_parts(brief)
 
-        short_prompt = f"""
+        if self._is_title_only_story():
+            short_prompt = f"""
+请把下面这份“短篇工作圣经”压缩成供后续单篇写作调用的短版记忆，不超过 1200 字。
+要求保留：核心卖点、主角定位、被救者/关键配角作用、私人亏欠、生活残片、世界规则、主冲突、最后一屏、文风提醒。
+禁止写成“卷级路线”“后续展开计划”。
+
+原文如下：
+{bible_text}
+"""
+        else:
+            short_prompt = f"""
 请把下面这份《系列圣经》压缩成供后续写作调用的短版记忆，不超过 1200 字。
 要求保留：核心卖点、主角定位、关键配角作用、世界规则、主线谜团、关系张力、文风提醒。
 
@@ -1767,6 +2244,8 @@ class AutoNovelRunner:
         if plan_path.exists():
             return plan_path
 
+        plan_label = self._plan_stage_label(volume_number)
+
         chapter_start = (volume_number - 1) * self.args.chapters_per_volume + 1
         chapter_end = chapter_start + self.args.chapters_per_volume - 1
         series_bible_short = truncate_text(read_text(self.series_bible_short_path), 1200)
@@ -1774,7 +2253,45 @@ class AutoNovelRunner:
         recent = truncate_text(self.recent_chapter_summaries(limit=4), 800)
         ending_guidance = self._ending_guidance_text(limit=1000)
 
-        prompt = f"""
+        if self._is_title_only_story():
+            prompt = f"""
+请规划这篇单篇短故事的整体路线图。
+
+基础信息：
+- 唯一正文：第 {chapter_start} 章
+- 目标：单篇闭环，人物先成立，情感后穿透，结尾要靠画面收住而不是靠总结点题
+- 输出尽量控制在 1600~2600 字，聚焦最关键的戏剧推进与情绪落点
+
+必须坚持：
+- 严格服从当前作品设定与题材
+- 不要按长篇连载思维拆钩子、拆高潮、拆尾声
+- 必须先把人物、私人亏欠、现实代价立起来，再让制度与规则压上去
+- 至少给出一条“被救者的真实生活残片”与一条“主角私人亏欠的具体物件/动作”
+- 结尾必须是一个能留下余味的最后画面，不要写成制度总结会
+
+【系列圣经短版】
+{series_bible_short}
+
+【前情压缩记忆】
+{story_memory or '（暂无）'}
+
+【最近章节摘要】
+{recent or '（暂无）'}
+
+{ending_guidance}
+
+输出格式：
+# 单篇路线图
+## 核心人物与私人亏欠
+## 主冲突
+## 情绪推进
+## 关键场景
+## 被救者必须具备的生活残片
+## 结尾最后一屏
+## 必须避免的写法
+"""
+        else:
+            prompt = f"""
 请规划第 {volume_number} 卷的卷级路线图。
 
 卷信息：
@@ -1813,8 +2330,8 @@ class AutoNovelRunner:
 ## 本卷必须回收/埋下的伏笔
 """
         plan_text = self.with_retry(
-            f'第{volume_number}卷规划',
-            lambda: self.call_llm(f'第{volume_number}卷规划', prompt, self.planner_model),
+            plan_label,
+            lambda: self.call_llm(plan_label, prompt, self.planner_model),
         )
         self.clear_error()
         write_text(plan_path, plan_text)
@@ -1829,6 +2346,38 @@ class AutoNovelRunner:
                 continue
             blocks.append(f"第{item['chapter_number']}章：{summary.strip()}")
         return '\n'.join(blocks)
+
+    def _chapter_summary_block(self, items: list[dict[str, Any]], limit: int = 8, *, from_head: bool = False) -> str:
+        selected = items[:limit] if from_head else items[-limit:]
+        blocks = []
+        for item in selected:
+            summary = read_text(Path(item.get('summary_file', ''))).strip()
+            if not summary:
+                continue
+            blocks.append(f"第{item['chapter_number']}章：{summary}")
+        return '\n'.join(blocks).strip()
+
+    def _chapter_fulltext_block(
+        self,
+        items: list[dict[str, Any]],
+        limit: int,
+        *,
+        from_head: bool = False,
+        per_chapter_limit: int = 3500,
+    ) -> str:
+        selected = items[:limit] if from_head else items[-limit:]
+        blocks = []
+        for item in selected:
+            draft_path = Path(item.get('draft_file', ''))
+            if not draft_path.exists():
+                continue
+            chapter_number = int(item.get('chapter_number', 0) or 0)
+            title = str(item.get('title', '') or '').strip() or format_chapter_heading(chapter_number, '')
+            text = truncate_text(read_text(draft_path), per_chapter_limit)
+            if not text:
+                continue
+            blocks.append(f'=== 第{chapter_number}章：{title} ===\n{text}')
+        return '\n\n'.join(blocks).strip()
 
     def _completion_mode(self) -> str:
         return str(getattr(self.args, 'completion_mode', 'hard_target') or 'hard_target').strip().lower()
@@ -1884,6 +2433,10 @@ class AutoNovelRunner:
         recent_average = self._recent_average_chapter_chars()
         return max(180_000, min(320_000, recent_average * 40))
 
+    def _ending_guidance_pressure_runway_chars(self) -> int:
+        recent_average = self._recent_average_chapter_chars()
+        return max(80_000, min(180_000, recent_average * 18))
+
     def _remaining_absolute_runway_chars(self) -> int:
         max_target_chars = self._effective_max_target_chars()
         if max_target_chars <= 0:
@@ -1898,6 +2451,117 @@ class AutoNovelRunner:
             return False
         return self._remaining_absolute_runway_chars() <= self._terminal_finish_runway_chars()
 
+    def _completion_same_remaining_streak(self, remaining_chapters: int) -> int:
+        target = max(0, int(remaining_chapters or 0))
+        if target <= 0:
+            return 0
+        streak = 0
+        for item in reversed(list(self.state.get('completion_check_history') or [])):
+            if item.get('is_complete'):
+                break
+            if int(item.get('remaining_chapters', 0) or 0) != target:
+                break
+            streak += 1
+        return streak
+
+    def _is_tail_only_completion_missing(self, item: str) -> bool:
+        text = str(item or '').strip()
+        if not text:
+            return True
+
+        hard_block_keywords = (
+            '主线', '谜团', '真相', '源头', '责任链', '胜负', '资格', '原位',
+            '第一页', '首字', '黑幕', '反派', '翻盘', '身份之谜', '最终解释',
+            '命运落点', '规则级', '最大谜团',
+        )
+        if any(keyword in text for keyword in hard_block_keywords):
+            return False
+
+        tail_keywords = (
+            '尾声', '后日谈', '后记', '远期', '长期', '时间层', '后世', '多年后',
+            '定格', '最后一次', '最终确认', '常态化', '无旧人参与', '旧人参与',
+            '旧人彻退', '人已彻退', '普通人', '静态画面', '翻页', '合簿',
+            '主栏永空', '页边旧墨', '独立后日谈', '长期落点', '后辈',
+        )
+        return any(keyword in text for keyword in tail_keywords)
+
+    def _tail_only_completion_stagnation(self, completion_report: dict[str, Any]) -> dict[str, Any]:
+        if self._completion_mode() != 'min_chars_and_story_end':
+            return {'triggered': False}
+        if self._is_title_only_story():
+            return {'triggered': False}
+        if completion_report.get('is_complete'):
+            return {'triggered': False}
+        if not self._in_terminal_finish_mode():
+            return {'triggered': False}
+
+        remaining_chapters = int(completion_report.get('remaining_chapters', 0) or 0)
+        if remaining_chapters != 1:
+            return {'triggered': False}
+
+        missing = [str(item).strip() for item in (completion_report.get('missing') or []) if str(item).strip()]
+        if not missing:
+            return {'triggered': False}
+        if not all(self._is_tail_only_completion_missing(item) for item in missing):
+            return {'triggered': False}
+
+        streak = self._completion_same_remaining_streak(remaining_chapters)
+        if streak < 3:
+            return {'triggered': False}
+
+        return {
+            'triggered': True,
+            'streak': streak,
+            'missing': missing,
+        }
+
+    def _rewrite_pending_from_chapter(self) -> int:
+        rewrite_from = int(self.state.get('rewrite_required_from_chapter', 0) or 0)
+        if rewrite_from <= 0:
+            return 0
+        max_completed = max(
+            [int(item.get('chapter_number', 0) or 0) for item in self.state.get('completed_chapters', [])] or [0]
+        )
+        return rewrite_from if max_completed < rewrite_from else 0
+
+    def _in_ending_guidance_pressure_mode(self) -> bool:
+        if self._completion_mode() != 'min_chars_and_story_end':
+            return False
+        if int(self.state.get('generated_chapters', 0) or 0) <= 0:
+            return False
+        current_chars = int(self.state.get('generated_chars', 0) or 0)
+        pressure_runway = self._ending_guidance_pressure_runway_chars()
+        force_finish = self._effective_force_finish_chars()
+        if force_finish > 0 and current_chars >= max(0, force_finish - pressure_runway):
+            return True
+        max_target_chars = self._effective_max_target_chars()
+        if max_target_chars > 0 and self._remaining_absolute_runway_chars() <= max(
+            pressure_runway,
+            self._terminal_finish_runway_chars(),
+        ):
+            return True
+        completion_check = self.state.get('completion_check') or {}
+        conservative_remaining_chapters = int(completion_check.get('conservative_remaining_chapters', 0) or 0)
+        return self._in_finale_mode() and conservative_remaining_chapters > 0 and conservative_remaining_chapters <= 6
+
+    def _ending_guidance_refresh_interval(self) -> int:
+        if self._in_terminal_finish_mode():
+            return 1
+        if self._in_force_finish_mode():
+            return 1
+        if self._in_ending_guidance_pressure_mode():
+            return 2
+        return 0
+
+    def _ending_guidance_mode_label(self) -> str:
+        if self._in_terminal_finish_mode():
+            return '绝对上限冲刺'
+        if self._in_force_finish_mode():
+            return '强制收束'
+        if self._in_ending_guidance_pressure_mode():
+            return '压线预警'
+        return '常规'
+
     def _recent_average_chapter_chars(self, limit: int = 8) -> int:
         completed = self.state.get('completed_chapters', [])
         recent = [
@@ -1909,6 +2573,103 @@ class AutoNovelRunner:
             return max(1200, int(self.args.chapter_char_target))
         return max(int(self.args.chapter_char_target), math.ceil(sum(recent) / len(recent)))
 
+    def _ending_quality_guidance_refresh_interval(self) -> int:
+        if self._in_terminal_finish_mode():
+            return 1
+        if self._in_force_finish_mode():
+            return 1
+        if self._in_ending_guidance_pressure_mode():
+            return 1
+        if self._in_finale_mode():
+            completion_check = self.state.get('completion_check') or {}
+            conservative_remaining = int(
+                completion_check.get('conservative_remaining_chapters')
+                or completion_check.get('remaining_chapters', 0)
+                or 0
+            )
+            if 0 < conservative_remaining <= 6:
+                return 2
+        return 0
+
+    def ensure_opening_promise(self, force: bool = False) -> str:
+        completed = self.state.get('completed_chapters', [])
+        if not completed:
+            return ''
+
+        if not force and self.opening_promise_path.exists():
+            return read_text(self.opening_promise_path).strip()
+
+        brief_text = truncate_text(read_text(self.brief_path), 1800)
+        series_bible = truncate_text(read_text(self.series_bible_short_path), 1200)
+        opening_summaries = self._chapter_summary_block(completed, limit=3, from_head=True)
+        opening_fulltext = self._chapter_fulltext_block(completed, limit=3, from_head=True, per_chapter_limit=3200)
+        prompt = f"""
+请提炼这部长篇小说的“开篇承诺”，供后续终局质量控制使用。
+
+你的任务不是总结全书，而是准确说清：
+1. 读者一开始为什么会被抓住。
+2. 开篇真正抛出了什么核心问题、关系张力、情绪承诺或意象承诺。
+3. 结尾如果只是把事情办完、解释完，会在哪些地方显得虎头蛇尾。
+4. 真正有力的终局，必须回应什么，最好以什么方式回应。
+
+要求：
+- 只基于设定与开篇材料判断，不要杜撰中后期情节。
+- 重点回答“读者最先被什么吸进去”和“结尾必须兑现什么”。
+- 允许提炼出一个最值得回响的开篇意象/动作/处境。
+- 总长度控制在 500~900 字。
+
+输出格式必须严格如下：
+# 开篇承诺
+## 读者最先被什么抓住
+## 开头提出的核心问题
+## 核心情绪 / 关系 / 意象
+## 结尾必须兑现什么
+## 最容易写砸的收尾方式
+
+【作品设定】
+{brief_text or '（无）'}
+
+【系列圣经短版】
+{series_bible or '（无）'}
+
+【开篇章节摘要】
+{opening_summaries or '（无）'}
+
+【开篇章节正文】
+{opening_fulltext or '（无）'}
+""".strip()
+        opening_promise = self.with_retry(
+            '开篇承诺提炼',
+            lambda: self.call_llm(
+                '开篇承诺提炼',
+                prompt,
+                self.ending_polish_model,
+                system_prompt='你是中文长篇小说的开篇承诺编辑，擅长提炼读者入坑理由与终局兑现义务。',
+            ),
+        )
+        self.clear_error()
+        write_text(self.opening_promise_path, opening_promise.strip())
+        self.state['last_opening_promise_refresh_chapter'] = int(self.state.get('generated_chapters', 0) or 0)
+        self._save_state()
+        return opening_promise.strip()
+
+    def _ending_quality_guidance_text(self, limit: int = 1200) -> str:
+        blocks = []
+        if self._in_finale_mode():
+            opening_promise = truncate_text(read_text(self.opening_promise_path), min(limit, 800)).strip()
+            if opening_promise:
+                blocks.append('【开篇承诺：终局必须回应】\n' + opening_promise)
+
+        auto_quality = truncate_text(read_text(self.auto_ending_quality_guidance_path), limit).strip()
+        if auto_quality:
+            blocks.append('【自动终局质量指引】\n' + auto_quality)
+
+        polish_brief = truncate_text(read_text(self.ending_polish_brief_path), limit).strip()
+        if polish_brief:
+            blocks.append('【终局回修要求：本轮写作必须遵守】\n' + polish_brief)
+
+        return '\n\n'.join(blocks).strip()
+
     def _ending_guidance_text(self, limit: int = 1200) -> str:
         blocks = []
 
@@ -1918,6 +2679,17 @@ class AutoNovelRunner:
                 '【完结要求：高优先级，若与旧卷计划冲突，以此为准】\n'
                 + truncate_text(manual_guidance, limit)
             )
+
+        auto_guidance = read_text(self.auto_ending_guidance_path).strip()
+        if auto_guidance:
+            blocks.append(
+                '【自动终局收束指引：依据当前字数压力与剩余跑道生成】\n'
+                + truncate_text(auto_guidance, limit)
+            )
+
+        quality_guidance = self._ending_quality_guidance_text(limit=limit)
+        if quality_guidance:
+            blocks.append(quality_guidance)
 
         if self._in_finale_mode():
             completion_check = self.state.get('completion_check') or {}
@@ -1967,6 +2739,614 @@ class AutoNovelRunner:
 
         return '\n\n'.join(blocks).strip()
 
+    def refresh_ending_quality_guidance(self, force: bool = False) -> None:
+        completed = self.state.get('completed_chapters', [])
+        if not completed or not self._in_finale_mode():
+            return
+        pending_rewrite_from = self._rewrite_pending_from_chapter()
+        if pending_rewrite_from:
+            self.log(
+                f'[ending_quality] 已进入终局回修待写状态（需从第{pending_rewrite_from}章补回），'
+                '暂停刷新终局质量指引，避免对回退后的半成品重复评估。'
+            )
+            return
+
+        interval = self._ending_quality_guidance_refresh_interval()
+        if not force:
+            if interval <= 0:
+                return
+            last_refresh = int(self.state.get('last_ending_quality_guidance_refresh_chapter', 0) or 0)
+            current_chapter = int(self.state.get('generated_chapters', 0) or 0)
+            if current_chapter - last_refresh < interval:
+                return
+
+        completion_check = self.state.get('completion_check') or {}
+        if force or not completion_check or int(completion_check.get('checked_at_chapter', -1) or -1) != int(self.state.get('generated_chapters', 0) or 0):
+            completion_check = self.evaluate_completion_status(force=force)
+
+        opening_promise = truncate_text(self.ensure_opening_promise(force=False), 1200)
+        recent_summaries = truncate_text(self.recent_chapter_summaries(limit=8), 2000)
+        last_draft_tail = ''
+        if completed:
+            last_draft_tail = tail_text(read_text(Path(completed[-1]['draft_file'])), 2200)
+        story_memory = truncate_text(read_text(self.story_memory_path), 1800)
+        manual_guidance = truncate_text(read_text(self.ending_guidance_path), 1400)
+        auto_guidance = truncate_text(read_text(self.auto_ending_guidance_path), 1400)
+        ending_research = ending_craft_research_text(1000)
+
+        prompt = f"""
+请为这部长篇处于终局阶段的最后少量章节，生成一份“终局质量指引”。
+
+你的目标不是防止没写完，而是防止“只收账、不回响”的虎头蛇尾。
+
+请尤其处理下面这些问题：
+1. 结尾必须回应开篇承诺，而不只是把流程办结。
+2. 终章/尾声/后日谈需要留下一个能让读者停下来的回响：可以是人物选择、代价、意象回声、价值反照、反讽、迟来的平静，但不能只是总结。
+3. 允许留余味，但不能靠不交代关键义务来制造“开放感”。
+4. 避免“制度说明会 / 办结通知 / 连续解释 / 重复宣判 / 情绪下坠”。
+5. 如果当前结尾已经偏解释化，请明确告诉作者最后1~2章要把什么重新抬起来。
+6. 参考外部成熟收尾经验：避免“高潮后反复落锤”“把结尾写成说明会”“用没写完冒充余味”；尽量让最后一屏可停留、可回响。
+
+要求：
+- 只面向最后极少量章节，不要写大而空的文学议论。
+- 必须落到当前作品已建立的冲突、人物、关系和意象上。
+- 必须明确写出“最后一屏/最后一段应给读者什么感觉”。
+- 总长度控制在 700~1400 字。
+
+输出格式必须严格如下：
+# 终局质量指引
+## 开篇承诺回看
+## 当前终局最容易失手的地方
+## 必须打中的主题回答
+## 最后一屏建议
+## 禁止的写法
+## 下一章质量目标
+
+【开篇承诺】
+{opening_promise or '（无）'}
+
+【外部收尾经验摘要】
+{ending_research or '（无）'}
+
+【故事记忆】
+{story_memory or '（无）'}
+
+【手工完结要求】
+{manual_guidance or '（无）'}
+
+【自动终局收束指引】
+{auto_guidance or '（无）'}
+
+【最近章节摘要】
+{recent_summaries or '（无）'}
+
+【最近正文尾段】
+{last_draft_tail or '（无）'}
+
+【当前完结评估】
+- 是否完结：{'是' if completion_check.get('is_complete') else '否'}
+- 建议还需章节：{int(completion_check.get('remaining_chapters', 0) or 0)}
+- 保守估计还需章节：{int(completion_check.get('conservative_remaining_chapters', 0) or 0)}
+- 仍缺内容：{'；'.join(str(item) for item in (completion_check.get('missing') or [])) or '无'}
+- 下一阶段目标：{str(completion_check.get('next_phase_goal', '') or '').strip() or '无'}
+""".strip()
+
+        guidance_text = self.with_retry(
+            '终局质量指引',
+            lambda: self.call_llm(
+                '终局质量指引',
+                prompt,
+                self.ending_polish_model,
+                system_prompt='你是中文长篇小说的终局质量编辑，擅长让结尾拥有与开篇相匹配的抓力、回响和余味。',
+            ),
+        )
+        self.clear_error()
+        write_text(self.auto_ending_quality_guidance_path, guidance_text.strip())
+        self.state['last_ending_quality_guidance_refresh_chapter'] = int(self.state.get('generated_chapters', 0) or 0)
+        self._save_state()
+        self.log(
+            f'[ending_quality] 已刷新终局质量指引：模式={self._ending_guidance_mode_label()}，'
+            f'章节={self.state.get("generated_chapters", 0)}，字数={self.state.get("generated_chars", 0)}'
+        )
+
+    def refresh_ending_guidance(self, force: bool = False) -> None:
+        completed = self.state.get('completed_chapters', [])
+        if not completed:
+            return
+        pending_rewrite_from = self._rewrite_pending_from_chapter()
+        if pending_rewrite_from:
+            self.log(
+                f'[ending_guidance] 已进入终局回修待写状态（需从第{pending_rewrite_from}章补回），'
+                '暂停刷新完结评估/自动收束指引，避免把回退后的中间稿误判成最终状态。'
+            )
+            return
+
+        interval = self._ending_guidance_refresh_interval()
+        if not force:
+            if interval <= 0:
+                return
+            last_refresh = int(self.state.get('last_ending_guidance_refresh_chapter', 0) or 0)
+            current_chapter = int(self.state.get('generated_chapters', 0) or 0)
+            if current_chapter - last_refresh < interval:
+                return
+
+        completion_check = self.state.get('completion_check') or {}
+        if force or not completion_check or int(completion_check.get('checked_at_chapter', -1) or -1) != int(self.state.get('generated_chapters', 0) or 0):
+            completion_check = self.evaluate_completion_status(force=force)
+
+        recent_summaries = truncate_text(self.recent_chapter_summaries(limit=10), 2400)
+        last_draft_tail = ''
+        if completed:
+            last_draft_tail = truncate_text(read_text(Path(completed[-1]['draft_file'])), 2200)
+        pending_outlines = truncate_text(self._recent_pending_outlines(limit=3), 1800)
+        story_memory = truncate_text(read_text(self.story_memory_path), 1800)
+        series_bible = truncate_text(read_text(self.series_bible_short_path), 1200)
+        manual_guidance = truncate_text(read_text(self.ending_guidance_path), 1600)
+        ending_research = ending_craft_research_text(1000)
+
+        prompt = f"""
+请为这部长篇生成一份“自动终局收束指引”，供接下来极少量章节的规划与正文直接遵循。
+
+你的目标不是继续扩写，而是：
+1. 在不烂尾的前提下，随着字数压力上升，尽快自然收束。
+2. 明确哪些终局任务必须优先回收，哪些可以合并，哪些绝对不能再开。
+3. 让后续章节在剩余跑道内完成“终局 / 尾声 / 后日谈”。
+4. 参考外部成熟收尾经验：不要在高潮后长时间磨损尾劲；落锤后最多保留一次现实验证和一个极短余韵，不要把尾声写成连续说明会。
+
+当前模式：{self._ending_guidance_mode_label()}
+
+硬要求：
+- 只面向“接下来很少的章节”给指引，不要写长线规划。
+- 不要复述圣经大词，要落到当前尾段实际还缺什么。
+- 若当前已进入强制收束或绝对上限冲刺，必须主动压缩，不允许再建议宽松展开。
+- 必须明确列出“禁止新增”的内容。
+- 必须明确给出“下一章最优先完成什么”。
+- 总长度控制在 700~1400 字。
+
+输出格式必须严格如下：
+# 自动终局收束指引
+## 当前状态判断
+## 必须立即回收的事项
+- 条目
+## 可合并完成的事项
+- 条目
+## 接下来1-3章建议
+- 条目
+## 禁止新增
+- 条目
+## 下一章最高优先级
+- 条目
+
+【系列圣经短版】
+{series_bible or '（无）'}
+
+【外部收尾经验摘要】
+{ending_research or '（无）'}
+
+【故事记忆】
+{story_memory or '（无）'}
+
+【手工完结要求】
+{manual_guidance or '（无）'}
+
+【最近章节摘要】
+{recent_summaries or '（无）'}
+
+【最近正文尾段】
+{last_draft_tail or '（无）'}
+
+【已规划未写大纲】
+{pending_outlines or '（无）'}
+
+【当前完结评估】
+- 是否完结：{'是' if completion_check.get('is_complete') else '否'}
+- 建议还需章节：{int(completion_check.get('remaining_chapters', 0) or 0)}
+- 建议还需字数：{int(completion_check.get('remaining_chars', 0) or 0)}
+- 保守估计还需章节：{int(completion_check.get('conservative_remaining_chapters', 0) or 0)}
+- 保守估计还需字数：{int(completion_check.get('conservative_remaining_chars', 0) or 0)}
+- 仍缺内容：{'；'.join(str(item) for item in (completion_check.get('missing') or [])) or '无'}
+- 保守估计依据：{str(completion_check.get('estimate_note', '') or '').strip() or '无'}
+- 下一阶段目标：{str(completion_check.get('next_phase_goal', '') or '').strip() or '无'}
+
+【字数压力】
+- 当前总字数：{int(self.state.get('generated_chars', 0) or 0)}
+- 强制收束阈值：{self._effective_force_finish_chars()}
+- 最终绝对上限：{self._effective_max_target_chars()}
+- 剩余绝对跑道：{self._remaining_absolute_runway_chars()}
+- 压线预警跑道：{self._ending_guidance_pressure_runway_chars()}
+""".strip()
+
+        guidance_text = self.with_retry(
+            '自动终局收束指引',
+            lambda: self.call_llm('自动终局收束指引', prompt, self.planner_model),
+        )
+        self.clear_error()
+        write_text(self.auto_ending_guidance_path, guidance_text.strip())
+        self.state['last_ending_guidance_refresh_chapter'] = int(self.state.get('generated_chapters', 0) or 0)
+        self._save_state()
+        self.log(
+            f'[ending_guidance] 已刷新自动终局收束指引：模式={self._ending_guidance_mode_label()}，'
+            f'章节={self.state.get("generated_chapters", 0)}，字数={self.state.get("generated_chars", 0)}'
+        )
+
+    def _build_ending_quality_prompt(self) -> str:
+        completed = list(self.state.get('completed_chapters', []) or [])
+        if not completed:
+            raise RuntimeError('尚无已完成章节，无法评估终局质量。')
+
+        current_chapter = int(self.state.get('generated_chapters', 0) or 0)
+        repeated_polish_mode = (
+            int(self.state.get('ending_polish_cycles', 0) or 0) > 0
+            or self._rewrite_pending_from_chapter() > 0
+            or int(self.state.get('ending_polish_last_rewrite_from_chapter', 0) or 0) > 0
+        )
+        opening_promise = truncate_text(self.ensure_opening_promise(force=False), 1200 if repeated_polish_mode else 1400)
+        brief_text = truncate_text(read_text(self.brief_path), 1500 if repeated_polish_mode else 1800)
+        series_bible = truncate_text(read_text(self.series_bible_short_path), 1200 if repeated_polish_mode else 1400)
+        story_memory = truncate_text(read_text(self.story_memory_path), 1800 if repeated_polish_mode else 2200)
+        completion_report = truncate_text(read_text(self.completion_report_path), 1800 if repeated_polish_mode else 2200)
+        ending_guidance = truncate_text(self._ending_guidance_text(limit=1200), 1400 if repeated_polish_mode else 1800)
+        ending_research = ending_craft_research_text(700 if repeated_polish_mode else 1000)
+        opening_summaries = self._chapter_summary_block(completed, limit=2 if repeated_polish_mode else 3, from_head=True)
+        opening_fulltext = self._chapter_fulltext_block(
+            completed,
+            limit=2 if repeated_polish_mode else 3,
+            from_head=True,
+            per_chapter_limit=2400 if repeated_polish_mode else 3200,
+        )
+        tail_summaries = self._chapter_summary_block(completed, limit=10 if repeated_polish_mode else 14, from_head=False)
+        tail_fulltext = self._chapter_fulltext_block(
+            completed,
+            limit=8 if repeated_polish_mode else 12,
+            from_head=False,
+            per_chapter_limit=3200 if repeated_polish_mode else 4200,
+        )
+        full_novel_tail = truncate_text(read_text(self.full_manuscript_path), 12000 if repeated_polish_mode else 18000)
+        book_title = self._project_book_title()
+        story_kind = '单篇短篇小说' if self._is_title_only_story() else '长篇小说'
+        editor_kind = '中文短篇小说的终稿编辑' if self._is_title_only_story() else '中文长篇连载的终局质量编辑'
+        last_rewrite_from = int(self.state.get('ending_polish_last_rewrite_from_chapter', 0) or 0)
+        quality_extra_rule = (
+            '对单篇短篇，不要机械要求“尾声”“后日谈”作为独立段落；只要单篇内部已经完成回响与收束，就可以判定为通过。'
+            if self._is_title_only_story()
+            else '开放式必须是“有意悬置的思考”，不是关键义务未兑现。'
+        )
+
+        return f"""
+请评估这部{story_kind}“当前结尾版本”的终局质量。重点不是它有没有写完，而是它是否真正配得上自己的开篇抓力。
+
+你是{editor_kind}。请优先判断：
+1. 开篇承诺、开头立起的核心问题/关系/意象，是否在结尾得到回应、升格、反照或有力的反讽。
+2. 结尾是否只是“把事情办完”，还是留下了一个能让读者停下来的 final image / final choice / final irony / final question。
+3. 结尾是否过度解释、制度说明化、总结会化、办结化，导致情绪与思想火力下降。
+4. 是否存在虎头蛇尾：开头极抓人，结尾却只剩收账、复述、总结。
+5. 允许留余味，但不能靠没写完制造余味；{quality_extra_rule}
+6. 参考外部成熟收尾经验：高潮后的重复落锤、解释化尾声、同构案例反复验证、尾声长于必要幅度，都应显著扣分。
+7. 商用品质达标即可通过，不要把“还能更好”误判成“必须回修”。
+
+通过/回修判定硬规则：
+- 若综合质量分 >= 85、回响分 >= 90、余味/思考分 >= 85，且不存在关键义务缺失、关键冲突未闭环、人物命运未落点、最后一屏失效等硬伤，默认应判 `quality_pass=true`、`needs_polish=false`。
+- 只有当“不回修会明显损害读者完成感”时，才允许判 `needs_polish=true`。
+- 如果只是还能更凝练、更高级、更有文学感，但现稿已经达到可发布、可合书、可让读者停下来的水准，不要要求回修。
+
+回修规则：
+- 如果无需回修，`rewrite_from_chapter` 必须为 0。
+- 如果只需小修最后一章，也必须写出最后一章章节号。
+- 如果问题集中在最后两三章的气质和火力，而不是更早布局，就不要把起点乱提早。
+- 不要为了追求“文学感”破坏已经完成的主线闭环与人物落点。
+- 若需要回修，优先使用作品早已建立的冲突、关系、意象和代价来形成回响，不要再新开设定。
+- 最近一次已执行的终局回修起点：{last_rewrite_from or 0}。如果本次仍想把回修起点继续前推到更早章节，必须在 `evidence` 里给出至少 2 条落在更早章节的直接证据，并在 `rewrite_scope_reason` 里明确说明“为什么仅改更晚章节无法补救”。
+- 不允许因为“整体气质更完整”“更有余味”“更像一体”这类泛化表述，就把回修范围从最后一章直接扩到更早数章；没有硬证据时，必须坚持最小必要范围。
+
+请返回严格 JSON：
+{{
+  "project_name": "{self.project_dir.name}",
+  "book_title": "{book_title}",
+  "quality_pass": true,
+  "needs_polish": false,
+  "quality_score": 0,
+  "resonance_score": 0,
+  "thought_provoking_score": 0,
+  "confidence": 0,
+  "rewrite_from_chapter": 0,
+  "diagnosis": ["问题1", "问题2"],
+  "strengths": ["优点1", "优点2"],
+  "rewrite_goals": ["若要回修，应优先做什么"],
+  "must_keep": ["回修时绝对不能丢掉的已完成成果"],
+  "final_image_target": "如果需要加强，最后一屏应该朝什么感觉收",
+  "editor_summary": "一段专业结论",
+  "polish_brief_markdown": "# 终局打磨要求\\n## 必须保留\\n- ...\\n## 必须加强\\n- ...\\n## 禁止写法\\n- ...\\n## 最后1-2章目标\\n- ..."
+}}
+
+【作品设定】
+{brief_text or '（无）'}
+
+【开篇承诺】
+{opening_promise or '（无）'}
+
+【外部收尾经验摘要】
+{ending_research or '（无）'}
+
+【系列圣经短版】
+{series_bible or '（无）'}
+
+【故事记忆】
+{story_memory or '（无）'}
+
+【当前完结评估】
+{completion_report or '（无）'}
+
+【当前终局指引】
+{ending_guidance or '（无）'}
+
+【开篇章节摘要】
+{opening_summaries or '（无）'}
+
+【开篇章节正文】
+{opening_fulltext or '（无）'}
+
+【尾段章节摘要】
+{tail_summaries or '（无）'}
+
+【最后若干章正文】
+{tail_fulltext or '（无）'}
+
+【全文结尾长摘】
+{full_novel_tail or '（无）'}
+
+【当前章节号】
+{current_chapter}
+""".strip()
+
+    def _normalize_ending_quality_report(self, payload: dict[str, Any]) -> dict[str, Any]:
+        current_chapter = int(self.state.get('generated_chapters', 0) or 0)
+
+        def normalize_score(value: Any) -> int:
+            try:
+                return max(0, min(100, int(value or 0)))
+            except (TypeError, ValueError):
+                return 0
+
+        def normalize_lines(key: str) -> list[str]:
+            return [str(item).strip() for item in (payload.get(key) or []) if str(item).strip()]
+
+        needs_polish = bool(payload.get('needs_polish'))
+        quality_pass = bool(payload.get('quality_pass')) and not needs_polish
+        rewrite_from_chapter = int(payload.get('rewrite_from_chapter', 0) or 0)
+        if needs_polish and rewrite_from_chapter <= 0:
+            rewrite_from_chapter = current_chapter
+        if rewrite_from_chapter > current_chapter:
+            rewrite_from_chapter = current_chapter
+        if not needs_polish:
+            rewrite_from_chapter = 0
+
+        polish_brief = str(payload.get('polish_brief_markdown', '') or '').strip()
+        if needs_polish and not polish_brief:
+            rewrite_goals = normalize_lines('rewrite_goals')
+            must_keep = normalize_lines('must_keep')
+            final_image_target = str(payload.get('final_image_target', '') or '').strip()
+            lines = ['# 终局打磨要求', '## 必须保留']
+            if must_keep:
+                lines.extend(f'- {item}' for item in must_keep)
+            else:
+                lines.append('- 保留现有主线闭环、人物落点和已完成的必要后果。')
+            lines.extend(['', '## 必须加强'])
+            if rewrite_goals:
+                lines.extend(f'- {item}' for item in rewrite_goals)
+            else:
+                lines.append('- 让最后一两章更有主题反照、人物代价与读后余味。')
+            lines.extend(['', '## 禁止写法'])
+            lines.extend([
+                '- 禁止把最后几章写成制度说明会、办结通知或重复总结。',
+                '- 禁止新开设定、新开黑幕、新加大反派来硬拉火力。',
+                '- 禁止破坏现有主线闭环与人物最终命运落点。',
+            ])
+            lines.extend(['', '## 最后1-2章目标'])
+            lines.append(f'- {final_image_target or "让最后一屏回应开篇承诺，并留下明确余味，而不是只剩解释。"}')
+            polish_brief = '\n'.join(lines).strip()
+
+        return {
+            'checked_at_chapter': current_chapter,
+            'project_name': str(payload.get('project_name') or self.project_dir.name).strip(),
+            'book_title': str(payload.get('book_title') or self._project_book_title()).strip(),
+            'quality_pass': quality_pass,
+            'needs_polish': needs_polish,
+            'quality_score': normalize_score(payload.get('quality_score')),
+            'resonance_score': normalize_score(payload.get('resonance_score')),
+            'thought_provoking_score': normalize_score(payload.get('thought_provoking_score')),
+            'confidence': normalize_score(payload.get('confidence')),
+            'rewrite_from_chapter': rewrite_from_chapter,
+            'diagnosis': normalize_lines('diagnosis'),
+            'strengths': normalize_lines('strengths'),
+            'rewrite_goals': normalize_lines('rewrite_goals'),
+            'must_keep': normalize_lines('must_keep'),
+            'final_image_target': str(payload.get('final_image_target', '') or '').strip(),
+            'editor_summary': str(payload.get('editor_summary', '') or '').strip(),
+            'polish_brief_markdown': polish_brief,
+        }
+
+    def _apply_ending_quality_scope_guard(self, report: dict[str, Any]) -> dict[str, Any]:
+        if not report.get('needs_polish'):
+            return report
+
+        proposed = int(report.get('rewrite_from_chapter', 0) or 0)
+        if proposed <= 0:
+            return report
+
+        previous = int(self.state.get('ending_polish_last_rewrite_from_chapter', 0) or 0)
+        if previous <= 0 or proposed >= previous:
+            return report
+
+        quality_score = int(report.get('quality_score', 0) or 0)
+        resonance_score = int(report.get('resonance_score', 0) or 0)
+        thought_score = int(report.get('thought_provoking_score', 0) or 0)
+        diagnosis_blob = ' '.join(
+            [
+                *[str(item).strip() for item in (report.get('diagnosis') or []) if str(item).strip()],
+                *[str(item).strip() for item in (report.get('rewrite_goals') or []) if str(item).strip()],
+                str(report.get('rewrite_scope_reason', '') or '').strip(),
+                str(report.get('editor_summary', '') or '').strip(),
+            ]
+        )
+        scope_keywords = (
+            '铺垫', '布局', '前置', '前文', '前面', '更早', '无法只改', '不能只改',
+            '仅改最后', '只改最后', '前几章', '倒数', '起势', '承接失衡',
+        )
+        evidence_chapters = sorted(
+            {
+                int(item.get('chapter', 0) or 0)
+                for item in (report.get('evidence') or [])
+                if isinstance(item, dict) and int(item.get('chapter', 0) or 0) > 0
+            }
+        )
+        earlier_evidence = [chapter for chapter in evidence_chapters if chapter < previous]
+        strong_scope_reason = any(keyword in diagnosis_blob for keyword in scope_keywords)
+        severe_gap = quality_score < 78 or resonance_score < 82 or thought_score < 80
+
+        max_extra_backward = 0
+        if strong_scope_reason and earlier_evidence:
+            max_extra_backward = 1
+        if severe_gap and strong_scope_reason and len(earlier_evidence) >= 2:
+            max_extra_backward = 2
+
+        guarded_rewrite_from = max(proposed, previous - max_extra_backward)
+        if guarded_rewrite_from == proposed:
+            return report
+
+        note = (
+            f'系统护栏：上一轮终局回修起点是第{previous}章。'
+            f'本轮缺少足够证据支持直接扩大到第{proposed}章，已将回修范围收敛到第{guarded_rewrite_from}章。'
+        )
+        report['rewrite_from_chapter'] = guarded_rewrite_from
+
+        diagnosis = [str(item).strip() for item in (report.get('diagnosis') or []) if str(item).strip()]
+        diagnosis.append(note)
+        report['diagnosis'] = diagnosis[:8]
+
+        rewrite_goals = [str(item).strip() for item in (report.get('rewrite_goals') or []) if str(item).strip()]
+        if max_extra_backward <= 0:
+            rewrite_goals.insert(0, f'本轮先在第{guarded_rewrite_from}章内完成最小必要强修，不要再无证据地继续前推回修范围。')
+        else:
+            rewrite_goals.insert(0, f'本轮最多只允许把回修范围前推到第{guarded_rewrite_from}章，先验证这一章是否足够解决尾段问题。')
+        deduped_goals: list[str] = []
+        seen_goals: set[str] = set()
+        for item in rewrite_goals:
+            if item and item not in seen_goals:
+                seen_goals.add(item)
+                deduped_goals.append(item)
+        report['rewrite_goals'] = deduped_goals[:8]
+
+        scope_reason = str(report.get('rewrite_scope_reason', '') or '').strip()
+        report['rewrite_scope_reason'] = ((scope_reason + '\n') if scope_reason else '') + note
+
+        polish_brief = str(report.get('polish_brief_markdown', '') or '').strip()
+        if polish_brief:
+            report['polish_brief_markdown'] = polish_brief + f'\n- {note}'
+
+        return report
+
+    def _write_ending_quality_review(self, report: dict[str, Any]) -> None:
+        lines = [
+            f"# 终局质量评估（{now_str()}）",
+            '',
+            f"- 项目：{report.get('project_name', self.project_dir.name)}",
+            f"- 书名：{report.get('book_title') or '（未记录）'}",
+            f"- 是否通过：{'是' if report.get('quality_pass') else '否'}",
+            f"- 是否需要打磨回修：{'是' if report.get('needs_polish') else '否'}",
+            f"- 综合质量分：{report.get('quality_score', 0)}",
+            f"- 回响分：{report.get('resonance_score', 0)}",
+            f"- 余味/思考分：{report.get('thought_provoking_score', 0)}",
+            f"- 置信度：{report.get('confidence', 0)}",
+            f"- 建议回修起点：{report.get('rewrite_from_chapter', 0)}",
+            '',
+            '## 主要判断',
+        ]
+        diagnosis = report.get('diagnosis') or []
+        if diagnosis:
+            lines.extend(f'- {item}' for item in diagnosis)
+        else:
+            lines.append('- 无')
+        lines.extend(['', '## 已有优点'])
+        strengths = report.get('strengths') or []
+        if strengths:
+            lines.extend(f'- {item}' for item in strengths)
+        else:
+            lines.append('- 无')
+        lines.extend(['', '## 回修时必须保留'])
+        must_keep = report.get('must_keep') or []
+        if must_keep:
+            lines.extend(f'- {item}' for item in must_keep)
+        else:
+            lines.append('- 无')
+        lines.extend(['', '## 若需回修，优先目标'])
+        goals = report.get('rewrite_goals') or []
+        if goals:
+            lines.extend(f'- {item}' for item in goals)
+        else:
+            lines.append('- 无')
+        lines.extend([
+            '',
+            '## 最后一屏目标',
+            report.get('final_image_target') or '（无）',
+            '',
+            '## 编辑结论',
+            report.get('editor_summary') or '（无）',
+            '',
+            '## 自动回修要求',
+            report.get('polish_brief_markdown') or '（无）',
+            '',
+            '## 原始 JSON',
+            '```json',
+            json.dumps(report, ensure_ascii=False, indent=2),
+            '```',
+        ])
+        write_text(self.ending_quality_review_path, '\n'.join(lines).strip() + '\n')
+
+    def evaluate_ending_quality(self, force: bool = False) -> dict[str, Any]:
+        checked_at_chapter = int((self.state.get('ending_quality_check') or {}).get('checked_at_chapter', -1) or -1)
+        current_chapter = int(self.state.get('generated_chapters', 0) or 0)
+        if not force and checked_at_chapter == current_chapter:
+            existing = self.state.get('ending_quality_check') or {}
+            if existing:
+                return existing
+
+        prompt = self._build_ending_quality_prompt()
+        payload = self.with_retry(
+            '终局质量评估',
+            lambda: self.call_llm_json(
+                '终局质量评估',
+                prompt,
+                self.ending_polish_model,
+                system_prompt='你是中文长篇连载的终局质量编辑，擅长判断结尾是否真正回应开篇、留下余味，并指出最小必要回修范围。',
+            ),
+        )
+        self.clear_error()
+        report = self._normalize_ending_quality_report(payload)
+        report = self._apply_ending_quality_scope_guard(report)
+        self._write_ending_quality_review(report)
+
+        history = list(self.state.get('ending_quality_history') or [])
+        history = [
+            item for item in history
+            if int(item.get('checked_at_chapter', -1) or -1) != current_chapter
+        ]
+        history.append({
+            'checked_at_chapter': current_chapter,
+            'quality_pass': bool(report.get('quality_pass')),
+            'needs_polish': bool(report.get('needs_polish')),
+            'quality_score': int(report.get('quality_score', 0) or 0),
+            'rewrite_from_chapter': int(report.get('rewrite_from_chapter', 0) or 0),
+        })
+        self.state['ending_quality_history'] = history[-20:]
+        self.state['ending_quality_check'] = report
+        if report.get('quality_pass'):
+            self.state['ending_polish_cycles'] = 0
+            self.state['ending_polish_last_rewrite_from_chapter'] = 0
+            if self.ending_polish_brief_path.exists():
+                self.ending_polish_brief_path.unlink()
+        self._save_state()
+        return report
+
     def _recent_pending_outlines(self, limit: int = 3) -> str:
         pending = self.state.get('pending_chapters', [])[:limit]
         blocks = []
@@ -1998,6 +3378,7 @@ class AutoNovelRunner:
             '',
             '如果还不够完结，请估算：为了写出“终局 + 尾声 + 后日谈”的完整版本，合理还需要多少章节、多少字。',
             '不要建议继续扩成长篇新阶段，只能给“把这本书完整收住”所需的剩余量。',
+            '如果当前只剩“后日谈/更远时间层定格/旧人彻退后的常态化确认”这类纯尾声任务，且最近几章已经在反复做同类尾段变体，不要机械继续判“还差一章”；此时应直接判定“是否完结：是”，把最后的回响强弱交给终局质量打磨阶段处理。',
             '',
             '输出格式必须严格如下，不要加别的标题：',
             '是否完结：是/否',
@@ -2023,6 +3404,44 @@ class AutoNovelRunner:
             12,
             '不要机械套用“一章揭晓、一章执行、一章尾声”的固定三段式模板；如果仍有多项独立收束任务，请把这些任务量折算进章节余量。',
         )
+        if self._is_title_only_story():
+            sections = [
+                '请站在中文短篇小说编辑的角度，判断这篇单篇故事现在是否已经具备“完整闭环且值得收住”的条件。',
+                '你的判断标准必须严格，不要为了省字数、省成本或凑整数而硬停，也不要把长篇连载的尾声/后日谈模板硬套到短篇上。',
+                '',
+                '对单篇短篇来说，完结必须同时满足：',
+                '1. 主冲突已经真正闭环，读者不会把关键问题理解成“作者还没写到”。',
+                '2. 主角的关键选择、代价、命运落点或立场变化已经落地。',
+                '3. 被救者、关键对照人物或核心关系至少已有一个清晰落点，而不是只停在功能说明。',
+                '4. 结尾已经收在具体画面、动作、残响、反照或反讽上，而不是主题总结。',
+                '5. 允许留白，但关键义务不能伪装成留白；缺失的关键信息不能靠“余味”糊过去。',
+                '',
+                '如果还不够完整，请估算：为了把这篇单篇故事补到真正成立，还需要多少“回修量”。',
+                '这里的“建议还需章节”只允许写 0 或 1：0 代表现在就能收住，1 代表还需要整体回修这一篇，而不是新增连载下一章。',
+                '“建议还需字数”指为了把这一篇补到成立，大致还需要补写或重写的字数。',
+                '',
+                '输出格式必须严格如下，不要加别的标题：',
+                '是否完结：是/否',
+                '置信度：0-100',
+                '仍缺内容：',
+                '- 缺失项1',
+                '- 缺失项2',
+                '建议还需章节：N',
+                '建议还需字数：N',
+                '说明：一句到三句，明确为什么这篇现在还不能收住，或为什么已经可以收住',
+                '下一阶段目标：如果未完结，请给一个最合理的整篇回修方向；如果已完结，写“无”',
+                '',
+                '额外提醒：不要机械要求“尾声”“后日谈”；如果正文已经在单篇内部完成了回响与余味，就视为满足。',
+                '',
+                '【系列圣经短版】',
+                truncate_text(read_text(self.series_bible_short_path), 1200) or '（暂无）',
+                '',
+                '【故事记忆】',
+                truncate_text(read_text(self.story_memory_path), 1600) or '（暂无）',
+                '',
+                '【最近章节摘要】',
+                truncate_text(self.recent_chapter_summaries(limit=8), 1800) or '（暂无）',
+            ]
         if self._in_force_finish_mode():
             sections.insert(
                 13,
@@ -2261,6 +3680,14 @@ class AutoNovelRunner:
             chapter_end_rule = '- 每章都要高密度推进终局收束；若本章已经适合直接完成终局/尾声/后日谈，则直接完成，不得为了续章再留人工卡点'
         if self._in_terminal_finish_mode():
             chapter_end_rule = '- 每章都必须显著减少全书剩余未解事项；若本章已适合成为正文终章、尾声章或后日谈章，必须直接收束到位，不得拖延'
+        if self._draft_heading_mode() == 'title_only':
+            chapter_shape_rule = '- 这是单篇短故事的唯一正文规划，必须单篇闭环，不能按连载思维拆悬念、拆回收、拆情绪落点'
+            chapter_end_rule = '- 结尾允许留余味，但必须完成主冲突闭环，不得保留“下一章再解决”的连载式卡点'
+        batch_scope_rule = '- 单章必须服务长篇连载，不要写成孤立的无关插曲'
+        batch_style_rule = '- 必须是中文番茄风长篇网文节奏'
+        if self._is_title_only_story():
+            batch_scope_rule = '- 这是单篇短故事，不要按长篇连载拆任务；必须把人物、冲突、代价和最后一屏放在同一篇内完成'
+            batch_style_rule = '- 必须是可一口气读完的中文短篇叙事：具体人物、具体处境、具体动作，避免流程图式推进'
 
         outline_prompt = f"""
 请规划接下来这一批章节的大纲：第 {next_chapter} 章 到 第 {chapter_end} 章。
@@ -2270,8 +3697,8 @@ class AutoNovelRunner:
 - 题材、世界观、力量体系、冲突逻辑必须服从既有设定
 - {chapter_shape_rule.lstrip('- ').strip()}
 - 兼顾主线推进、副线拉扯、人物关系变化与阶段性爽点
-- 单章必须服务长篇连载，不要写成孤立的无关插曲
-- 必须是中文番茄风长篇网文节奏
+- {batch_scope_rule.lstrip('- ').strip()}
+- {batch_style_rule.lstrip('- ').strip()}
 - 章节编号必须使用阿拉伯数字格式“第1章”，禁止写成“第一章”“第Ⅰ章”“Chapter 1”
 - {chapter_end_rule.lstrip('- ').strip()}
 - 单章定位是“章节大纲”，不是正文，不要写成小说正文
@@ -2286,6 +3713,9 @@ class AutoNovelRunner:
 
 直到第 {chapter_end} 章。
 """
+        project_role_rule = self._project_role_only_rule()
+        if project_role_rule:
+            outline_prompt += f"\n补充硬规则：\n- {project_role_rule}\n"
 
         def _plan():
             writer = OutlineWriter(
@@ -2315,11 +3745,12 @@ class AutoNovelRunner:
             draft_path = chapter_dir / 'draft.md'
             summary_path = chapter_dir / 'summary.md'
             write_text(outline_path, outline)
+            story_heading_title = self._story_heading_title(safe_title(outline))
             pending.append({
                 'chapter_number': chapter_number,
                 'volume_number': volume_number,
                 'chapter_in_volume': volume_chapter,
-                'title': safe_title(outline),
+                'title': story_heading_title,
                 'outline_file': str(outline_path),
                 'plot_file': str(plot_path),
                 'draft_file': str(draft_path),
@@ -2349,6 +3780,7 @@ class AutoNovelRunner:
             finale_plot_rules = """
 - 当前已进入全书最终收束阶段，本章若承担终局、尾声或后日谈功能，应直接推进，不要继续拖大主线
 - 不要新增需要多卷回收的新谜团，只能回收当前主线伏笔并推进角色落点
+- 若本章已经接近正文终章/尾声/后日谈，必须安排一个能回应开篇承诺的具体落点、选择或意象，不能只写程序性收束
 """
         if self._in_force_finish_mode():
             finale_plot_rules += """
@@ -2368,6 +3800,8 @@ class AutoNovelRunner:
             plot_ending_rule = '- 若本章已适合直接完成一个终局环节、尾声或后日谈，可直接收住，不得为了续章制造强卡点'
         if self._in_terminal_finish_mode():
             plot_ending_rule = '- 若本章适合直接写成正文终章、尾声章或后日谈章，则直接收束，不得为了续章保留任何人工悬念'
+        if self._draft_heading_mode() == 'title_only':
+            plot_ending_rule = '- 这是单篇短故事的唯一剧情梗概，结尾允许留余味，但必须完成主冲突闭环，不能保留下一章钩子'
         prompt = f"""
 请把这章大纲扩写成详细剧情梗概。
 
@@ -2382,6 +3816,18 @@ class AutoNovelRunner:
 - 目标长度：400~900 字
 {finale_plot_rules}
 """
+        if self._is_title_only_story():
+            prompt += """
+
+单篇短故事补充要求：
+- 不要把剧情梗概写成“功能清单”或“制度说明流程图”。
+- 必须明确：主角的私人亏欠是什么，被救者身上哪 2~3 个生活碎片最扎人。
+- 至少写出一个配角在关键场景中的个人反应或私心，而不是只给立场标签。
+- 抢救成功后，尾段要尽量短；不要预先把主题总结句写进梗概里。
+"""
+        project_role_rule = self._project_role_only_rule()
+        if project_role_rule:
+            prompt += f"\n补充硬规则：\n- {project_role_rule}\n"
 
         def _plot():
             writer = PlotWriter(
@@ -2401,10 +3847,146 @@ class AutoNovelRunner:
 
         plot_text = self.with_retry(f'第{chapter["chapter_number"]}章剧情', _plot)
         self.clear_error()
+        plot_text = self._enforce_project_role_labels(f'第{chapter["chapter_number"]}章剧情', plot_text)
+        self.clear_error()
         write_text(plot_path, plot_text)
         chapter['status'] = 'plotted'
         self._save_state()
         return plot_text
+
+    def _title_only_story_segment_specs(self, target_chars: int) -> list[dict[str, str]]:
+        if target_chars <= 12000:
+            return [
+                {
+                    'name': '起势段',
+                    'goal': '迅速立住主角处境、关键关系和引爆事件，把读者拉进故事。',
+                    'ending': '本段结尾必须把人物真正推入后果，不要提前收束全篇。',
+                },
+                {
+                    'name': '收束段',
+                    'goal': '承接前段完成冲突闭环、代价落地和最后一屏，不要留成下一章。',
+                    'ending': '本段必须完成单篇闭环，最后收在具体画面、动作或残响上。',
+                },
+            ]
+        return [
+            {
+                'name': '起势段',
+                'goal': '迅速立住主角处境、关键关系和引爆事件，把读者拉进故事。',
+                'ending': '本段结尾必须把人物推入不可回避的压力，不要提前解释结局。',
+            },
+            {
+                'name': '承压段',
+                'goal': '把冲突真正顶到最疼的位置，写清选择、反制和代价，避免原地打转。',
+                'ending': '本段结尾应把人物逼到必须落判的位置，为最终收束腾出空间。',
+            },
+            {
+                'name': '收束段',
+                'goal': '完成主冲突闭环、代价兑现和最后一屏，不要把结尾写成主题说明会。',
+                'ending': '本段必须完成单篇闭环，最后收在具体画面、动作或残响上。',
+            },
+        ]
+
+    def _generate_title_only_segmented_draft(
+        self,
+        chapter: dict,
+        plot_text: str,
+        min_chars: int,
+        target_chars: int,
+        max_chars: int,
+        finale_draft_rules: str,
+    ) -> str:
+        specs = self._title_only_story_segment_specs(target_chars)
+        weights = [1] * len(specs)
+        total_weight = sum(weights)
+        base_target = max(target_chars, min_chars)
+        allocated_targets: list[int] = []
+        running_total = 0
+        for index, _spec in enumerate(specs):
+            if index == len(specs) - 1:
+                segment_target = max(2200, base_target - running_total)
+            else:
+                segment_target = max(2200, int(base_target * weights[index] / total_weight))
+                running_total += segment_target
+            allocated_targets.append(segment_target)
+
+        segments: list[str] = []
+        for index, spec in enumerate(specs):
+            segment_target = allocated_targets[index]
+            segment_min = max(1800, int(segment_target * 0.72))
+            segment_max = max(segment_target + 1200, int(segment_target * 1.28))
+            previous_text = '\n\n'.join(item for item in segments if item.strip()).strip()
+            previous_tail = tail_text(previous_text, 5000) if previous_text else ''
+            is_final_segment = index == len(specs) - 1
+            segment_label = f'第{chapter["chapter_number"]}章正文-{spec["name"]}'
+
+            prompt = f"""
+你正在分段创作一篇单篇中文短篇小说的正文。本次只写其中一个连续段落区间，而不是重写全篇。
+
+硬性要求：
+- 全程只输出中文小说正文，不要输出英文，不要输出分析，不要输出提纲，不要输出注释。
+- 不要重复前一段已经写出的内容；已完成正文只作为续写上下文参考。
+- 不要补写作品标题，不要写“第1章”“第一章”“Chapter 1”等章节编号。
+- 你现在只负责从上一段停住的地方继续往下写，不要回顾式总结前文。
+- 题材、人物、关系、冲突和结局义务必须严格服从当前这份剧情梗概。
+- 风格必须是可发布的中文短篇小说正文：人物真实感、情绪穿透力和画面推进优先，避免流程图腔、设定讲解腔和空泛抒情。
+- 被救者/被伤害者不能只是功能位，必须继续让读者看见其作为活人的细节。
+- 配角不能只负责传递信息，至少保留一个人的个人反应、私心或处境折角。
+- 这是一篇单篇短篇小说，不允许“未完待续”式结尾。
+
+本段职责：
+- 段名：{spec["name"]}
+- 核心目标：{spec["goal"]}
+- 结尾要求：{spec["ending"]}
+- 本段目标字数：{segment_target} 字左右，至少 {segment_min} 字，建议不超过 {segment_max} 字。
+
+额外要求：
+- 开头承接必须顺滑，像同一篇小说自然往下流动，而不是另起一章。
+- 不要把已经发生的事再讲一遍；新增内容必须带来新的动作、对话、判断、代价或情绪变化。
+- 若不是最后一段，不要提前把全篇主题总结完，不要抢跑结局。
+- 若是最后一段，必须完成主冲突闭环、人物代价和最后一屏；最后一段不要替读者下结论，要收在具体画面、动作或残响上。
+{finale_draft_rules}
+""".strip()
+            role_only_rule = self._project_role_only_rule()
+            if role_only_rule:
+                prompt += f"\n\n补充硬规则：\n- {role_only_rule}\n"
+            if previous_tail:
+                prompt += "\n你会收到前文尾段作为上下文，只允许顺着它继续，不得回头改写。\n"
+            if is_final_segment:
+                prompt += "\n这是最后一段，必须真正收住，不能再把关键义务推给不存在的下一段。\n"
+            else:
+                prompt += "\n这不是最后一段，本段结尾只允许形成强推进，不允许提前写成全篇总结或尾声。\n"
+
+            def _write_segment() -> str:
+                writer = DraftWriter(
+                    [(plot_text, '')],
+                    {'context_y': previous_tail},
+                    model=self.writer_model,
+                    sub_model=self.sub_model,
+                    x_chunk_length=800,
+                    y_chunk_length=segment_max,
+                    max_thread_num=self.args.max_thread_num,
+                )
+                pairs = self.run_writer(segment_label, writer, prompt, pair_span=(0, len(writer.xy_pairs)))
+                text = ''.join(pair[1] for pair in pairs).strip()
+                text = strip_generated_draft_heading(
+                    chapter['chapter_number'],
+                    chapter['title'],
+                    text,
+                ).strip()
+                if len(text) < segment_min:
+                    raise RuntimeError(f'{spec["name"]}字数不足。')
+                return text
+
+            segment_text = self.with_retry(segment_label, _write_segment)
+            self.clear_error()
+            segments.append(segment_text)
+
+        draft_text = '\n\n'.join(item.strip() for item in segments if item.strip()).strip()
+        if len(draft_text) < min_chars:
+            raise RuntimeError(
+                f'分段生成后正文仍不足最低字数要求：当前 {len(draft_text)}，至少需要 {min_chars}。'
+            )
+        return draft_text
 
     def generate_draft(self, chapter: dict, plot_text: str) -> str:
         draft_path = Path(chapter['draft_file'])
@@ -2414,16 +3996,32 @@ class AutoNovelRunner:
         min_chars = max(1400, int(self.args.chapter_char_target * 0.8))
         target_chars = self.args.chapter_char_target
         max_chars = max(target_chars + 600, 2600)
+        if self._is_title_only_story() and not self._in_terminal_finish_mode():
+            # 短篇以项目最小字数为准，避免“分段写完后又被整篇扩写”这一不稳定路径反复触发。
+            min_chars = max(6000, int(self.args.min_target_chars or 0))
+            target_chars = max(target_chars, min_chars)
+            max_chars = max(max_chars, target_chars + 1200)
         if self._in_terminal_finish_mode():
             min_chars = 1200
             target_chars = min(target_chars, 1800)
             max_chars = min(max_chars, 2200)
+        prompt_min_chars = min_chars
+        prompt_target_chars = target_chars
+        prompt_max_chars = max_chars
+        expand_y_chunk_length = max_chars + 600
+        if self._is_title_only_story() and not self._in_terminal_finish_mode():
+            # 单篇短篇先保证正文能稳定落地，避免首轮一次性请求过长导致上游 524。
+            prompt_target_chars = min(target_chars, 9000)
+            prompt_min_chars = min(min_chars, max(7000, int(prompt_target_chars * 0.82)))
+            prompt_max_chars = min(max_chars, max(prompt_target_chars + 1200, 10800))
+            expand_y_chunk_length = min(max_chars + 600, max(min_chars + 1800, 12000))
         finale_draft_rules = ''
         if self._in_finale_mode():
             finale_draft_rules = """
 - 当前已进入全书最终收束阶段；如果本章承担终局、尾声或后日谈功能，请按其应有气质直接完成
 - 不要再扩展需要多卷回收的新大坑、新地图、新主反派
 - 允许保留章末钩子，但钩子必须服务于本书剩余收束，而不是开启新长篇
+- 若本章承担终章、尾声或后日谈功能，最后两段必须留下主题反照、人物代价、关系回响或意象回声，不要只剩总结与说明
 """
         if self._in_force_finish_mode():
             finale_draft_rules += """
@@ -2452,35 +4050,75 @@ class AutoNovelRunner:
                 draft_ending_rule = '- 结尾必须优先服务全书收束；如果本章已经适合自然收住，就直接收住，不得为了续章强行卡住'
             if self._in_terminal_finish_mode():
                 draft_ending_rule = '- 结尾必须朝全文结束直接推进；若本章已适合成为正文终章、尾声章或后日谈章，就直接写到位，不得再留新的程序性悬念'
+            title_line_rule = f'- 最终正文标题行必须使用阿拉伯数字格式“第{chapter["chapter_number"]}章 标题”，禁止写成“第一章”“第Ⅰ章”“Chapter 1”'
+            chapter_role_rule = f'- 这是第 {chapter["chapter_number"]} 章，必须保留并优化章节标题感'
+            if self._draft_heading_mode() == 'title_only':
+                title_line_rule = f'- 这是单篇短故事，最终正文开头只保留作品标题“{chapter["title"]}”，禁止出现“第1章”“第一章”“第Ⅰ章”“Chapter 1”等章节编号'
+                chapter_role_rule = '- 这是单篇短故事的唯一正文，不要写成连载章节'
+            style_rule = '- 风格：番茄风、强代入、强画面、强对白、强追读'
+            if self._is_title_only_story():
+                style_rule = '- 风格：短篇叙事优先，人物真实感与情绪穿透高于连载腔；不要写成设定讲解、流程图或爽文复盘'
             prompt = f"""
-请把这段剧情梗概写成可发布的中文长篇网文正文。
+请把这段剧情梗概写成{('可发布的中文短篇小说正文' if self._is_title_only_story() else '可发布的中文长篇网文正文')}。
 
 要求：
-- 这是第 {chapter['chapter_number']} 章，必须保留并优化章节标题感
-- 最终正文标题行必须使用阿拉伯数字格式“第{chapter['chapter_number']}章 标题”，禁止写成“第一章”“第Ⅰ章”“Chapter 1”
-- 风格：番茄风、强代入、强画面、强对白、强追读
+- {chapter_role_rule.lstrip('- ').strip()}
+- {title_line_rule.lstrip('- ').strip()}
+- {style_rule.lstrip('- ').strip()}
 - 题材、世界观、力量体系、人物关系和冲突类型必须严格服从本书设定
 - 重点写清人物目标、阻力、选择、代价、反制与变化
 - {draft_tension_rule.lstrip('- ').strip()}
 - 正文不是梗概，不要用“随后、然后、接着”堆流水账
 - 开头三段必须抓人
 - {draft_ending_rule.lstrip('- ').strip()}
+- 若本篇是单篇短故事，则必须单篇完整闭环，允许余味，不允许“未完待续”式结尾
 - 目标字数：{target_chars} 字左右，至少 {min_chars} 字，建议不超过 {max_chars} 字
 {finale_draft_rules}
 """
+            if self._is_title_only_story():
+                prompt += """
+
+单篇短故事额外硬要求：
+- 被救者不能只是“案例”或“高危样本”，必须尽快让读者看见他作为一个活人的细节。
+- 配角不能只承担观点功能；至少让主管、值班同事、接线员其中两人带出个人处境或性格折角。
+- 抢救成功后的审计与处分段落必须克制，绝不能盖过前面“人差点死掉”的疼感。
+- 最后一段不要总结主题，不要替读者下结论，要收在一个具体画面、动作或残响上。
+"""
+            if self._is_title_only_story():
+                prompt += "\n- 这是短篇初稿阶段，先把事件闭环、情绪落点和最后一屏画面写稳，不要为了冲字数把单次生成拉得过满。\n"
+            prompt = prompt.replace(
+                f'目标字数：{target_chars} 字左右，至少 {min_chars} 字，建议不超过 {max_chars} 字',
+                f'目标字数：{prompt_target_chars} 字左右，至少 {prompt_min_chars} 字，建议不超过 {prompt_max_chars} 字',
+            )
+            role_only_rule = self._project_role_only_rule()
+            if role_only_rule:
+                prompt += f"\n补充硬规则：\n- {role_only_rule}\n"
             writer = DraftWriter(
                 [(plot_text, existing_text)],
                 {},
                 model=self.writer_model,
                 sub_model=self.sub_model,
                 x_chunk_length=800,
-                y_chunk_length=max_chars,
+                y_chunk_length=prompt_max_chars,
                 max_thread_num=self.args.max_thread_num,
             )
             pairs = self.run_writer(f'第{chapter["chapter_number"]}章正文', writer, prompt, pair_span=(0, len(writer.xy_pairs)))
             return ''.join(pair[1] for pair in pairs).strip()
 
-        draft_text = self.with_retry(f'第{chapter["chapter_number"]}章正文', lambda: _draft(''))
+        if self._is_title_only_story() and not self._in_terminal_finish_mode():
+            draft_text = self.with_retry(
+                f'第{chapter["chapter_number"]}章正文分段生成',
+                lambda: self._generate_title_only_segmented_draft(
+                    chapter=chapter,
+                    plot_text=plot_text,
+                    min_chars=min_chars,
+                    target_chars=target_chars,
+                    max_chars=max_chars,
+                    finale_draft_rules=finale_draft_rules,
+                ),
+            )
+        else:
+            draft_text = self.with_retry(f'第{chapter["chapter_number"]}章正文', lambda: _draft(''))
         self.clear_error()
         if len(draft_text) < min_chars:
             expand_goal_line = '请在不改变这章主线事件与结尾卡点的前提下，对正文进行扩充和润色。'
@@ -2503,7 +4141,7 @@ class AutoNovelRunner:
                     model=self.writer_model,
                     sub_model=self.sub_model,
                     x_chunk_length=800,
-                    y_chunk_length=max_chars + 600,
+                    y_chunk_length=expand_y_chunk_length,
                     max_thread_num=self.args.max_thread_num,
                 )
                 pairs = self.run_writer(f'第{chapter["chapter_number"]}章扩写', writer, expand_prompt, pair_span=(0, len(writer.xy_pairs)))
@@ -2515,9 +4153,24 @@ class AutoNovelRunner:
             draft_text = self.with_retry(f'第{chapter["chapter_number"]}章扩写', _expand)
             self.clear_error()
 
-        draft_text = normalize_chapter_draft_text(chapter['chapter_number'], chapter['title'], draft_text)
+        if not self._is_title_only_story():
+            draft_text = self._enforce_project_role_labels(f'第{chapter["chapter_number"]}章正文', draft_text)
+            self.clear_error()
+        draft_text = normalize_chapter_draft_text(
+            chapter['chapter_number'],
+            chapter['title'],
+            draft_text,
+            heading_mode=self._draft_heading_mode(),
+        )
         draft_text = self.apply_chapter_critic(chapter, plot_text, draft_text)
-        draft_text = normalize_chapter_draft_text(chapter['chapter_number'], chapter['title'], draft_text)
+        draft_text = self._enforce_project_role_labels(f'第{chapter["chapter_number"]}章正文定稿', draft_text)
+        self.clear_error()
+        draft_text = normalize_chapter_draft_text(
+            chapter['chapter_number'],
+            chapter['title'],
+            draft_text,
+            heading_mode=self._draft_heading_mode(),
+        )
         write_text(draft_path, draft_text)
         chapter['status'] = 'drafted'
         self._save_state()
@@ -2555,6 +4208,8 @@ class AutoNovelRunner:
         return summary_text.strip()
 
     def finalize_chapter(self, chapter: dict, draft_text: str, summary_text: str) -> None:
+        draft_text = self._sanitize_text(draft_text)
+        summary_text = self._sanitize_text(summary_text)
         self.state['generated_chars'] += len(draft_text)
         self.state['generated_chapters'] += 1
         self.state['next_chapter_number'] = chapter['chapter_number'] + 1
@@ -2569,6 +4224,9 @@ class AutoNovelRunner:
             'chars': len(draft_text),
             'summary_preview': summary_text,
         })
+        rewrite_required_from = int(self.state.get('rewrite_required_from_chapter', 0) or 0)
+        if rewrite_required_from > 0 and int(chapter['chapter_number']) >= rewrite_required_from:
+            self.state['rewrite_required_from_chapter'] = 0
         with self.full_manuscript_path.open('a', encoding='utf-8') as handle:
             handle.write(draft_text.rstrip() + '\n\n')
         self.state['manuscript_last_appended_chapter'] += 1
@@ -2578,11 +4236,416 @@ class AutoNovelRunner:
             f'第{chapter["chapter_number"]}章完成，累计 {self.state["generated_chapters"]} 章 / {self.state["generated_chars"]} 字'
         )
 
-    def should_stop(self) -> bool:
-        if self.args.max_chapters and self.state['generated_chapters'] >= self.args.max_chapters:
+    def _delete_future_content_for_rewrite(self, rewrite_from_chapter: int) -> None:
+        target_volume, _ = self._chapter_volume_number(rewrite_from_chapter)
+        for volume_dir in sorted(self.volumes_dir.glob('vol_*')):
+            try:
+                volume_number = int(volume_dir.name.split('_')[-1])
+            except ValueError:
+                continue
+            if volume_number < target_volume:
+                continue
+            plan_path = volume_dir / 'plan.md'
+            if plan_path.exists():
+                plan_path.unlink()
+            if volume_number > target_volume:
+                shutil.rmtree(volume_dir, ignore_errors=True)
+                continue
+            chapters_dir = volume_dir / 'chapters'
+            if not chapters_dir.exists():
+                continue
+            for chapter_dir in sorted(chapters_dir.glob('ch_*')):
+                try:
+                    chapter_number = int(chapter_dir.name.split('_')[-1])
+                except ValueError:
+                    continue
+                if chapter_number >= rewrite_from_chapter:
+                    shutil.rmtree(chapter_dir, ignore_errors=True)
+
+    def _reset_story_memory_for_rewrite(self, rewrite_from_chapter: int, reason_lines: list[str]) -> None:
+        lines = [
+            '# 故事至今',
+            '## 当前状态',
+            f'- 本项目已从第{rewrite_from_chapter}章开始进入终局回修模式。',
+            f'- 第{rewrite_from_chapter}章及之后的旧正文、旧摘要、旧完结判断一律作废。',
+            '- 当前有效前情以保留正文、系列圣经、最近章节摘要与开篇承诺为准。',
+            '',
+            '## 回修提醒',
+            '- 下一次续写前，应先对照开篇承诺与当前终局义务，避免只做程序性收束。',
+            '- 后续规划不得引用旧终局中的重复宣判、重复尾声、时间倒退、过度解释或办结式段落。',
+        ]
+        if reason_lines:
+            lines.extend(['', '## 本轮回修重点'])
+            lines.extend(f'- {line}' for line in reason_lines if line.strip())
+        write_text(self.story_memory_path, '\n'.join(lines).strip() + '\n')
+
+    def rewind_from_chapter(self, rewrite_from_chapter: int, *, reason_lines: list[str] | None = None, polish_brief: str = '') -> None:
+        rewrite_from_chapter = int(rewrite_from_chapter or 0)
+        if rewrite_from_chapter <= 0:
+            raise ValueError('rewrite_from_chapter must be greater than 0')
+
+        completed = list(self.state.get('completed_chapters') or [])
+        if rewrite_from_chapter == 1:
+            if not completed:
+                raise ValueError('当前没有已完成正文可供回修。')
+            retained: list[dict[str, Any]] = []
+        else:
+            retained = [item for item in completed if int(item.get('chapter_number', 0) or 0) < rewrite_from_chapter]
+        if rewrite_from_chapter > 1 and len(retained) == len(completed):
+            raise ValueError(f'第{rewrite_from_chapter}章及之后没有已完成正文可供回修。')
+
+        self._delete_future_content_for_rewrite(rewrite_from_chapter)
+        for path in (
+            self.completion_report_path,
+            self.auto_ending_guidance_path,
+            self.auto_ending_quality_guidance_path,
+            self.ending_quality_review_path,
+        ):
+            if path.exists():
+                path.unlink()
+
+        if polish_brief.strip():
+            write_text(self.ending_polish_brief_path, polish_brief.strip())
+        elif self.ending_polish_brief_path.exists():
+            self.ending_polish_brief_path.unlink()
+
+        self._reset_story_memory_for_rewrite(rewrite_from_chapter, reason_lines or [])
+
+        recalculated_completed: list[dict[str, Any]] = []
+        generated_chars = 0
+        for item in retained:
+            chapter_number = int(item.get('chapter_number', 0) or 0)
+            draft_file = str(item.get('draft_file', '') or '')
+            summary_file = str(item.get('summary_file', '') or '')
+            draft_text = read_text(Path(draft_file))
+            summary_text = read_text(Path(summary_file)).strip()
+            chars = len(draft_text.strip())
+            generated_chars += chars
+            volume_number, chapter_in_volume = self._chapter_volume_number(chapter_number)
+            recalculated_completed.append({
+                'chapter_number': chapter_number,
+                'volume_number': int(item.get('volume_number', 0) or volume_number),
+                'chapter_in_volume': int(item.get('chapter_in_volume', 0) or chapter_in_volume),
+                'title': str(item.get('title', '') or '').strip(),
+                'draft_file': draft_file,
+                'summary_file': summary_file,
+                'chars': chars,
+                'summary_preview': summary_text or str(item.get('summary_preview', '') or '').strip(),
+            })
+
+        target_volume, _ = self._chapter_volume_number(rewrite_from_chapter)
+        self.state['status'] = 'running'
+        self.state['generated_chars'] = generated_chars
+        self.state['generated_chapters'] = len(recalculated_completed)
+        self.state['next_chapter_number'] = rewrite_from_chapter
+        self.state['current_volume'] = target_volume
+        self.state['pending_chapters'] = []
+        self.state['completed_chapters'] = recalculated_completed
+        self.state['manuscript_last_appended_chapter'] = 0
+        self.state['last_memory_refresh_chapter'] = 0
+        self.state['last_ending_guidance_refresh_chapter'] = 0
+        self.state['last_ending_quality_guidance_refresh_chapter'] = 0
+        self.state['rewrite_required_from_chapter'] = rewrite_from_chapter
+        self.state['ending_polish_last_rewrite_from_chapter'] = rewrite_from_chapter
+        self.state['last_error'] = ''
+        self.state['completion_check'] = {}
+        self.state['completion_check_history'] = []
+        self.state['ending_quality_check'] = {}
+        self.state['ending_quality_history'] = []
+        self.rebuild_full_manuscript(export_chapters_txt=True)
+        self.log(
+            f'[ending_quality] 已从第{rewrite_from_chapter}章回退；旧稿在该章及之后的完结/指引结论全部作废，'
+            '后续评估只针对回修后的新稿面。'
+        )
+
+    def _recalculate_completed_state_from_disk(self) -> None:
+        completed = sorted(
+            self.state.get('completed_chapters', []),
+            key=lambda item: int(item.get('chapter_number', 0) or 0),
+        )
+        recalculated_completed: list[dict[str, Any]] = []
+        generated_chars = 0
+        max_chapter_number = 0
+        for item in completed:
+            chapter_number = int(item.get('chapter_number', 0) or 0)
+            max_chapter_number = max(max_chapter_number, chapter_number)
+            draft_file = str(item.get('draft_file', '') or '')
+            summary_file = str(item.get('summary_file', '') or '')
+            draft_text = read_text(Path(draft_file))
+            summary_text = read_text(Path(summary_file)).strip()
+            chars = len(draft_text.strip())
+            generated_chars += chars
+            volume_number, chapter_in_volume = self._chapter_volume_number(chapter_number)
+            recalculated_completed.append({
+                'chapter_number': chapter_number,
+                'volume_number': int(item.get('volume_number', 0) or volume_number),
+                'chapter_in_volume': int(item.get('chapter_in_volume', 0) or chapter_in_volume),
+                'title': str(item.get('title', '') or '').strip(),
+                'draft_file': draft_file,
+                'summary_file': summary_file,
+                'chars': chars,
+                'summary_preview': summary_text or str(item.get('summary_preview', '') or '').strip(),
+            })
+
+        self.state['completed_chapters'] = recalculated_completed
+        self.state['generated_chapters'] = len(recalculated_completed)
+        self.state['generated_chars'] = generated_chars
+        self.state['next_chapter_number'] = (max_chapter_number + 1) if max_chapter_number else 1
+        self.state['manuscript_last_appended_chapter'] = len(recalculated_completed)
+
+    def _polish_title_only_story_in_place(
+        self,
+        *,
+        cycle_index: int,
+        reason_lines: list[str],
+        polish_brief: str,
+        stage_label: str,
+    ) -> None:
+        if not self._is_title_only_story():
+            raise RuntimeError('只有短篇单篇模式才能使用定向终稿修补。')
+
+        completed = sorted(
+            self.state.get('completed_chapters', []),
+            key=lambda item: int(item.get('chapter_number', 0) or 0),
+        )
+        if not completed:
+            raise RuntimeError('当前没有可供定向修补的已完成正文。')
+
+        chapter = completed[-1]
+        chapter_number = int(chapter.get('chapter_number', 0) or 0)
+        chapter_title = str(chapter.get('title', '') or '').strip()
+        draft_path = Path(str(chapter.get('draft_file', '') or ''))
+        summary_path = Path(str(chapter.get('summary_file', '') or ''))
+        current_text = read_text(draft_path).strip()
+        if not current_text:
+            raise RuntimeError(f'第{chapter_number}章当前正文为空，无法定向修补。')
+
+        if polish_brief.strip():
+            write_text(self.ending_polish_brief_path, polish_brief.strip())
+        elif self.ending_polish_brief_path.exists():
+            self.ending_polish_brief_path.unlink()
+
+        reason_block = '\n'.join(f'- {line}' for line in reason_lines if line.strip()) or '- 让现有单篇真正收住。'
+        guidance_text = self._ending_guidance_text(limit=1800)
+        quality_guidance_text = self._ending_quality_guidance_text(limit=1800)
+        project_role_rule = self._project_role_only_rule()
+        prompt = f"""
+你正在做一篇单篇中文短篇小说的“终稿定向修补”。
+
+目标不是推翻重写，而是在保留现有故事主体、人物关系、场景顺序、核心事件、主要文风和绝大多数正文的前提下，
+把当前版本补到真正可收住。
+
+硬要求：
+- 直接输出修订后的完整正文，不要解释，不要分点，不要附注。
+- 优先保留现有文本的 85% 以上内容，尤其不要重写开头。
+- 优先修后半段，尤其是最后三分之一；如果前文已经成立，不要为了“更顺”重开新叙事链。
+- 严禁新增第二章、附录、后记、作者说明、设定说明。
+- 严禁新增新专有姓名、额外世界观、额外大事件、额外配角线。
+- 只能用现有故事已经建立的人物、代价、动作、场景和物件来补齐闭环。
+- 结尾必须落在具体动作、回声或静止画面上，不能停在主题总结句上。
+{f'- {project_role_rule}' if project_role_rule else ''}
+
+【本轮修补目标】
+{reason_block}
+
+【本轮回修要求】
+{polish_brief.strip() or '（无）'}
+
+【当前终局指引】
+{guidance_text or '（无）'}
+
+【当前终局质量指引】
+{quality_guidance_text or '（无）'}
+
+【当前正文】
+{current_text}
+"""
+
+        revised = self._call_llm_raw(
+            f'{stage_label}第{cycle_index}轮',
+            prompt,
+            self.ending_polish_model,
+            system_prompt='你是只做定向终稿修补的中文短篇小说编辑，擅长保留主体、只补关键闭环。',
+            response_json=False,
+            stream_output=False,
+        ).strip()
+        revised = self._sanitize_text(revised)
+        if not revised:
+            raise RuntimeError('短篇定向终稿修补返回空文本。')
+
+        revised = normalize_chapter_draft_text(
+            chapter_number,
+            chapter_title,
+            revised,
+            heading_mode=self._draft_heading_mode(),
+        )
+        revised = self._enforce_project_role_labels(f'第{chapter_number}章终稿定向修补', revised)
+        revised = normalize_chapter_draft_text(
+            chapter_number,
+            chapter_title,
+            revised,
+            heading_mode=self._draft_heading_mode(),
+        )
+        if revised.strip() == current_text.strip():
+            raise RuntimeError('短篇定向终稿修补未产生有效改动。')
+        if len(revised) < max(400, int(len(current_text) * 0.75)):
+            raise RuntimeError('短篇定向终稿修补后文本异常变短。')
+
+        write_text(draft_path, revised)
+        write_text(summary_path, '')
+        summary_text = self.summarize_chapter(
+            {
+                'chapter_number': chapter_number,
+                'title': chapter_title,
+                'summary_file': str(summary_path),
+            },
+            '',
+            '',
+            revised,
+        )
+        write_text(summary_path, summary_text.strip())
+        self._recalculate_completed_state_from_disk()
+        self.rebuild_full_manuscript(export_chapters_txt=True)
+        self.state['status'] = 'running'
+        self.state['last_error'] = ''
+        self.state['completion_check'] = {}
+        self.state['ending_quality_check'] = {}
+        self._save_state()
+        self.log(
+            f'[title_only_polish] 第 {cycle_index} 轮已对第{chapter_number}章执行定向终稿修补；'
+            '不再整篇回退，接下来直接重评当前成稿。'
+        )
+
+    def maybe_polish_ending_before_stop(self) -> bool:
+        if self._completion_mode() != 'min_chars_and_story_end':
             return True
+        report = self.evaluate_ending_quality()
+        if not report.get('needs_polish'):
+            self.log(
+                f'终局质量评估通过：综合 {report.get("quality_score", 0)} / 回响 {report.get("resonance_score", 0)} / 余味 {report.get("thought_provoking_score", 0)}'
+            )
+            return True
+
+        rewrite_from_chapter = int(report.get('rewrite_from_chapter', 0) or 0)
+        if rewrite_from_chapter <= 0:
+            raise RuntimeError('终局质量评估要求回修，但未返回有效章节起点。')
+
+        cycles = int(self.state.get('ending_polish_cycles', 0) or 0) + 1
+        max_cycles = max(1, int(getattr(self.args, 'ending_polish_max_cycles', 2) or 2))
+        self.state['ending_polish_cycles'] = cycles
+        self._save_state()
+        if cycles > max_cycles:
+            raise RuntimeError(
+                f'终局质量自动回修已达到上限 {max_cycles} 轮，最近一次建议从第{rewrite_from_chapter}章回修，请人工检查。'
+            )
+
+        reason_lines = [str(item).strip() for item in (report.get('rewrite_goals') or []) if str(item).strip()]
+        if report.get('final_image_target'):
+            reason_lines.append(f'最后一屏目标：{report.get("final_image_target")}')
+        if self._is_title_only_story():
+            self.log(
+                f'终局质量评估未通过：综合 {report.get("quality_score", 0)} / 回响 {report.get("resonance_score", 0)} / 余味 {report.get("thought_provoking_score", 0)}；'
+                f'第 {cycles} 轮将对当前短篇成稿做定向终稿修补。'
+            )
+            self._polish_title_only_story_in_place(
+                cycle_index=cycles,
+                reason_lines=reason_lines,
+                polish_brief=str(report.get('polish_brief_markdown', '') or '').strip(),
+                stage_label='短篇终局质量定向修补',
+            )
+            return self.should_stop()
+        self.log(
+            f'终局质量评估未通过：综合 {report.get("quality_score", 0)} / 回响 {report.get("resonance_score", 0)} / 余味 {report.get("thought_provoking_score", 0)}；'
+            f'第 {cycles} 轮自动回修将从第{rewrite_from_chapter}章开始。'
+        )
+        self.log(
+            '说明：上一轮“完结评估=是”只代表旧稿在主线闭环层面已可结束；'
+            '本轮未通过的是终局质量要求。回退后若再次出现“未完结”，指向的是新的回修底稿，并不与上一轮旧稿结论冲突。'
+        )
+        self.rewind_from_chapter(
+            rewrite_from_chapter,
+            reason_lines=reason_lines,
+            polish_brief=str(report.get('polish_brief_markdown', '') or '').strip(),
+        )
+        return False
+
+    def maybe_rewrite_title_only_story_before_stop(self, completion_report: dict[str, Any]) -> bool:
+        if not self._is_title_only_story():
+            return True
+
+        cycles = int(self.state.get('ending_polish_cycles', 0) or 0) + 1
+        max_cycles = max(1, int(getattr(self.args, 'ending_polish_max_cycles', 2) or 2))
+        self.state['ending_polish_cycles'] = cycles
+        self._save_state()
+        if cycles > max_cycles:
+            raise RuntimeError(
+                f'单篇终稿自动回修已达到上限 {max_cycles} 轮，当前稿仍未达到可收住标准，请人工检查。'
+            )
+
+        missing = [str(item).strip() for item in (completion_report.get('missing') or []) if str(item).strip()]
+        summary = str(completion_report.get('summary', '') or '').strip()
+        next_phase_goal = str(completion_report.get('next_phase_goal', '') or '').strip()
+        guidance_text = self._ending_guidance_text(limit=1600)
+
+        reason_lines: list[str] = []
+        if summary:
+            reason_lines.append(summary)
+        reason_lines.extend(missing[:6])
+        if next_phase_goal:
+            reason_lines.append(f'下一阶段目标：{next_phase_goal}')
+
+        polish_lines = [
+            '# 单篇终稿回修要求',
+            '## 当前判定',
+            f'- 当前版本尚未达到“单篇完整闭环且值得收住”的标准。',
+        ]
+        if summary:
+            polish_lines.append(f'- {summary}')
+        polish_lines.extend([
+            '',
+            '## 必须补齐',
+        ])
+        if missing:
+            polish_lines.extend(f'- {item}' for item in missing)
+        else:
+            polish_lines.append('- 让整篇在单章内部真正收住，而不是停在说明和总结句上。')
+        polish_lines.extend([
+            '',
+            '## 必须遵守',
+            '- 这是单篇短故事的整章重写，不允许新增第二章来接尾巴。',
+            '- 必须把主冲突、代价、人物认领和最后一屏全部压回这一篇内部完成。',
+            '- 结尾必须落在具体动作、回声或静止画面上，不能用主题总结句收束。',
+            '- 不允许把“缺少的关键闭环”伪装成开放式余味。',
+        ])
+        if guidance_text:
+            polish_lines.extend([
+                '',
+                '## 现有高优先级终局指引',
+                guidance_text,
+            ])
+        polish_brief = '\n'.join(polish_lines).strip()
+
+        self.log(
+            f'单篇完结评估未通过：置信度 {completion_report.get("confidence", 0)}；'
+            f'第 {cycles} 轮将对当前短篇成稿做定向终稿修补。'
+        )
+        self._polish_title_only_story_in_place(
+            cycle_index=cycles,
+            reason_lines=reason_lines,
+            polish_brief=polish_brief,
+            stage_label='短篇完结定向修补',
+        )
+        return self.should_stop()
+
+    def should_stop(self) -> bool:
+        if self._rewrite_pending_from_chapter():
+            return False
         if self._completion_mode() == 'hard_target':
+            if self.args.max_chapters and self.state['generated_chapters'] >= self.args.max_chapters:
+                return True
             return self.state['generated_chars'] >= self.args.target_chars
+
+        max_chapters_reached = bool(self.args.max_chapters and self.state['generated_chapters'] >= self.args.max_chapters)
 
         max_target_chars = self._effective_max_target_chars()
         if max_target_chars and self.state['generated_chars'] >= max_target_chars:
@@ -2595,9 +4658,30 @@ class AutoNovelRunner:
 
         completion_report = self.evaluate_completion_status()
         if completion_report.get('is_complete'):
+            if not self.maybe_polish_ending_before_stop():
+                return False
             self.log(
                 f'完结评估判定已可自然收尾结束：置信度 {completion_report.get("confidence", 0)}'
             )
+            return True
+
+        tail_stagnation = self._tail_only_completion_stagnation(completion_report)
+        if tail_stagnation.get('triggered'):
+            missing = '；'.join(str(item) for item in (tail_stagnation.get('missing') or []))
+            self.log(
+                f'完结评估尾段停滞保护触发：连续 {tail_stagnation.get("streak", 0)} 章仍判定“还需1章”，'
+                f'且缺口仅剩尾声/后日谈类收束（{missing}）；停止新增章节，转入终局质量打磨。'
+            )
+            if not self.maybe_polish_ending_before_stop():
+                return False
+            self.log(
+                f'尾段停滞保护判定当前版本已可结束：置信度 {completion_report.get("confidence", 0)}'
+            )
+            return True
+
+        if max_chapters_reached:
+            if self._is_title_only_story():
+                return self.maybe_rewrite_title_only_story_before_stop(completion_report)
             return True
         return False
 
@@ -2609,13 +4693,14 @@ class AutoNovelRunner:
         self.state['max_target_chars'] = self._effective_max_target_chars()
         self.state['completion_mode'] = self.args.completion_mode
         self._save_state()
-        self.log('自动长篇模式启动')
+        self.log('自动短篇模式启动' if self._is_title_only_story() else '自动长篇模式启动')
         self.log(f'项目目录：{self.project_dir}')
         self.log(
             f'停止模式：{self.args.completion_mode}，硬目标：{self.args.target_chars}，'
             f'最少字数：{self.args.min_target_chars}，强制收束阈值：{self._effective_force_finish_chars()}，'
             f'最终绝对上限：{self._effective_max_target_chars()}，'
-            f'单章目标：{self.args.chapter_char_target}'
+            f'单章目标：{self.args.chapter_char_target}，'
+            f'正文标题模式：{self._draft_heading_mode()}'
         )
         self.log(f'主模型：{self.args.main_model}，副模型：{self.args.sub_model}')
         critic_model_name = self.args.critic_model or self.args.main_model
@@ -2630,6 +4715,11 @@ class AutoNovelRunner:
             f'critic：{critic_status}，模型：{critic_model_name}，'
             f'推理：{self.args.critic_reasoning_effort}，最大复检轮数：{critic_pass_limit}'
         )
+        ending_polish_model_name = self.args.ending_polish_model or critic_model_name
+        self.log(
+            f'ending_quality：模型：{ending_polish_model_name}，推理：{self.args.ending_polish_reasoning_effort}，'
+            f'自动回修上限：{self.args.ending_polish_max_cycles} 轮'
+        )
 
         self.ensure_series_bible()
 
@@ -2637,6 +4727,8 @@ class AutoNovelRunner:
             write_text(self.story_memory_path, '# 故事至今\n尚未生成正文。')
 
         while not self.should_stop():
+            self.refresh_ending_guidance()
+            self.refresh_ending_quality_guidance()
             self.plan_next_batch()
             chapter = self.state['pending_chapters'][0]
             chapter_number = chapter['chapter_number']
@@ -2648,8 +4740,12 @@ class AutoNovelRunner:
             summary_text = self.summarize_chapter(chapter, outline_text, plot_text, draft_text)
             self.finalize_chapter(chapter, draft_text, summary_text)
             self.refresh_story_memory()
+            self.refresh_ending_guidance()
+            self.refresh_ending_quality_guidance()
 
         self.refresh_story_memory(force=True)
+        self.refresh_ending_guidance(force=True)
+        self.refresh_ending_quality_guidance(force=True)
         self.export_full_novel_chapters_txt()
         self.state['status'] = 'completed'
         self.state['last_error'] = ''
@@ -2679,12 +4775,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--summary-reasoning-effort', default='low')
     parser.add_argument('--critic-model', default='')
     parser.add_argument('--critic-every-chapters', type=int, default=0)
-    parser.add_argument('--critic-reasoning-effort', default='xhigh')
+    parser.add_argument('--critic-reasoning-effort', default='high')
     parser.add_argument('--critic-max-passes', type=int, default=0)
+    parser.add_argument('--ending-polish-model', default='')
+    parser.add_argument('--ending-polish-reasoning-effort', default='high')
+    parser.add_argument('--ending-polish-max-cycles', type=int, default=2)
     parser.add_argument('--max-thread-num', type=int, default=1)
     parser.add_argument('--max-retries', type=int, default=0)
     parser.add_argument('--retry-backoff-seconds', type=int, default=15)
     parser.add_argument('--max-chapters', type=int, default=0)
+    parser.add_argument('--title-only-story', action='store_true')
     parser.add_argument('--live-stream', action='store_true')
     parser.add_argument('--evaluate-completion-only', action='store_true')
     return parser.parse_args()
@@ -2694,6 +4794,9 @@ def main() -> int:
     args = parse_args()
     runner = AutoNovelRunner(args)
     try:
+        if runner.state.get('status') == 'manual_review_required':
+            runner.log('项目当前已标记为 manual_review_required；需先人工回退或重置终局回修状态后再续跑。')
+            return 3
         if args.evaluate_completion_only:
             report = runner.evaluate_completion_status(force=True)
             payload = json.dumps(report, ensure_ascii=False, indent=2)
@@ -2711,12 +4814,21 @@ def main() -> int:
         runner.log('收到中断信号，已保存进度，可直接续跑。')
         return 130
     except Exception as exc:
-        runner.state['status'] = 'failed'
-        runner.state['last_error'] = str(exc)
+        error_text = str(exc)
+        manual_review_required_markers = (
+            '终局质量自动回修已达到上限',
+            '单篇终稿自动回修已达到上限',
+        )
+        requires_manual_review = any(marker in error_text for marker in manual_review_required_markers)
+        runner.state['status'] = 'manual_review_required' if requires_manual_review else 'failed'
+        runner.state['last_error'] = error_text
         runner._save_state()
         runner.log(f'任务失败：{exc}')
         for line in traceback.format_exc().splitlines():
             runner.log(f'traceback | {line}')
+        if requires_manual_review:
+            runner.log('已标记为 manual_review_required，等待人工处理，不再自动续跑。')
+            return 3
         raise
     finally:
         runner.close()

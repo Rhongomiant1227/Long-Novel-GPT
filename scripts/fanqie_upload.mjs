@@ -10,6 +10,7 @@ import { chromium } from "playwright-core";
 const 默认起始网址 = "https://fanqienovel.com/main/writer/?enter_from=author_zone";
 const 默认_OPENCLAW_CDP_网址 = "http://127.0.0.1:18800";
 let 当前日志文件 = "";
+const 作品路由缓存 = new Map();
 
 function 打印帮助() {
   console.log(`番茄小说章节上传脚本
@@ -178,6 +179,63 @@ function 规范空白(value) {
   return value.replace(/\s+/g, " ").trim();
 }
 
+function 转义正则文本(value) {
+  return String(value ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function 解析中文章节数字(rawValue) {
+  const normalized = String(rawValue ?? "").replace(/\s+/g, "");
+  if (!normalized) {
+    return NaN;
+  }
+
+  const digits = {
+    "零": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+  };
+  const units = {
+    "十": 10,
+    "百": 100,
+    "千": 1000,
+    "万": 10000,
+  };
+
+  let total = 0;
+  let section = 0;
+  let number = 0;
+  for (const char of normalized) {
+    if (digits[char] !== undefined) {
+      number = digits[char];
+      continue;
+    }
+    if (units[char] !== undefined) {
+      const unit = units[char];
+      if (unit === 10000) {
+        section = (section + (number || 0)) * unit;
+        total += section;
+        section = 0;
+        number = 0;
+        continue;
+      }
+      section += (number || 1) * unit;
+      number = 0;
+      continue;
+    }
+    return NaN;
+  }
+
+  return total + section + number;
+}
+
 function 规范AI使用值(value, sourceLabel = "aiUsage") {
   if (typeof value === "boolean") {
     return value ? "yes" : "no";
@@ -193,6 +251,18 @@ function 规范AI使用值(value, sourceLabel = "aiUsage") {
     return "no";
   }
   throw new Error(`${sourceLabel} 只支持 yes/no`);
+}
+
+function 解析作品ID(publishPath = "", chapterManagePath = "") {
+  const publishMatch = String(publishPath).match(/\/main\/writer\/(\d+)\/publish\//);
+  if (publishMatch?.[1]) {
+    return publishMatch[1];
+  }
+  const manageMatch = String(chapterManagePath).match(/\/chapter-manage\/(\d+)&/);
+  if (manageMatch?.[1]) {
+    return manageMatch[1];
+  }
+  return "";
 }
 
 function 记录日志(message) {
@@ -218,10 +288,16 @@ async function 等待回车(prompt) {
 
 function 解析章节文件内容(content, filePath) {
   const lines = content.replace(/\r\n/g, "\n").split("\n");
-  const titleLine = lines[0]?.trim() ?? "";
-  const match = titleLine.match(/^第\s*(\d+)\s*章(?:\s+|[：:，,、.．。]\s*)(.+)$/);
+  const titleLine = lines[0]?.replace(/^[\uFEFF\u200B]+/, "").trim() ?? "";
+  const match = titleLine.match(/^第\s*([零一二两三四五六七八九十百千万\d]+)\s*章(?:\s+|[：:，,、.．。]\s*)(.+)$/);
   if (!match) {
-    throw new Error(`章节标题格式无效: ${filePath}`);
+    throw new Error(`章节标题格式无效: ${filePath}；首行=${JSON.stringify(titleLine)}`);
+  }
+  const chapterNumber = /^\d+$/.test(match[1])
+    ? Number(match[1])
+    : 解析中文章节数字(match[1]);
+  if (!Number.isFinite(chapterNumber) || chapterNumber <= 0) {
+    throw new Error(`章节标题中的章节号无效: ${filePath}`);
   }
 
   let body = lines.slice(1).join("\n");
@@ -231,7 +307,7 @@ function 解析章节文件内容(content, filePath) {
   }
 
   return {
-    number: Number(match[1]),
+    number: chapterNumber,
     title: match[2].trim(),
     body,
     heading: titleLine,
@@ -432,7 +508,16 @@ async function 点击首个可见元素(page, factories, description) {
   if (!locator) {
     return false;
   }
-  await locator.click();
+  try {
+    await locator.click();
+  } catch (error) {
+    const message = error?.message ?? String(error);
+    if (!/intercepts pointer events|element click intercepted|another element would receive/i.test(message)) {
+      throw error;
+    }
+    记录日志(`常规点击被页面浮层拦截，改用强制点击: ${message.split("\n")[0]}`);
+    await locator.click({ force: true, timeout: 5000 });
+  }
   if (description) {
     记录日志(description);
   }
@@ -770,6 +855,152 @@ async function 在工作台选择作品(page, bookTitle) {
   } catch {}
 }
 
+async function 从作品管理解析作品路由(page, startUrl, bookTitle) {
+  const bookManageUrl = new URL("/main/writer/book-manage", startUrl).toString();
+  记录日志(`进入作品管理，查找《${bookTitle}》`);
+  await page.goto(bookManageUrl, { waitUntil: "domcontentloaded" });
+  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+
+  const routeInfo = await page.evaluate((targetBookTitle) => {
+    const normalize = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
+    const isVisible = (el) => {
+      if (!(el instanceof Element)) {
+        return false;
+      }
+      const style = window.getComputedStyle(el);
+      if (!style || style.display === "none" || style.visibility === "hidden") {
+        return false;
+      }
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    };
+    const textOf = (el) => normalize(el.innerText || el.textContent || "");
+
+    const cardSelectors = [
+      ".home-book-item",
+      ".long-article-table-item",
+      "[class*='home-book-item']",
+      "[class*='article-table-item']",
+    ].join(",");
+
+    const matches = [];
+    for (const card of document.querySelectorAll(cardSelectors)) {
+      if (!(card instanceof Element) || !isVisible(card)) {
+        continue;
+      }
+      const cardText = textOf(card);
+      if (!cardText || !cardText.includes(targetBookTitle)) {
+        continue;
+      }
+
+      const exactTitle = Array.from(card.querySelectorAll("*")).some(
+        (node) => node instanceof Element && isVisible(node) && textOf(node) === targetBookTitle,
+      );
+      const publishLink = Array.from(card.querySelectorAll("a[href*='/publish/']")).find(
+        (node) => node instanceof Element && isVisible(node),
+      );
+      const chapterManageLink = Array.from(card.querySelectorAll("a[href*='/chapter-manage/']")).find(
+        (node) => node instanceof Element && isVisible(node),
+      );
+
+      if (!publishLink && !chapterManageLink) {
+        continue;
+      }
+
+      matches.push({
+        score: (exactTitle ? 0 : 1000) + cardText.length,
+        publishPath: publishLink?.getAttribute("href") || "",
+        chapterManagePath: chapterManageLink?.getAttribute("href") || "",
+      });
+    }
+
+    if (!matches.length) {
+      return null;
+    }
+
+    matches.sort((a, b) => a.score - b.score);
+    return matches[0];
+  }, bookTitle).catch(() => null);
+
+  if (!routeInfo?.publishPath && !routeInfo?.chapterManagePath) {
+    throw new Error(`作品管理中未找到《${bookTitle}》的章节入口`);
+  }
+
+  const bookId = 解析作品ID(routeInfo.publishPath, routeInfo.chapterManagePath);
+  if (!bookId) {
+    throw new Error(`无法从作品管理页解析《${bookTitle}》的作品 ID`);
+  }
+
+  const resolved = {
+    bookId,
+    publishUrl: routeInfo.publishPath ? new URL(routeInfo.publishPath, startUrl).toString() : "",
+    chapterManageUrl: routeInfo.chapterManagePath
+      ? new URL(routeInfo.chapterManagePath, startUrl).toString()
+      : "",
+  };
+  记录日志(`已定位作品: ${bookTitle} (bookId=${bookId})`);
+  return resolved;
+}
+
+async function 获取作品路由(page, startUrl, bookTitle) {
+  const cacheKey = `${startUrl}::${规范空白(bookTitle)}`;
+  if (作品路由缓存.has(cacheKey)) {
+    return 作品路由缓存.get(cacheKey);
+  }
+  const resolved = await 从作品管理解析作品路由(page, startUrl, bookTitle);
+  作品路由缓存.set(cacheKey, resolved);
+  return resolved;
+}
+
+async function 点击作品卡片入口(page, bookTitle, actionText, description) {
+  const scopePattern = new RegExp(转义正则文本(规范空白(bookTitle)));
+  if (
+    await 点击作用域内可见文本(page, {
+      selectors: "a, button, [role='button'], [role='link'], span",
+      targetPattern: new RegExp(`^${转义正则文本(actionText)}$|${转义正则文本(actionText)}`),
+      scopePattern,
+      description,
+    })
+  ) {
+    return true;
+  }
+
+  return await 点击首个可见元素(
+    page,
+    [
+      (p) => p.getByRole("link", { name: actionText }),
+      (p) => p.getByRole("button", { name: actionText }),
+      (p) => p.locator("a").filter({ hasText: actionText }),
+      (p) => p.locator("button").filter({ hasText: actionText }),
+    ],
+    description,
+  );
+}
+
+async function 读取当前发布页作品名(page) {
+  return 规范空白(
+    await page
+      .locator(".publish-header-book-name")
+      .first()
+      .innerText()
+      .catch(async () => {
+        const bodyText = await page.locator("body").innerText().catch(() => "");
+        const match = bodyText.match(/作品名称[：:]\s*(.+?)(?:\r?\n|$)/);
+        return match?.[1] ?? "";
+      }),
+  );
+}
+
+async function 校验当前发布页作品(page, bookTitle) {
+  const actualTitle = await 读取当前发布页作品名(page);
+  if (!actualTitle) {
+    return;
+  }
+  if (规范空白(actualTitle) !== 规范空白(bookTitle)) {
+    throw new Error(`进入了错误的作品发布页：目标为《${bookTitle}》，实际为《${actualTitle}》`);
+  }
+}
+
 function 解析上次提交章节(text) {
   const normalized = 规范空白(text);
   const match = normalized.match(/上次提交[：:]\s*(?:第\S+卷\s*)?第\s*(\d+)\s*章\s+(.+?)(?=\s*(?:已保存|保存中|审核中|已发布|正文字数|存草稿|下一步|上次提交|作品名称|$))/);
@@ -936,47 +1167,24 @@ async function 校验上一章匹配(page, chapter, chaptersDir) {
 
 async function 获取最新已发布章节(page, startUrl, bookTitle) {
   记录日志(`读取《${bookTitle}》远端最新已发布章节`);
-  await page.goto(startUrl, { waitUntil: "domcontentloaded" });
-  await 等待工作台就绪(page, bookTitle);
-  await 在工作台选择作品(page, bookTitle);
-
-  const homeText = await page.locator("body").innerText().catch(() => "");
-  const recent = 解析最近更新章节(homeText);
-  if (recent) {
-    记录日志(`首页最近更新显示为第${recent.number}章`);
+  await 确保已登录(page, startUrl);
+  const routes = await 获取作品路由(page, startUrl, bookTitle);
+  if (!routes.chapterManageUrl) {
+    throw new Error(`未找到《${bookTitle}》的章节管理地址`);
   }
 
-  if (recent) {
-    记录日志("继续转到章节管理复核最新章节（含审核中章节）");
-  } else {
-    记录日志("首页未解析到最近更新，转到章节管理读取最新章节");
-  }
-  await 点击首个可见元素(
-    page,
-    [
-      (p) => p.getByRole("link", { name: "章节管理" }),
-      (p) => p.getByRole("button", { name: "章节管理" }),
-      (p) => p.locator("a").filter({ hasText: "章节管理" }),
-      (p) => p.locator("button").filter({ hasText: "章节管理" }),
-    ],
-    "已进入章节管理",
-  );
+  记录日志("转到章节管理读取最新章节（含审核中章节）");
+  await page.goto(routes.chapterManageUrl, { waitUntil: "domcontentloaded" });
+  记录日志("已进入章节管理");
   await page.waitForLoadState("domcontentloaded");
   await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
   const numbers = await 从章节管理页读取章节号列表(page, 15000);
   if (!numbers.length) {
-    if (recent) {
-      return recent.number;
-    }
     记录日志("远端未解析到任何已发布章节，按从第1章开始处理");
     return 0;
   }
-  const latest = Math.max(recent?.number ?? 0, ...numbers);
-  if (recent && latest > recent.number) {
-    记录日志(`章节管理显示最新章节为第${latest}章（首页最近更新仍为第${recent.number}章）`);
-  } else {
-    记录日志(`章节管理显示最新章节为第${latest}章`);
-  }
+  const latest = Math.max(...numbers);
+  记录日志(`章节管理显示最新章节为第${latest}章`);
   return latest;
 }
 
@@ -1019,31 +1227,19 @@ async function 确保已登录(page, startUrl) {
 }
 
 async function 选择作品并打开创建页(context, page, startUrl, bookTitle) {
-  记录日志(`进入作品首页，准备定位《${bookTitle}》`);
-  await page.goto(startUrl, { waitUntil: "domcontentloaded" });
-  await 等待工作台就绪(page, bookTitle);
-  await 在工作台选择作品(page, bookTitle);
-
-  const popupPromise = context.waitForEvent("page", { timeout: 5000 }).catch(() => null);
-  const clicked = await 点击首个可见元素(
-    page,
-    [
-      (p) => p.getByRole("link", { name: "创建章节" }),
-      (p) => p.getByRole("button", { name: "创建章节" }),
-      (p) => p.locator("a").filter({ hasText: "创建章节" }),
-      (p) => p.locator("button").filter({ hasText: "创建章节" }),
-    ],
-    "已点击创建章节",
-  );
-  if (!clicked) {
-    throw new Error(`未找到《${bookTitle}》的创建章节入口`);
+  void context;
+  记录日志(`准备直达《${bookTitle}》创建章节页`);
+  await 确保已登录(page, startUrl);
+  const routes = await 获取作品路由(page, startUrl, bookTitle);
+  if (!routes.publishUrl) {
+    throw new Error(`未找到《${bookTitle}》的创建章节地址`);
   }
 
-  const popup = await popupPromise;
-  const targetPage = popup ?? page;
-  await targetPage.waitForLoadState("domcontentloaded");
-  记录日志(`已进入创建章节页: ${targetPage.url()}`);
-  return targetPage;
+  await page.goto(routes.publishUrl, { waitUntil: "domcontentloaded" });
+  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+  await 校验当前发布页作品(page, bookTitle);
+  记录日志(`已进入创建章节页: ${page.url()}`);
+  return page;
 }
 
 async function 填写编辑器(page, chapter) {
@@ -1328,29 +1524,15 @@ async function 处理错别字和AI弹窗(page, chapter, { draftOnly, debug, aiU
 }
 
 async function 在工作台校验已发布(page, startUrl, bookTitle, chapter) {
-  记录日志(`回到首页校验第${chapter.number}章是否已显示`);
-  await page.goto(startUrl, { waitUntil: "domcontentloaded" });
-  await 等待工作台就绪(page, bookTitle);
-  await 在工作台选择作品(page, bookTitle);
-  const expected = 规范空白(`第${chapter.number}章 ${chapter.title}`);
-  const expectedRecent = 规范空白(`最近更新：${expected}`);
-  const bodyText = 规范空白(await page.locator("body").innerText().catch(() => ""));
-  if (bodyText.includes(expectedRecent) || bodyText.includes(expected)) {
-    记录日志(`后台首页已显示目标章节: ${expected}`);
-    return;
+  记录日志(`转到章节管理校验第${chapter.number}章是否已显示`);
+  await 确保已登录(page, startUrl);
+  const routes = await 获取作品路由(page, startUrl, bookTitle);
+  if (!routes.chapterManageUrl) {
+    throw new Error(`未找到《${bookTitle}》的章节管理地址`);
   }
-
-  记录日志("首页未立即显示目标章节，转到章节管理继续校验");
-  await 点击首个可见元素(
-    page,
-    [
-      (p) => p.getByRole("link", { name: "章节管理" }),
-      (p) => p.getByRole("button", { name: "章节管理" }),
-      (p) => p.locator("a").filter({ hasText: "章节管理" }),
-      (p) => p.locator("button").filter({ hasText: "章节管理" }),
-    ],
-    "已进入章节管理",
-  );
+  const expected = 规范空白(`第${chapter.number}章 ${chapter.title}`);
+  await page.goto(routes.chapterManageUrl, { waitUntil: "domcontentloaded" });
+  记录日志("已进入章节管理");
   await page.waitForLoadState("domcontentloaded");
   await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
   if (await 章节管理已显示目标章节(page, expected, 20000)) {

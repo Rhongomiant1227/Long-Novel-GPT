@@ -30,6 +30,7 @@ function parseArgs(argv) {
     configPath: path.resolve(process.cwd(), "fanqie_daily_jobs.json"),
     once: false,
     runNow: false,
+    retryUntilSuccess: false,
     skipDelay: false,
     dryRun: false,
     jobId: "",
@@ -55,6 +56,9 @@ function parseArgs(argv) {
         break;
       case "--run-now":
         args.runNow = true;
+        break;
+      case "--retry-until-success":
+        args.retryUntilSuccess = true;
         break;
       case "--skip-delay":
         args.skipDelay = true;
@@ -162,6 +166,37 @@ function computePublishAnchor(now, publishTime) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeRetryNumber(value, fallbackValue) {
+  if (value === undefined || value === null || value === "") {
+    return fallbackValue;
+  }
+  const resolved = Number(value);
+  if (!Number.isFinite(resolved) || resolved <= 0) {
+    throw new Error(`invalid retry config value: ${value}`);
+  }
+  return resolved;
+}
+
+function computeRetryDelayMinutes(baseMinutes, multiplier, maxMinutes, attemptCount) {
+  const safeAttempt = Math.max(1, Number(attemptCount) || 1);
+  const scaledDelay = baseMinutes * Math.pow(multiplier, safeAttempt - 1);
+  const boundedDelay = Math.min(scaledDelay, maxMinutes);
+  return Math.max(1, Math.round(boundedDelay));
+}
+
+function getPendingRetryJobs(jobs, stateJobs) {
+  return jobs
+    .map((job) => ({ job, entry: stateJobs[job.id] ?? {} }))
+    .filter(({ entry }) => Number(entry.lastExitCode ?? 0) !== 0 && entry.nextRunAt)
+    .map(({ job, entry }) => ({
+      job,
+      entry,
+      nextRetryAt: new Date(entry.nextRunAt),
+      retryAttemptCount: Number(entry.retryAttemptCount ?? 0),
+    }))
+    .filter(({ nextRetryAt }) => Number.isFinite(nextRetryAt.getTime()));
 }
 
 function normalizeWeekdayCounts(rawMap) {
@@ -413,7 +448,12 @@ async function main() {
   const statePath = resolvePathLike(configDir, rawConfig.stateFile ?? ".run/fanqie_daily_scheduler_state.json");
   const logPath = resolvePathLike(configDir, rawConfig.logFile ?? ".run/fanqie_daily_scheduler.log");
   const tickSeconds = Number(rawConfig.tickSeconds ?? 30);
-  const retryMinutes = Number(rawConfig.retryMinutes ?? defaults.retryMinutes ?? 30);
+  const retryMinutes = normalizeRetryNumber(rawConfig.retryMinutes ?? defaults.retryMinutes ?? 30, 30);
+  const retryBackoffMultiplier = normalizeRetryNumber(
+    rawConfig.retryBackoffMultiplier ?? defaults.retryBackoffMultiplier ?? 2,
+    2,
+  );
+  const retryMaxMinutes = normalizeRetryNumber(rawConfig.retryMaxMinutes ?? defaults.retryMaxMinutes ?? 360, 360);
 
   ensureDir(path.dirname(logPath));
   const log = logFactory(logPath);
@@ -444,6 +484,8 @@ async function main() {
   let forceRunNow = args.runNow;
 
   while (true) {
+    let hasFailure = false;
+    const failedJobs = [];
     const loopNow = new Date();
     const latestState = await loadJson(statePath, { jobs: {} });
     latestState.jobs ??= {};
@@ -463,14 +505,15 @@ async function main() {
       await saveJson(statePath, latestState);
 
       if (!args.skipDelay && !args.dryRun && job.publishWindowMinutes > 0) {
-        const randomized = getRandomizedExecutionState(entry, job, loopNow, log);
+        const delayNow = new Date();
+        const randomized = getRandomizedExecutionState(entry, job, delayNow, log);
         latestState.jobs[job.id] = entry;
         await saveJson(statePath, latestState);
 
         const executeAt = new Date(randomized.executeAt);
-        if (executeAt > loopNow) {
+        if (executeAt > delayNow) {
           if (args.once) {
-            const waitMs = executeAt.getTime() - loopNow.getTime();
+            const waitMs = executeAt.getTime() - delayNow.getTime();
             log(`[${job.id}] 等待随机窗口，到 ${executeAt.toLocaleString("zh-CN", { hour12: false })} 后执行`);
             await sleep(waitMs);
           } else {
@@ -493,13 +536,24 @@ async function main() {
       if (exitCode === 0) {
         entry.lastSuccessAt = new Date().toISOString();
         entry.lastExitCode = 0;
+        entry.retryAttemptCount = 0;
         entry.nextRunAt = computeNextOccurrence(new Date(), job.publishTime).toISOString();
         clearRandomizedExecution(entry);
         log(`[${job.id}] 本轮任务成功，下一次执行时间 ${entry.nextRunAt}`);
       } else {
+        hasFailure = true;
+        failedJobs.push(`${job.id}:${exitCode}`);
         entry.lastFailureAt = new Date().toISOString();
         entry.lastExitCode = exitCode;
-        entry.nextRunAt = new Date(Date.now() + retryMinutes * 60 * 1000).toISOString();
+        entry.retryAttemptCount = Number(entry.retryAttemptCount ?? 0) + 1;
+        const retryDelayMinutes = computeRetryDelayMinutes(
+          retryMinutes,
+          retryBackoffMultiplier,
+          retryMaxMinutes,
+          entry.retryAttemptCount,
+        );
+        entry.nextRunAt = new Date(Date.now() + retryDelayMinutes * 60 * 1000).toISOString();
+        log(`[${job.id}] retry scheduled: attempt=${entry.retryAttemptCount}, delayMinutes=${retryDelayMinutes}`);
         log(`[${job.id}] 本轮任务失败，exit=${exitCode}，将在 ${entry.nextRunAt} 重试`);
       }
       latestState.jobs[job.id] = entry;
@@ -509,7 +563,35 @@ async function main() {
     forceRunNow = false;
 
     if (args.once) {
+      if (hasFailure && args.retryUntilSuccess) {
+        const pendingRetryJobs = getPendingRetryJobs(jobs, latestState.jobs);
+        const nextRetry = pendingRetryJobs
+          .slice()
+          .sort((left, right) => left.nextRetryAt.getTime() - right.nextRetryAt.getTime())[0];
+
+        if (nextRetry) {
+          const waitMs = Math.max(0, nextRetry.nextRetryAt.getTime() - Date.now());
+          const retrySummary = pendingRetryJobs
+            .map(({ job, retryAttemptCount, nextRetryAt }) => {
+              const attemptLabel = retryAttemptCount > 0 ? retryAttemptCount : 1;
+              return `${job.id}(retry=${attemptLabel}, at=${nextRetryAt.toISOString()})`;
+            })
+            .join(", ");
+          log(`retry-until-success active: ${retrySummary}`);
+          if (waitMs > 0) {
+            log(`waiting ${Math.ceil(waitMs / 1000)} seconds before next retry loop`);
+            await sleep(waitMs);
+          }
+          continue;
+        }
+      }
+      if (failedJobs.length > 0) {
+        log(`单轮执行存在失败任务：${failedJobs.join(", ")}`);
+      }
       log("完成单轮检查，调度器退出");
+      if (hasFailure) {
+        process.exitCode = 1;
+      }
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, tickSeconds * 1000));

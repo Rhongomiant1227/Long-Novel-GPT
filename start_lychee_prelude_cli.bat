@@ -76,7 +76,7 @@ echo Min chars: 500000
 echo Force finish chars: 1000000
 echo Target chars: 1000000
 echo Max chars: 1200000
-echo Critic: gpt/gpt-5.4 xhigh on batch tail, unlimited until clean or stalled
+echo Critic: gpt/gpt-5.4 high on batch tail, unlimited until clean or stalled
 echo.
 echo This window shows live LLM output and auto-restarts on crashes or stalls.
 echo Close this window to stop the watchdog.
@@ -102,12 +102,14 @@ echo.
   --summary-reasoning-effort low ^
   --critic-model gpt/gpt-5.4 ^
   --critic-every-chapters 0 ^
-  --critic-reasoning-effort xhigh ^
+  --critic-reasoning-effort high ^
   --critic-max-passes 0 ^
   --max-thread-num 1 ^
   --max-retries 0 ^
   --retry-backoff-seconds 15 ^
   --stall-timeout-seconds 480 ^
+  --runner-heartbeat-grace-seconds 1200 ^
+  --max-silent-seconds 2400 ^
   --restart-delay-seconds 15 ^
   --max-stage-runtime-seconds 0 %*
 

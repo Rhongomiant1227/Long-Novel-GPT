@@ -78,12 +78,16 @@ def build_runner_args(project_dir: Path, args: argparse.Namespace) -> SimpleName
         critic_every_chapters=1,
         critic_reasoning_effort=args.critic_reasoning_effort,
         critic_max_passes=args.critic_max_passes,
+        ending_polish_model='',
+        ending_polish_reasoning_effort='high',
+        ending_polish_max_cycles=2,
         max_thread_num=1,
         max_retries=args.max_retries,
         retry_backoff_seconds=args.retry_backoff_seconds,
         max_chapters=0,
         live_stream=args.live_stream,
         evaluate_completion_only=False,
+        title_only_story=bool(getattr(args, 'title_only_story', False)),
     )
 
 
@@ -93,11 +97,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--chapters', default='', help='Comma/range chapter list, e.g. 12,18-20')
     parser.add_argument('--all-completed', action='store_true')
     parser.add_argument('--critic-model', default='')
-    parser.add_argument('--critic-reasoning-effort', default='xhigh')
+    parser.add_argument('--critic-reasoning-effort', default='high')
     parser.add_argument('--critic-max-passes', type=int, default=3)
     parser.add_argument('--max-retries', type=int, default=0)
     parser.add_argument('--retry-backoff-seconds', type=int, default=15)
     parser.add_argument('--live-stream', action='store_true')
+    parser.add_argument('--title-only-story', action='store_true')
     return parser.parse_args()
 
 
@@ -140,7 +145,12 @@ def main() -> int:
             }
 
             revised_text = runner.apply_chapter_critic(chapter, plot_text, draft_text, force=True)
-            revised_text = normalize_chapter_draft_text(chapter_number, chapter['title'], revised_text)
+            revised_text = normalize_chapter_draft_text(
+                chapter_number,
+                chapter['title'],
+                revised_text,
+                heading_mode=runner._draft_heading_mode(),
+            )
 
             if revised_text != draft_text:
                 write_text(draft_path, revised_text)

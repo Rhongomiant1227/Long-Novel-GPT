@@ -1,25 +1,93 @@
 {
+  "taskSchedule": {
+    "taskName": "LongNovelFanqieDailyUpload",
+    "startTime": "18:00",
+    "days": [
+      "MON",
+      "TUE",
+      "WED",
+      "THU",
+      "FRI",
+      "SAT",
+      "SUN"
+    ]
+  },
+  "authorCheckIn": {
+    "enabled": true,
+    "runAfterUpload": true,
+    "taskName": "LongNovelFanqieAuthorCheckIn",
+    "startTime": "18:00",
+    "days": [
+      "MON",
+      "TUE",
+      "WED",
+      "THU",
+      "FRI",
+      "SAT",
+      "SUN"
+    ],
+    "profileDir": ".run/fanqie_author_checkin_profile",
+    "artifactsDir": ".run/fanqie_author_checkin_artifacts"
+  },
   "tickSeconds": 30,
   "retryMinutes": 30,
+  "retryBackoffMultiplier": 2,
+  "retryMaxMinutes": 360,
   "logFile": ".run/fanqie_daily_scheduler.log",
   "stateFile": ".run/fanqie_daily_scheduler_state.json",
   "defaults": {
     "startUrl": "https://fanqienovel.com/main/writer/?enter_from=author_zone",
+    "aiUsage": "no",
     "headless": true,
     "seedProfileDir": "%USERPROFILE%/.openclaw/browser/openclaw/user-data",
     "profileRoot": ".run/fanqie_daily_profiles",
     "artifactsRoot": ".run/fanqie_daily_artifacts",
-    "chaptersPerRun": 1,
-    "publishTime": "12:00"
+    "publishWindowMinutes": 120,
+    "publishTime": "18:00",
+    "chaptersPerRunByWeekday": {
+      "mon": 3,
+      "tue": 3,
+      "wed": 3,
+      "thu": 3,
+      "fri": 3,
+      "sat": 3,
+      "sun": 3
+    }
   },
   "jobs": [
     {
       "id": "inscribed_immortal",
       "enabled": true,
       "bookTitle": "删史成仙",
+      "aiUsage": "no",
       "chaptersDir": "auto_projects/inscribed_immortal/manuscript/chapters_txt",
-      "publishTime": "12:00",
-      "chaptersPerRun": 1
+      "publishTime": "18:00",
+      "chaptersPerRunByWeekday": {
+        "mon": 3,
+        "tue": 3,
+        "wed": 3,
+        "thu": 3,
+        "fri": 3,
+        "sat": 3,
+        "sun": 3
+      }
+    },
+    {
+      "id": "crowd_blackbox",
+      "enabled": true,
+      "bookTitle": "众生黑匣",
+      "aiUsage": "no",
+      "chaptersDir": "auto_projects/crowd_blackbox/manuscript/chapters_txt",
+      "publishTime": "18:00",
+      "chaptersPerRunByWeekday": {
+        "mon": 3,
+        "tue": 3,
+        "wed": 3,
+        "thu": 3,
+        "fri": 3,
+        "sat": 3,
+        "sun": 3
+      }
     }
   ]
 }

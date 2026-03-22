@@ -1,10 +1,15 @@
 ﻿param(
     [string]$ConfigPath = '',
-    [string]$Action = ''
+    [string]$Action = '',
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$ExtraArgs
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+    $PSNativeCommandUseErrorActionPreference = $false
+}
 [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -19,7 +24,24 @@ if (-not $taskSchedule) {
 }
 
 $taskName = [string]$taskSchedule.taskName
+$authorCheckIn = $config.authorCheckIn
+$authorCheckInEnabled = $false
+$authorCheckInRunsAfterUpload = $false
+if ($authorCheckIn) {
+    $authorCheckInEnabled = ($authorCheckIn.enabled -ne $false)
+    $authorCheckInRunsAfterUpload = ($authorCheckInEnabled -and $authorCheckIn.runAfterUpload -eq $true)
+}
+$authorTaskName = if ($authorCheckIn) {
+    if ($authorCheckIn.taskName) {
+        [string]$authorCheckIn.taskName
+    } else {
+        "$taskName-AuthorCheckIn"
+    }
+} else {
+    ''
+}
 $runner = Join-Path $repoRoot 'run_daily_fanqie_uploads_once.bat'
+$authorRunner = Join-Path $repoRoot 'run_daily_fanqie_author_checkin_once.bat'
 $installer = Join-Path $repoRoot 'scripts\install_fanqie_daily_task.ps1'
 
 function Write-Section {
@@ -103,14 +125,16 @@ function Format-WeekdayList {
 }
 
 function Get-TaskStatusText {
-    $output = & schtasks /Query /TN $taskName /V /FO LIST 2>&1
+    param([string]$TaskNameForQuery)
+
+    $output = & cmd.exe /d /c schtasks /Query /TN $TaskNameForQuery /V /FO LIST 2>&1
     if ($LASTEXITCODE -ne 0) {
-        return "未找到计划任务：$taskName`n$output"
+        return "未找到计划任务：$TaskNameForQuery`n$output"
     }
 
     $map = Parse-TaskQueryOutput $output
     $summary = @(
-        ("任务名称：{0}" -f (Get-FieldValue $map @('TaskName') $taskName)),
+        ("任务名称：{0}" -f (Get-FieldValue $map @('TaskName') $TaskNameForQuery)),
         ("下次运行时间：{0}" -f (Translate-TaskValue (Get-FieldValue $map @('Next Run Time') '未提供'))),
         ("当前状态：{0}" -f (Translate-TaskValue (Get-FieldValue $map @('Status') '未提供'))),
         ("启用状态：{0}" -f (Translate-TaskValue (Get-FieldValue $map @('Scheduled Task State') '未提供'))),
@@ -125,6 +149,30 @@ function Get-TaskStatusText {
         ("作者：{0}" -f (Get-FieldValue $map @('Author') '未提供'))
     )
     return ($summary -join [Environment]::NewLine)
+}
+
+function Get-ManagedTasks {
+    $tasks = @(
+        @{
+            Key = 'upload'
+            Label = '上传任务'
+            TaskName = $taskName
+            Runner = $runner
+            ConfigEnabled = $true
+        }
+    )
+
+    if ($authorCheckIn -and $authorCheckInEnabled -and -not $authorCheckInRunsAfterUpload) {
+        $tasks += @{
+            Key = 'checkin'
+            Label = '签到修复任务'
+            TaskName = $authorTaskName
+            Runner = $authorRunner
+            ConfigEnabled = $true
+        }
+    }
+
+    return $tasks
 }
 
 function Format-WeekdayCounts {
@@ -199,17 +247,43 @@ function Format-AIUsage {
 function Show-Status {
     Write-Output "番茄日更计划任务管理器"
     Write-Output "配置文件：$resolvedConfig"
-    Write-Output "单次执行脚本：$runner"
+    Write-Output "上传执行脚本：$runner"
+    if ($authorCheckIn) {
+        Write-Output "签到执行脚本：$authorRunner"
+    }
     Write-Output "如需修改每周执行日期或每本书的发章数量，请直接编辑上面的配置文件。"
 
-    Write-Section '当前任务状态'
-    Write-Output (Get-TaskStatusText)
+    foreach ($managedTask in @(Get-ManagedTasks)) {
+        Write-Section ("当前状态 - {0}" -f $managedTask.Label)
+        Write-Output (Get-TaskStatusText -TaskNameForQuery $managedTask.TaskName)
+    }
+    if ($authorCheckInRunsAfterUpload) {
+        Write-Section '当前状态 - 签到修复'
+        Write-Output '执行方式：跟随上传任务串行执行'
+        Write-Output ("关联上传任务：{0}" -f $taskName)
+        Write-Output ("独立计划任务：不注册（原任务名：{0}）" -f $authorTaskName)
+        Write-Output '触发条件：上传任务全部成功完成后立即执行'
+    }
 
     Write-Section '配置摘要'
     Write-Output ("任务名称：{0}" -f $taskName)
     Write-Output ("每周执行日：{0}" -f (Format-WeekdayList @($taskSchedule.days)))
     Write-Output ("开始时间：{0}" -f $taskSchedule.startTime)
     Write-Output ("默认随机窗口：{0} 分钟" -f $config.defaults.publishWindowMinutes)
+    if ($authorCheckIn) {
+        $checkInDays = if ($authorCheckIn.days) { @($authorCheckIn.days) } else { @($taskSchedule.days) }
+        $checkInStartTime = if ($authorCheckIn.startTime) { [string]$authorCheckIn.startTime } else { '02:50' }
+        $checkInEnabled = if ($authorCheckInEnabled) { '是' } else { '否' }
+        Write-Output ("签到修复已启用：{0}" -f $checkInEnabled)
+        if ($authorCheckInRunsAfterUpload) {
+            Write-Output '签到修复模式：跟随上传任务执行'
+            Write-Output '签到修复触发时机：两篇小说上传完成之后立即执行'
+            Write-Output ("独立计划任务：不注册（配置中的开始时间 {0} 仅作兼容保留）" -f $checkInStartTime)
+        } else {
+            Write-Output ("签到修复执行日：{0}" -f (Format-WeekdayList $checkInDays))
+            Write-Output ("签到修复开始时间：{0}" -f $checkInStartTime)
+        }
+    }
     foreach ($job in @($config.jobs)) {
         $jobWindowProp = $job.PSObject.Properties['publishWindowMinutes']
         $window = if ($jobWindowProp -and $null -ne $jobWindowProp.Value) { $jobWindowProp.Value } else { $config.defaults.publishWindowMinutes }
@@ -217,42 +291,64 @@ function Show-Status {
     }
 }
 
-function Enable-Task {
-    $output = & schtasks /Change /TN $taskName /ENABLE 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw ($output -join [Environment]::NewLine)
+function Change-TaskState {
+    param(
+        [ValidateSet('ENABLE', 'DISABLE')]
+        [string]$Mode
+    )
+
+    foreach ($managedTask in @(Get-ManagedTasks)) {
+        if (-not $managedTask.ConfigEnabled) {
+            continue
+        }
+
+        $output = & cmd.exe /d /c schtasks /Change /TN $managedTask.TaskName /$Mode 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw ($output -join [Environment]::NewLine)
+        }
+
+        $actionText = if ($Mode -eq 'ENABLE') { '启用' } else { '禁用' }
+        Write-Output ("已{0}计划任务：{1}" -f $actionText, $managedTask.TaskName)
     }
-    Write-Output ("已启用计划任务：{0}" -f $taskName)
+}
+
+function Enable-Task {
+    Change-TaskState -Mode 'ENABLE'
 }
 
 function Disable-Task {
-    $output = & schtasks /Change /TN $taskName /DISABLE 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw ($output -join [Environment]::NewLine)
-    }
-    Write-Output ("已禁用计划任务：{0}" -f $taskName)
+    Change-TaskState -Mode 'DISABLE'
 }
 
 function Reinstall-Task {
-    powershell -ExecutionPolicy Bypass -File $installer -ConfigPath $resolvedConfig | Out-Host
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -ConfigPath $resolvedConfig | Out-Host
 }
 
 function Run-OnceNow {
-    cmd /c $runner --skip-delay | Out-Host
+    & cmd /c $runner --skip-delay @ExtraArgs | Out-Host
 }
 
 function Run-OneChapterNow {
-    cmd /c $runner --skip-delay --chapter-count 1 | Out-Host
+    & cmd /c $runner --skip-delay --chapter-count 1 @ExtraArgs | Out-Host
+}
+
+function Run-CheckInNow {
+    if (-not $authorCheckIn) {
+        throw '当前配置中未定义 authorCheckIn。'
+    }
+    & cmd /c $authorRunner @ExtraArgs | Out-Host
 }
 
 function Invoke-Action {
     param([string]$Name)
+
     switch ($Name.ToLowerInvariant()) {
         'enable' { Enable-Task; return }
         'disable' { Disable-Task; return }
         'reinstall' { Reinstall-Task; return }
         'run' { Run-OnceNow; return }
         'run-one' { Run-OneChapterNow; return }
+        'run-checkin' { Run-CheckInNow; return }
         'status' { Show-Status; return }
         default { throw "未知动作：$Name" }
     }
@@ -265,8 +361,10 @@ if ($Action) {
     }
     Invoke-Action $Action
     if ($normalizedAction -ne 'status') {
-        Write-Section '执行后状态'
-        Write-Output (Get-TaskStatusText)
+        foreach ($managedTask in @(Get-ManagedTasks)) {
+            Write-Section ("执行后状态 - {0}" -f $managedTask.Label)
+            Write-Output (Get-TaskStatusText -TaskNameForQuery $managedTask.TaskName)
+        }
     }
     exit 0
 }
@@ -277,9 +375,10 @@ while ($true) {
     Write-Output '[1] 启用任务'
     Write-Output '[2] 禁用任务'
     Write-Output '[3] 重新安装或更新任务'
-    Write-Output '[4] 立即执行一次'
+    Write-Output '[4] 立即执行一次上传'
     Write-Output '[5] 立即只发一章'
-    Write-Output '[6] 刷新状态'
+    Write-Output '[6] 立即执行签到修复'
+    Write-Output '[7] 刷新状态'
     Write-Output '[Q] 退出'
     try {
         $choice = Read-Host '请选择'
@@ -295,7 +394,8 @@ while ($true) {
         '3' { Reinstall-Task; Start-Sleep -Seconds 1 }
         '4' { Run-OnceNow; Read-Host '按回车键返回' | Out-Null }
         '5' { Run-OneChapterNow; Read-Host '按回车键返回' | Out-Null }
-        '6' { }
+        '6' { Run-CheckInNow; Read-Host '按回车键返回' | Out-Null }
+        '7' { }
         'Q' { break }
         default { Write-Host "无效选项：$choice"; Start-Sleep -Seconds 1 }
     }

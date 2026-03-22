@@ -170,6 +170,9 @@ def build_child_command(args: argparse.Namespace) -> list[str]:
         '--critic-every-chapters', str(args.critic_every_chapters),
         '--critic-reasoning-effort', args.critic_reasoning_effort,
         '--critic-max-passes', str(args.critic_max_passes),
+        '--ending-polish-model', args.ending_polish_model,
+        '--ending-polish-reasoning-effort', args.ending_polish_reasoning_effort,
+        '--ending-polish-max-cycles', str(args.ending_polish_max_cycles),
         '--max-thread-num', str(args.max_thread_num),
         '--max-retries', str(args.max_retries),
         '--retry-backoff-seconds', str(args.retry_backoff_seconds),
@@ -177,6 +180,8 @@ def build_child_command(args: argparse.Namespace) -> list[str]:
     ]
     if args.max_chapters:
         command.extend(['--max-chapters', str(args.max_chapters)])
+    if args.title_only_story:
+        command.append('--title-only-story')
     return command
 
 
@@ -354,7 +359,7 @@ def run_once(args: argparse.Namespace, state_path: Path) -> bool:
         f'chapters={state_snapshot["generated_chapters"]}, chars={state_snapshot["generated_chars"]}, '
         f'next={state_snapshot["next_chapter_number"]}'
     )
-    return state_snapshot['status'] == 'completed'
+    return state_snapshot['status'] in {'completed', 'manual_review_required'}
 
 
 def parse_args() -> argparse.Namespace:
@@ -382,18 +387,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--summary-reasoning-effort', default='low')
     parser.add_argument('--critic-model', default='gpt/gpt-5.4')
     parser.add_argument('--critic-every-chapters', type=int, default=0)
-    parser.add_argument('--critic-reasoning-effort', default='xhigh')
+    parser.add_argument('--critic-reasoning-effort', default='high')
     parser.add_argument('--critic-max-passes', type=int, default=0)
+    parser.add_argument('--ending-polish-model', default='gpt/gpt-5.4')
+    parser.add_argument('--ending-polish-reasoning-effort', default='high')
+    parser.add_argument('--ending-polish-max-cycles', type=int, default=2)
     parser.add_argument('--max-thread-num', type=int, default=1)
     parser.add_argument('--max-retries', type=int, default=0)
     parser.add_argument('--retry-backoff-seconds', type=int, default=15)
     parser.add_argument('--max-chapters', type=int, default=0)
-    parser.add_argument('--stall-timeout-seconds', type=int, default=480)
+    parser.add_argument('--title-only-story', action='store_true')
+    parser.add_argument('--stall-timeout-seconds', type=int, default=600)
     parser.add_argument('--restart-delay-seconds', type=int, default=15)
     parser.add_argument('--heartbeat-interval-seconds', type=int, default=30)
-    parser.add_argument('--runner-heartbeat-grace-seconds', type=int, default=90)
+    parser.add_argument('--runner-heartbeat-grace-seconds', type=int, default=1200)
     parser.add_argument('--max-stage-runtime-seconds', type=int, default=0)
-    parser.add_argument('--max-silent-seconds', type=int, default=900)
+    parser.add_argument('--max-silent-seconds', type=int, default=2400)
     args = parser.parse_args()
     args.repo_root = Path(args.repo_root).resolve()
     args.python_exe = Path(args.python_exe).resolve()
@@ -431,9 +440,17 @@ def main() -> int:
 
     try:
         while True:
+            state_snapshot = read_state_snapshot(state_path)
+            if state_snapshot['status'] == 'manual_review_required':
+                log('project already marked manual_review_required; watchdog exits without starting child')
+                return 0
             completed = run_once(args, state_path)
             if completed:
-                log('project completed, watchdog exits')
+                state_snapshot = read_state_snapshot(state_path)
+                if state_snapshot['status'] == 'manual_review_required':
+                    log('project stopped for manual review, watchdog exits')
+                else:
+                    log('project completed, watchdog exits')
                 return 0
             log(f'restarting after {args.restart_delay_seconds}s')
             time.sleep(args.restart_delay_seconds)

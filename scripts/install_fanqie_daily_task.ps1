@@ -6,6 +6,9 @@
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+    $PSNativeCommandUseErrorActionPreference = $false
+}
 [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -27,11 +30,19 @@ if (-not $days.Count) {
     throw "配置文件中的 taskSchedule.days 为空：$resolvedConfig"
 }
 $daysValue = ($days | ForEach-Object { $_.ToString().ToUpperInvariant() }) -join ','
+$authorCheckIn = $config.authorCheckIn
+$authorCheckInEnabled = $false
+$authorCheckInRunsAfterUpload = $false
+if ($authorCheckIn) {
+    $authorCheckInEnabled = ($authorCheckIn.enabled -ne $false)
+    $authorCheckInRunsAfterUpload = ($authorCheckInEnabled -and $authorCheckIn.runAfterUpload -eq $true)
+}
 
 $runner = Join-Path $repoRoot 'run_daily_fanqie_uploads_once.bat'
 if (-not (Test-Path $runner)) {
     throw "未找到单次执行脚本：$runner"
 }
+$authorRunner = Join-Path $repoRoot 'run_daily_fanqie_author_checkin_once.bat'
 
 function Parse-TaskQueryOutput {
     param([string[]]$Lines)
@@ -131,31 +142,108 @@ function Format-TaskSummary {
     )
 }
 
-$createArgs = @(
-    '/Create',
-    '/SC', 'WEEKLY',
-    '/D', $daysValue,
-    '/ST', $startTimeValue,
-    '/TN', $taskNameValue,
-    '/TR', $runner,
-    '/F'
-)
+function Normalize-Days {
+    param(
+        [object]$RawDays,
+        [string[]]$FallbackDays
+    )
 
-$queryArgs = @(
-    '/Query',
-    '/TN', $taskNameValue,
-    '/V',
-    '/FO', 'LIST'
-)
-
-$createOutput = & schtasks @createArgs 2>&1
-if ($LASTEXITCODE -ne 0) {
-    throw ($createOutput -join [Environment]::NewLine)
+    $resolved = @($RawDays)
+    if (-not $resolved.Count) {
+        $resolved = @($FallbackDays)
+    }
+    if (-not $resolved.Count) {
+        throw '计划任务执行日不能为空。'
+    }
+    return @($resolved | ForEach-Object { $_.ToString().ToUpperInvariant() })
 }
 
-$queryOutput = & schtasks @queryArgs 2>&1
-if ($LASTEXITCODE -ne 0) {
-    throw ($queryOutput -join [Environment]::NewLine)
+function Register-WeeklyTask {
+    param(
+        [string]$TaskNameForCreate,
+        [string]$StartTimeForCreate,
+        [string[]]$DaysForCreate,
+        [string]$RunnerPath
+    )
+
+    $createArgs = @(
+        '/Create',
+        '/SC', 'WEEKLY',
+        '/D', ($DaysForCreate -join ','),
+        '/ST', $StartTimeForCreate,
+        '/TN', $TaskNameForCreate,
+        '/TR', $RunnerPath,
+        '/F'
+    )
+
+    $queryArgs = @(
+        '/Query',
+        '/TN', $TaskNameForCreate,
+        '/V',
+        '/FO', 'LIST'
+    )
+
+    $createOutput = & schtasks @createArgs 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw ($createOutput -join [Environment]::NewLine)
+    }
+
+    $queryOutput = & schtasks @queryArgs 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw ($queryOutput -join [Environment]::NewLine)
+    }
+
+    return $queryOutput
+}
+
+function Remove-TaskIfExists {
+    param([string]$TaskNameForDelete)
+
+    $queryOutput = & schtasks /Query /TN $TaskNameForDelete /FO LIST 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        return $false
+    }
+
+    $deleteOutput = & schtasks /Delete /TN $TaskNameForDelete /F 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw ($deleteOutput -join [Environment]::NewLine)
+    }
+    return $true
+}
+
+$queryOutput = Register-WeeklyTask -TaskNameForCreate $taskNameValue -StartTimeForCreate $startTimeValue -DaysForCreate (Normalize-Days -RawDays $days -FallbackDays @()) -RunnerPath $runner
+
+$authorTaskSummary = $null
+$authorTaskNameValue = if ($authorCheckIn) {
+    if ($authorCheckIn.taskName) {
+        [string]$authorCheckIn.taskName
+    } else {
+        "$taskNameValue-AuthorCheckIn"
+    }
+} else {
+    ''
+}
+$authorTaskDays = @()
+$authorStartTimeValue = ''
+if ($authorCheckInEnabled -and -not $authorCheckInRunsAfterUpload) {
+    if (-not (Test-Path $authorRunner)) {
+        throw "未找到签到修复执行脚本：$authorRunner"
+    }
+
+    $authorStartTimeValue = if ($authorCheckIn.startTime) { [string]$authorCheckIn.startTime } else { '02:50' }
+    $authorTaskDays = Normalize-Days -RawDays $authorCheckIn.days -FallbackDays $days
+    $authorQueryOutput = Register-WeeklyTask -TaskNameForCreate $authorTaskNameValue -StartTimeForCreate $authorStartTimeValue -DaysForCreate $authorTaskDays -RunnerPath $authorRunner
+    $authorTaskSummary = Format-TaskSummary -TaskNameForDisplay $authorTaskNameValue -QueryOutput $authorQueryOutput
+} elseif ($authorCheckIn) {
+    if (Remove-TaskIfExists -TaskNameForDelete $authorTaskNameValue) {
+        if ($authorCheckInRunsAfterUpload) {
+            $authorTaskSummary = @("签到修复已改为跟随上传任务执行，已删除独立计划任务：$authorTaskNameValue")
+        } else {
+            $authorTaskSummary = @("签到修复任务已按配置删除：$authorTaskNameValue")
+        }
+    } elseif ($authorCheckInRunsAfterUpload) {
+        $authorTaskSummary = @("签到修复已改为跟随上传任务执行，不会单独注册计划任务：$authorTaskNameValue")
+    }
 }
 
 Write-Output "计划任务创建或更新命令已成功执行。"
@@ -164,6 +252,15 @@ Write-Output ("配置文件：{0}" -f $resolvedConfig)
 Write-Output ("执行脚本：{0}" -f $runner)
 Write-Output ("每周执行日：{0}" -f (Format-WeekdayList $days))
 Write-Output ("开始时间：{0}" -f $startTimeValue)
+if ($authorCheckInRunsAfterUpload) {
+    Write-Output "签到修复模式：跟随上传任务串行执行"
+    Write-Output "签到修复触发时机：上传任务成功完成后立即执行"
+}
 Write-Output ""
 Write-Output "当前任务状态："
 Write-Output ((Format-TaskSummary -TaskNameForDisplay $taskNameValue -QueryOutput $queryOutput) -join [Environment]::NewLine)
+if ($authorTaskSummary) {
+    Write-Output ""
+    Write-Output "签到修复任务状态："
+    Write-Output ($authorTaskSummary -join [Environment]::NewLine)
+}

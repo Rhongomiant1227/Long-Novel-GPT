@@ -9,17 +9,13 @@ if /I "%FIRST_ARG%"=="disable" goto run_simple_action
 if /I "%FIRST_ARG%"=="reinstall" goto run_simple_action
 if /I "%FIRST_ARG%"=="run" goto run_simple_action
 if /I "%FIRST_ARG%"=="run-one" goto run_simple_action
+if /I "%FIRST_ARG%"=="run-checkin" goto run_simple_action
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\manage_fanqie_daily_task.ps1" %*
 goto after_run
 
 :run_simple_action
-if not "%~2"=="" goto run_named_args
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\manage_fanqie_daily_task.ps1" -Action "%FIRST_ARG%"
-goto after_run
-
-:run_named_args
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\manage_fanqie_daily_task.ps1" %*
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\manage_fanqie_daily_task.ps1" -Action "%FIRST_ARG%" %2 %3 %4 %5 %6 %7 %8 %9
 
 :after_run
 set "EXIT_CODE=%ERRORLEVEL%"

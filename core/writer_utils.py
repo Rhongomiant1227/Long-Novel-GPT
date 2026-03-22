@@ -155,7 +155,10 @@ def split_text_into_chunks(text, max_chunk_size, min_chunk_n, min_chunk_size=1, 
     paragraphs = split_text_into_paragraphs(text)
 
     assert max_chunk_n >= 1, "max_chunk_n必须大于等于1"
-    assert sum(len(p) for p in paragraphs) >= min_chunk_size, f"分割时，输入的文本长度小于要求的min_chunk_size:{min_chunk_size}"
+    total_len = sum(len(p) for p in paragraphs)
+    if total_len > 0:
+        min_chunk_size = min(min_chunk_size, total_len)
+    assert total_len >= min_chunk_size, f"分割时，输入的文本长度小于要求的min_chunk_size:{min_chunk_size}"
     count = 0 # 防止死循环
     while len(paragraphs) > max_chunk_n or min(len(p) for p in paragraphs) < min_chunk_size:
         assert (count:=count+1) < 1000, "分割进入死循环！"

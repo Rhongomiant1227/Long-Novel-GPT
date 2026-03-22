@@ -1,4 +1,5 @@
 import os
+import re
 from urllib.parse import urlparse, urlunparse
 
 import httpx
@@ -50,6 +51,40 @@ def _normalize_base_url(base_url):
     if parsed.scheme and parsed.netloc and parsed.path in ('', '/'):
         return urlunparse(parsed._replace(path='/v1'))
     return normalized
+
+
+def _exception_chain_text(exc):
+    parts = []
+    current = exc
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        text = str(current).strip()
+        if text:
+            parts.append(text)
+        current = getattr(current, '__cause__', None) or getattr(current, '__context__', None)
+    return ' | '.join(parts)
+
+
+def _normalize_provider_error(exc):
+    combined = _exception_chain_text(exc)
+    lowered = combined.lower()
+    if (
+        'error code: 524' in lowered
+        or 'error 524' in lowered
+        or 'origin web server timed out responding to this request' in lowered
+        or ('cloudflare' in lowered and 'timed out' in lowered)
+        or ('cf-ray' in lowered and '<html' in lowered)
+    ):
+        return 'cloudflare_524_timeout'
+
+    if '<html' in lowered and 'cloudflare' in lowered:
+        return 'cloudflare_gateway_html_error'
+
+    if re.search(r'<html[\s>]', lowered) and re.search(r'</html>', lowered):
+        return 'unexpected_html_gateway_response'
+
+    return None
 
 
 def _build_timeout(timeout=None, streaming=False):
@@ -256,6 +291,14 @@ def _extract_responses_output_text(response):
 
 
 def _is_retryable_responses_stream_error(exc):
+    normalized = _normalize_provider_error(exc)
+    if normalized in {
+        'cloudflare_524_timeout',
+        'cloudflare_gateway_html_error',
+        'unexpected_html_gateway_response',
+    }:
+        return True
+
     current = exc
     seen = set()
     messages = []
@@ -330,6 +373,11 @@ def _create_with_responses_api(
         result_messages[-1]['content'] = final_text
         yield result_messages
         return result_messages
+    except Exception as exc:
+        normalized = _normalize_provider_error(exc)
+        if normalized:
+            raise RuntimeError(normalized) from None
+        raise
     finally:
         response_client.close()
 
@@ -385,11 +433,14 @@ def _stream_chat_with_responses_api(
             yield result_messages
             return result_messages
     except Exception as exc:
+        normalized = _normalize_provider_error(exc)
         if not _is_retryable_responses_stream_error(exc):
+            if normalized:
+                raise RuntimeError(normalized) from None
             raise
 
         result_messages.stream_fallback = True
-        result_messages.stream_fallback_reason = str(exc)
+        result_messages.stream_fallback_reason = normalized or str(exc)
 
         if content:
             result_messages[-1]['content'] = content

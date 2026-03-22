@@ -43,6 +43,13 @@ def _load_openai_fallback_env():
             os.environ['GPT_API_KEY'] = api_key
             break
 
+    # Keep direct CLI/script invocations aligned with the project start scripts.
+    # Without this fallback, ad-hoc python runs can silently hit the official
+    # OpenAI endpoint and fail on region restrictions instead of using the proxy
+    # endpoint already standardized for this repository.
+    if not os.getenv('GPT_BASE_URL', '').strip():
+        os.environ['GPT_BASE_URL'] = 'https://fast.vpsairobot.com/v1'
+
 
 def _read_int_env(name):
     value = os.getenv(name, '').strip()
