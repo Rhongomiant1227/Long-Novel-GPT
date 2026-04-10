@@ -43,6 +43,11 @@ def _read_non_empty_env(name):
     return value or None
 
 
+def _env_flag_enabled(name):
+    value = os.getenv(name, '').strip().lower()
+    return value in {'1', 'true', 'yes', 'on'}
+
+
 def _normalize_base_url(base_url):
     if not base_url:
         return base_url
@@ -156,7 +161,22 @@ def _prepare_request_messages(messages, model):
     return request_messages
 
 
-def _should_use_responses_api(model, response_json, n):
+def _should_disable_responses_api(base_url):
+    if _env_flag_enabled('GPT_DISABLE_RESPONSES_API'):
+        return True
+
+    normalized = str(base_url or '').strip().lower()
+    if not normalized:
+        return False
+
+    # Some third-party OpenAI-compatible gateways expose /responses but return
+    # empty bodies for text output. Fall back to chat.completions for those.
+    return 'ananapi.com' in normalized
+
+
+def _should_use_responses_api(model, response_json, n, base_url=None):
+    if _should_disable_responses_api(base_url):
+        return False
     return model.startswith('gpt-5') and not response_json and n == 1
 
 
@@ -487,7 +507,7 @@ def stream_chat_with_gpt(
     result_messages = ChatMessages([dict(message) for message in request_messages], model=model)
     result_messages.append({'role': 'assistant', 'content': ['' for _ in range(n)] if n > 1 else ''})
 
-    if _should_use_responses_api(model, response_json, n):
+    if _should_use_responses_api(model, response_json, n, base_url=base_url):
         if _should_bypass_responses_stream(reasoning_effort, output_token_limit):
             yield from _create_with_responses_api(
                 request_messages=request_messages,
