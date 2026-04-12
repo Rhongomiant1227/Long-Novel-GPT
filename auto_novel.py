@@ -18,6 +18,7 @@ from typing import Any, Callable, Iterable
 
 from backend.backend_utils import get_model_config_from_provider_model
 from core.draft_writer import DraftWriter
+from core.novel_memory_retrieval import NovelMemoryRetrieval
 from core.outline_writer import OutlineWriter
 from core.plot_writer import PlotWriter
 from core.writer_utils import KeyPointMsg
@@ -45,6 +46,14 @@ PROJECT_ROLE_ONLY_RULES: dict[str, dict[str, Any]] = {
 
 DEFAULT_SYSTEM_PROMPT = "你是资深中文网文总编、商业策划和长篇连载统筹。"
 
+MEMORY_RETRIEVAL_ROOM_LABELS = {
+    'brief': '立项设定',
+    'series_bible': '完整圣经',
+    'series_bible_short': '圣经短版',
+    'story_memory': '故事记忆',
+    'chapter_summary': '章节摘要',
+}
+
 ENDING_CRAFT_RESEARCH_SUMMARY = """
 【外部收尾经验摘要】
 - 读者对故事的最终记忆会被峰值场面与最后收束显著放大；高潮之后若继续重复落锤、反复解释，会快速磨损整本书的尾劲。
@@ -54,6 +63,15 @@ ENDING_CRAFT_RESEARCH_SUMMARY = """
 - 余味不是靠关键义务悬而不决制造出来的，而是在主线已兑现后，只留下少量让读者自己停留和回想的空间。
 - 最后一屏最好是一个可停留的具体画面、动作、选择或反讽，而不是“从此以后制度如何运行”的继续讲解。
 """.strip()
+
+CHAPTER_TERMINAL_TAIL_CHARS = frozenset('。！？!?…」』】）》〉）〕”’"\'')
+CHAPTER_DANGLING_TAIL_SUFFIXES = (
+    '的', '了', '在', '把', '将', '向', '跟', '和', '与', '及', '或', '并', '便', '却',
+    '又', '更', '还', '正', '仍', '像', '让', '给', '对', '从', '往', '朝', '到',
+    '这', '那', '这时', '此时', '其中',
+)
+COUNTDOWN_TAIL_RE = re.compile(r'^\d{1,2}:\d{2}(?::\d{2})?$')
+PROGRESS_TAIL_KEYWORDS = ('进行中', '进度')
 
 
 def now_str() -> str:
@@ -113,7 +131,110 @@ def sanitize_project_text(text: str, *, project_name: str = '', path: Path | Non
 
 def write_text(path: Path, text: str) -> None:
     ensure_dir(path.parent)
-    path.write_text(sanitize_project_text(text, path=path), encoding='utf-8')
+    sanitized = sanitize_project_text(text, path=path)
+    tmp_path = path.with_name(f'.{path.name}.{os.getpid()}.{threading.get_ident()}.tmp')
+    try:
+        with tmp_path.open('w', encoding='utf-8', newline='') as handle:
+            handle.write(sanitized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        replace_with_retry(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def replace_with_retry(tmp_path: Path, target_path: Path, *, attempts: int = 8, base_delay: float = 0.15) -> None:
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            tmp_path.replace(target_path)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            if attempt >= attempts - 1:
+                raise
+            time.sleep(base_delay * (attempt + 1))
+    if last_error is not None:
+        raise last_error
+
+
+def assess_chapter_tail_integrity(body_text: str) -> dict[str, Any]:
+    lines = [line.strip() for line in (body_text or '').splitlines() if line.strip()]
+    if not lines:
+        return {
+            'suspicious': True,
+            'high_confidence': True,
+            'reason': 'empty_body',
+            'tail': '',
+        }
+
+    tail = lines[-1].strip()
+    if not tail:
+        return {
+            'suspicious': True,
+            'high_confidence': True,
+            'reason': 'empty_tail',
+            'tail': '',
+        }
+
+    if COUNTDOWN_TAIL_RE.fullmatch(tail):
+        return {
+            'suspicious': True,
+            'high_confidence': False,
+            'reason': 'countdown_tail',
+            'tail': tail,
+        }
+
+    if '%' in tail and any(keyword in tail for keyword in PROGRESS_TAIL_KEYWORDS):
+        return {
+            'suspicious': True,
+            'high_confidence': False,
+            'reason': 'progress_tail',
+            'tail': tail,
+        }
+
+    if tail.endswith('——') or tail.endswith('—'):
+        return {
+            'suspicious': False,
+            'high_confidence': False,
+            'reason': 'cliffhanger_dash_tail',
+            'tail': tail,
+        }
+
+    if tail[-1] in CHAPTER_TERMINAL_TAIL_CHARS or re.search(r'(?:\.{3,}|…+)$', tail):
+        return {
+            'suspicious': False,
+            'high_confidence': False,
+            'reason': 'complete',
+            'tail': tail,
+        }
+
+    if len(tail) <= 4:
+        reason = 'very_short_tail'
+    elif re.search(r'[，、：；,:（(【「『《“‘—-]$', tail):
+        reason = 'open_clause_tail'
+    elif (
+        tail.count('“') > tail.count('”')
+        or tail.count('‘') > tail.count('’')
+        or tail.count('「') > tail.count('」')
+        or tail.count('『') > tail.count('』')
+    ):
+        reason = 'unclosed_quote_tail'
+    elif any(tail.endswith(token) for token in CHAPTER_DANGLING_TAIL_SUFFIXES):
+        reason = 'dangling_suffix_tail'
+    else:
+        reason = 'mid_sentence_tail'
+
+    return {
+        'suspicious': True,
+        'high_confidence': True,
+        'reason': reason,
+        'tail': tail,
+    }
 
 
 def truncate_text(text: str, limit: int) -> str:
@@ -328,6 +449,8 @@ SHORT_STORY_BIBLE_PART_SPECS = [
 
 
 CHAPTER_NUMBER_TOKEN_RE = r'[\d零〇一二两三四五六七八九十百千万IVXLCDMivxlcdmⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]+'
+MAX_CHAPTER_TITLE_LENGTH = 30
+MAX_EXTRACTED_TITLE_LENGTH = 12
 CHAPTER_HEADING_PATTERNS = (
     re.compile(
         rf'^\s*第\s*(?P<number>{CHAPTER_NUMBER_TOKEN_RE})\s*章(?:\s+|[：:，,、.．。—-]\s*)?(?P<title>.*)$',
@@ -347,6 +470,69 @@ ROMAN_NUMERAL_VALUES = {
     'D': 500,
     'M': 1000,
 }
+TITLE_SENTENCE_SPLIT_RE = re.compile(r'[，,。！？；：]')
+TITLE_OUTER_PUNCTUATION = ' \t\r\n-—:：，,、.．。;；“”‘’"\'《》()（）[]【】'
+TITLE_NOISE_PREFIXES = (
+    '本章核心目标是',
+    '本章目标是',
+    '本章核心任务是',
+    '本章任务是',
+    '章节标题',
+    '章末钩子是',
+    '章末钩子',
+    '阶段性爽点在于',
+    '阶段性爽点',
+    '人物关系推进上',
+    '人物关系上',
+    '推进上',
+    '阻力来自',
+    '变化在于',
+    '已锁定的',
+    '刚写入的',
+    '刚挂起的',
+    '回传的',
+    '抢下的',
+    '追出的',
+    '解出的',
+    '暴露出的',
+    '发现的',
+    '逼出的',
+    '逼近的',
+    '浮出的',
+    '跳出的',
+    '卡住的',
+    '留下的',
+    '完成的',
+    '形成的',
+    '立下的',
+    '吐出的',
+    '末尾露出的',
+    '得到的',
+    '出现的',
+    '确认的',
+)
+GENERIC_TITLE_EXACT = {
+    '本章目标',
+    '本章大纲',
+    '本章大纲内容',
+    '本章内容',
+    '当前目标',
+    '明确目标',
+    '章节标题',
+    '线索',
+    '目标',
+    '内容',
+}
+GENERIC_TITLE_PREFIXES = (
+    '本章',
+    '当前',
+    '阶段',
+    '明确',
+    '核心',
+    '主要',
+    '本回',
+    '本节',
+)
 
 
 def parse_chinese_number_token(text: str) -> int | None:
@@ -431,6 +617,57 @@ def parse_chapter_heading_line(text: str) -> tuple[int | None, str]:
     return None, line
 
 
+def clean_title_fragment(text: str) -> str:
+    normalized = re.sub(r'\s+', ' ', text or '').strip()
+    return normalized.strip(TITLE_OUTER_PUNCTUATION)
+
+
+def is_preferred_title_candidate(text: str, *, allow_long: bool = False) -> bool:
+    candidate = clean_title_fragment(text)
+    if not candidate:
+        return False
+    if candidate in GENERIC_TITLE_EXACT:
+        return False
+    if any(candidate.startswith(prefix) for prefix in GENERIC_TITLE_PREFIXES):
+        return False
+    if candidate.endswith(('目标', '内容')) and len(candidate) <= 6:
+        return False
+    if not allow_long and len(candidate) > MAX_EXTRACTED_TITLE_LENGTH:
+        return False
+    return True
+
+
+def strip_title_noise_prefix(text: str) -> str:
+    current = clean_title_fragment(text)
+    previous = ''
+    while current and current != previous:
+        previous = current
+        for prefix in TITLE_NOISE_PREFIXES:
+            if current.startswith(prefix) and len(current) - len(prefix) >= 2:
+                current = clean_title_fragment(current[len(prefix):])
+                break
+        else:
+            generic_prefix = re.match(r'^[^，,。！？；：]{1,8}?的(.+)$', current)
+            if generic_prefix and len(generic_prefix.group(1).strip()) >= 2:
+                current = clean_title_fragment(generic_prefix.group(1))
+                continue
+            break
+    return current
+
+
+def extract_quoted_title(text: str) -> str:
+    for pattern in (
+        r'“([^”]{2,30})”',
+        r'"([^"]{2,30})"',
+        r'《([^》]{2,30})》',
+    ):
+        for match in re.finditer(pattern, text or ''):
+            candidate = clean_title_fragment(match.group(1))
+            if 1 < len(candidate) <= MAX_CHAPTER_TITLE_LENGTH and is_preferred_title_candidate(candidate):
+                return candidate
+    return ''
+
+
 def safe_title(text: str) -> str:
     first_line = ''
     for line in text.splitlines():
@@ -440,15 +677,189 @@ def safe_title(text: str) -> str:
             break
     if not first_line:
         return '未命名章节'
+
     _, parsed_title = parse_chapter_heading_line(first_line)
-    clean_title = re.sub(r'\s+', ' ', parsed_title).strip(' \t\r\n-—:：，,、.．。')
-    if not clean_title:
+    candidate = clean_title_fragment(parsed_title or first_line)
+    if not candidate:
         return '未命名章节'
-    return clean_title
+
+    sentence_like = (
+        len(candidate) > MAX_CHAPTER_TITLE_LENGTH
+        or candidate.count('，') >= 1
+        or any(mark in candidate for mark in ('。', '；', '：'))
+    )
+    if sentence_like:
+        quoted_title = extract_quoted_title(candidate)
+        if quoted_title:
+            return quoted_title
+
+    candidate = strip_title_noise_prefix(candidate)
+    if (
+        candidate
+        and len(candidate) <= MAX_CHAPTER_TITLE_LENGTH
+        and candidate.count('，') == 0
+        and not any(mark in candidate for mark in ('。', '；', '：'))
+    ):
+        return candidate
+
+    clauses = [
+        clean_title_fragment(part)
+        for part in TITLE_SENTENCE_SPLIT_RE.split(candidate)
+        if clean_title_fragment(part)
+    ]
+    for clause in clauses:
+        quoted_title = extract_quoted_title(clause)
+        if quoted_title:
+            return quoted_title
+        clause = strip_title_noise_prefix(clause)
+        clause = re.sub(r'(?:开启时|发生时|当场|之后|以前|之时|当下)$', '', clause).strip()
+        clause = clean_title_fragment(clause)
+        if 1 < len(clause) <= MAX_CHAPTER_TITLE_LENGTH:
+            return clause
+
+    fallback = clean_title_fragment(strip_title_noise_prefix(candidate))
+    if not fallback:
+        return '未命名章节'
+    if len(fallback) > MAX_CHAPTER_TITLE_LENGTH:
+        fallback = clean_title_fragment(fallback[:MAX_CHAPTER_TITLE_LENGTH])
+    return fallback or '未命名章节'
+
+
+def normalize_outline_text(chapter_number: int, text: str) -> str:
+    source = (text or '').strip()
+    if not source:
+        raise RuntimeError(f'第{chapter_number}章大纲为空，无法归一化。')
+
+    lines = source.splitlines()
+    first_index = next((index for index, line in enumerate(lines) if line.strip()), None)
+    if first_index is None:
+        raise RuntimeError(f'第{chapter_number}章大纲为空白，无法归一化。')
+
+    first_line = lines[first_index].strip()
+    _, parsed_title = parse_chapter_heading_line(first_line)
+    title = safe_title(parsed_title or first_line)
+    heading = format_chapter_heading(chapter_number, title)
+
+    body = '\n'.join(lines[first_index + 1:]).strip()
+    if not body and parsed_title:
+        raw_outline = clean_title_fragment(parsed_title)
+        if normalize_heading_compare_text(raw_outline) != normalize_heading_compare_text(title):
+            body = raw_outline
+    elif not body and not parsed_title:
+        raw_outline = clean_title_fragment(source)
+        if normalize_heading_compare_text(raw_outline) != normalize_heading_compare_text(title):
+            body = raw_outline
+
+    if body:
+        return f'{heading}\n{body}'.strip()
+    return heading
+
+
+def rewrite_outline_heading(
+    chapter_number: int,
+    title: str,
+    text: str,
+) -> str:
+    heading = format_chapter_heading(chapter_number, title)
+    source = (text or '').strip()
+    if not source:
+        return heading
+
+    lines = source.splitlines()
+    first_index = next((index for index, line in enumerate(lines) if line.strip()), None)
+    if first_index is None:
+        return heading
+
+    body = '\n'.join(lines[first_index + 1:]).strip()
+    if body:
+        return f'{heading}\n{body}'.strip()
+    return heading
 
 
 def format_chapter_heading(chapter_number: int, title: str) -> str:
     return f'第{chapter_number}章 {safe_title(title)}'
+
+
+def iter_title_candidate_fragments(text: str) -> list[str]:
+    source = (text or '').strip()
+    if not source:
+        return []
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        candidate = clean_title_fragment(raw)
+        normalized = normalize_heading_compare_text(candidate)
+        if not candidate or not normalized or normalized in seen:
+            return
+        if not is_preferred_title_candidate(candidate):
+            return
+        seen.add(normalized)
+        candidates.append(candidate)
+
+    for pattern in (
+        r'“([^”]{2,30})”',
+        r'"([^"]{2,30})"',
+        r'《([^》]{2,30})》',
+    ):
+        for match in re.finditer(pattern, source):
+            add(match.group(1))
+
+    for line in source.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        _, parsed_title = parse_chapter_heading_line(stripped)
+        base = parsed_title or stripped
+        add(base)
+        for part in TITLE_SENTENCE_SPLIT_RE.split(base):
+            cleaned = strip_title_noise_prefix(part)
+            if cleaned:
+                add(cleaned)
+
+    return candidates
+
+
+def ensure_unique_chapter_title(
+    chapter_number: int,
+    preferred_title: str,
+    existing_titles: Iterable[str],
+    source_text: str = '',
+) -> str:
+    normalized_existing = {
+        normalize_heading_compare_text(item)
+        for item in (existing_titles or [])
+        if normalize_heading_compare_text(item)
+    }
+
+    candidate_titles: list[str] = []
+    seen_candidates: set[str] = set()
+
+    def add_candidate(raw: str, *, allow_long: bool = False) -> None:
+        candidate = safe_title(raw)
+        normalized = normalize_heading_compare_text(candidate)
+        if not candidate or not normalized or normalized in seen_candidates:
+            return
+        if not is_preferred_title_candidate(candidate, allow_long=allow_long):
+            return
+        seen_candidates.add(normalized)
+        candidate_titles.append(candidate)
+
+    add_candidate(preferred_title, allow_long=True)
+    for fragment in iter_title_candidate_fragments(source_text):
+        add_candidate(fragment)
+
+    for candidate in candidate_titles:
+        if normalize_heading_compare_text(candidate) not in normalized_existing:
+            return candidate
+
+    fallback = candidate_titles[0] if candidate_titles else safe_title(preferred_title or source_text)
+    suffix = f'·{chapter_number}'
+    available = max(1, MAX_CHAPTER_TITLE_LENGTH - len(suffix))
+    fallback = clean_title_fragment(fallback)[:available].strip()
+    fallback = clean_title_fragment(fallback) or '未命名章节'
+    return f'{fallback}{suffix}'
 
 
 def extract_json_payload(text: str) -> dict[str, Any]:
@@ -912,6 +1323,13 @@ class AutoNovelRunner:
         self._last_live_stage_payload_key = ''
         self._live_stream_available = True
         self._live_stream_error_logged = False
+        self.memory_retrieval = NovelMemoryRetrieval(
+            self.project_dir,
+            wing=self.project_dir.name,
+            enabled=not bool(getattr(args, 'disable_memory_retrieval', False)),
+            logger=self.logger,
+        )
+        self._memory_retrieval_needs_backfill = True
 
         ensure_dir(self.project_dir)
         self._prepare_brief()
@@ -958,6 +1376,7 @@ class AutoNovelRunner:
             self.critic_enabled = False
 
         self.state = self._load_or_init_state()
+        self._repair_duplicate_chapter_titles(rewrite_files=True, rebuild_manuscript=True, reason='startup')
         self._sync_manuscript()
         self._write_heartbeat(force=True)
         self._write_live_stage_snapshot(
@@ -1016,7 +1435,7 @@ class AutoNovelRunner:
             snapshot = self._heartbeat_snapshot()
             tmp_path = self.heartbeat_path.with_suffix('.json.tmp')
             tmp_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding='utf-8')
-            tmp_path.replace(self.heartbeat_path)
+            replace_with_retry(tmp_path, self.heartbeat_path)
             self._last_heartbeat_write_ts = current_time
         except Exception as exc:
             if not self._heartbeat_error_logged:
@@ -1075,6 +1494,145 @@ class AutoNovelRunner:
         if book_title:
             return f'《{book_title.strip("《》").strip()}》'
         return fallback_title
+
+    def _existing_story_titles(self) -> set[str]:
+        titles: set[str] = set()
+        for key in ('completed_chapters', 'pending_chapters'):
+            for item in self.state.get(key, []) or []:
+                title = str(item.get('title', '') or '').strip()
+                if title:
+                    titles.add(title)
+        return titles
+
+    def _chapter_record_paths(self, chapter: dict[str, Any]) -> dict[str, Path]:
+        chapter_number = int(chapter.get('chapter_number', 0) or 0)
+        volume_number = int(chapter.get('volume_number', 0) or 0)
+        if chapter_number <= 0:
+            return {}
+        if volume_number <= 0:
+            volume_number, _ = self._chapter_volume_number(chapter_number)
+        chapter_dir = self.volumes_dir / f'vol_{volume_number:03d}' / 'chapters' / f'ch_{chapter_number:04d}'
+        return {
+            'outline': Path(chapter.get('outline_file') or chapter_dir / 'outline.md'),
+            'plot': Path(chapter.get('plot_file') or chapter_dir / 'plot.md'),
+            'draft': Path(chapter.get('draft_file') or chapter_dir / 'draft.md'),
+            'summary': Path(chapter.get('summary_file') or chapter_dir / 'summary.md'),
+        }
+
+    def _chapter_title_source_text(self, chapter: dict[str, Any], extra_texts: Iterable[str] | None = None) -> str:
+        parts: list[str] = []
+        current_title = str(chapter.get('title', '') or '').strip()
+        if current_title:
+            parts.append(current_title)
+
+        for path in self._chapter_record_paths(chapter).values():
+            if path.exists():
+                text = read_text(path).strip()
+                if text:
+                    parts.append(text)
+
+        for text in extra_texts or ():
+            cleaned = str(text or '').strip()
+            if cleaned:
+                parts.append(cleaned)
+
+        return '\n\n'.join(parts)
+
+    def _apply_title_to_record_files(self, chapter: dict[str, Any], new_title: str) -> None:
+        chapter_number = int(chapter.get('chapter_number', 0) or 0)
+        if chapter_number <= 0:
+            return
+
+        paths = self._chapter_record_paths(chapter)
+
+        outline_path = paths.get('outline')
+        if outline_path and outline_path.exists():
+            outline_text = read_text(outline_path)
+            if outline_text.strip():
+                write_text(
+                    outline_path,
+                    rewrite_outline_heading(chapter_number, new_title, outline_text),
+                )
+
+        draft_path = paths.get('draft')
+        if draft_path and draft_path.exists():
+            draft_text = read_text(draft_path)
+            if draft_text.strip():
+                write_text(
+                    draft_path,
+                    normalize_chapter_draft_text(
+                        chapter_number,
+                        new_title,
+                        draft_text,
+                        heading_mode=self._draft_heading_mode(),
+                    ),
+                )
+
+    def _repair_duplicate_chapter_titles(
+        self,
+        *,
+        rewrite_files: bool,
+        rebuild_manuscript: bool,
+        reason: str,
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for key in ('completed_chapters', 'pending_chapters'):
+            bucket = self.state.get(key, []) or []
+            for item in bucket:
+                if not isinstance(item, dict):
+                    continue
+                records.append(item)
+
+        records.sort(key=lambda item: int(item.get('chapter_number', 0) or 0))
+        existing_titles: list[str] = []
+        changes: list[dict[str, Any]] = []
+
+        for chapter in records:
+            chapter_number = int(chapter.get('chapter_number', 0) or 0)
+            if chapter_number <= 0:
+                continue
+
+            current_title = str(chapter.get('title', '') or '').strip()
+            source_text = self._chapter_title_source_text(chapter)
+            unique_title = ensure_unique_chapter_title(
+                chapter_number,
+                current_title or source_text,
+                existing_titles,
+                source_text,
+            )
+            existing_titles.append(unique_title)
+
+            if unique_title == current_title:
+                continue
+
+            chapter['title'] = unique_title
+            if rewrite_files:
+                self._apply_title_to_record_files(chapter, unique_title)
+
+            changes.append(
+                {
+                    'chapter_number': chapter_number,
+                    'old_title': current_title,
+                    'new_title': unique_title,
+                }
+            )
+
+        if not changes:
+            return []
+
+        preview = ', '.join(
+            f'第{item["chapter_number"]}章 {item["old_title"] or "（空标题）"} -> {item["new_title"]}'
+            for item in changes[:8]
+        )
+        if len(changes) > 8:
+            preview += f' ... 共 {len(changes)} 处'
+        self.log(f'[title_guard] {reason} 修复重复章节标题：{preview}')
+
+        if rebuild_manuscript:
+            self.rebuild_full_manuscript(export_chapters_txt=True)
+        else:
+            self._save_state()
+        return changes
 
     def _is_title_only_story(self) -> bool:
         return self._draft_heading_mode() == 'title_only'
@@ -1225,7 +1783,7 @@ class AutoNovelRunner:
         try:
             tmp_path = self.live_stage_path.with_suffix('.json.tmp')
             tmp_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding='utf-8')
-            tmp_path.replace(self.live_stage_path)
+            replace_with_retry(tmp_path, self.live_stage_path)
             self._last_live_stage_write_ts = current_time
             self._last_live_stage_payload_key = payload_key
         except Exception as exc:
@@ -1344,12 +1902,346 @@ class AutoNovelRunner:
         self.state['updated_at'] = now_str()
         tmp_path = self.state_path.with_suffix('.json.tmp')
         tmp_path.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding='utf-8')
-        tmp_path.replace(self.state_path)
+        replace_with_retry(tmp_path, self.state_path)
+
+    def _invalidate_memory_retrieval(self) -> None:
+        self._memory_retrieval_needs_backfill = True
+
+    def _ensure_memory_retrieval_ready(self) -> None:
+        if not self.memory_retrieval or not self.memory_retrieval.available:
+            return
+        if not self._memory_retrieval_needs_backfill:
+            return
+        stats = self.memory_retrieval.backfill(self.state.get('completed_chapters', []))
+        if not stats.get('enabled'):
+            return
+        self._memory_retrieval_needs_backfill = False
+        self.log(
+            '[memory_retrieval] 索引已准备：'
+            f'更新 {stats.get("synced", 0)}，'
+            f'跳过 {stats.get("skipped", 0)}，'
+            f'移除 {stats.get("removed", 0)}，'
+            f'失败 {stats.get("failed", 0)}'
+        )
+
+    def _sync_memory_retrieval_file(
+        self,
+        room: str,
+        path: Path,
+        *,
+        chapter_number: int = 0,
+        source_kind: str = '',
+    ) -> None:
+        if not self.memory_retrieval or not self.memory_retrieval.available:
+            return
+        target_path = Path(path)
+        text = read_text(target_path).strip()
+        self.memory_retrieval.sync_text(
+            room=room,
+            source_path=target_path,
+            text=text,
+            chapter_number=chapter_number,
+            source_kind=source_kind or room,
+        )
+
+    def _build_memory_retrieval_query(
+        self,
+        stage: str,
+        *,
+        chapter: dict | None = None,
+        outline_text: str = '',
+        plot_text: str = '',
+    ) -> tuple[str, tuple[str, ...]]:
+        story_memory = truncate_text(read_text(self.story_memory_path), 700)
+        recent = truncate_text(self.recent_chapter_summaries(limit=4), 900)
+        chapter_number = int((chapter or {}).get('chapter_number', 0) or 0)
+        chapter_title = str((chapter or {}).get('title', '') or '').strip()
+        chapter_label = f'第{chapter_number}章 {chapter_title}'.strip() if chapter_number else ''
+
+        if stage == 'plan':
+            query = f"""
+为接下来章节规划检索最相关的历史记忆。
+
+当前准备继续写作的位置：第 {self.state.get('next_chapter_number', 1)} 章
+最近章节摘要：
+{recent or '（暂无）'}
+
+当前故事记忆：
+{story_memory or '（暂无）'}
+""".strip()
+            return truncate_text(query, 1800), ('brief', 'series_bible', 'chapter_summary')
+
+        if stage == 'plot':
+            query = f"""
+为 {chapter_label or '当前章节'} 的剧情梗概检索最相关的历史记忆。
+
+章节大纲：
+{truncate_text(outline_text, 1000) or '（暂无）'}
+
+最近章节摘要：
+{recent or '（暂无）'}
+""".strip()
+            return truncate_text(query, 1800), ('brief', 'series_bible', 'chapter_summary')
+
+        if stage == 'draft':
+            query = f"""
+为 {chapter_label or '当前章节'} 的正文写作检索最相关的历史记忆。
+
+剧情梗概：
+{truncate_text(plot_text, 1000) or '（暂无）'}
+
+最近章节摘要：
+{recent or '（暂无）'}
+""".strip()
+            return truncate_text(query, 1800), ('brief', 'series_bible', 'chapter_summary')
+
+        return '', ()
+
+    def _memory_retrieval_context(
+        self,
+        stage: str,
+        *,
+        chapter: dict | None = None,
+        outline_text: str = '',
+        plot_text: str = '',
+    ) -> str:
+        if not self.memory_retrieval or not self.memory_retrieval.available:
+            return ''
+        self._ensure_memory_retrieval_ready()
+        query, rooms = self._build_memory_retrieval_query(
+            stage,
+            chapter=chapter,
+            outline_text=outline_text,
+            plot_text=plot_text,
+        )
+        if not query or not rooms:
+            return ''
+        hits = self.memory_retrieval.search(
+            query,
+            rooms=rooms,
+            n_results=max(1, int(getattr(self.args, 'memory_retrieval_hits', 4) or 4)),
+            max_chars=max(400, int(getattr(self.args, 'memory_retrieval_max_chars', 1200) or 1200)),
+        )
+        if not hits:
+            return ''
+
+        blocks = []
+        for hit in hits:
+            room = str(hit.get('room', '') or '')
+            room_label = MEMORY_RETRIEVAL_ROOM_LABELS.get(room, room or '检索记忆')
+            source_file = str(hit.get('source_file', '') or '').replace('\\', '/')
+            source_label = source_file.split('/')[-1] if source_file else ''
+            chapter_number = int(hit.get('chapter_number', 0) or 0)
+            header_parts = [room_label]
+            if chapter_number:
+                header_parts.append(f'第{chapter_number}章')
+            if source_label:
+                header_parts.append(source_label)
+            similarity = hit.get('similarity')
+            if isinstance(similarity, (int, float)):
+                header_parts.append(f'相似度 {similarity:.3f}')
+            snippet = str(hit.get('text', '') or '').strip()
+            if not snippet:
+                continue
+            blocks.append(f"[{' | '.join(header_parts)}]\n{snippet}")
+
+        if not blocks:
+            return ''
+        return '【历史检索记忆】\n' + '\n\n'.join(blocks)
 
     def clear_error(self) -> None:
         if self.state.get('last_error'):
             self.state['last_error'] = ''
             self._save_state()
+
+    def _load_cached_text_if_valid(self, path: Path, *, min_chars: int, label: str) -> str:
+        if not path.exists():
+            return ''
+        text = read_text(path).strip()
+        if len(text) >= min_chars:
+            return text
+        if text:
+            self.log(f'[{label}] 检测到过短缓存文件，已删除并重新生成：{path}（{len(text)} 字，阈值 {min_chars}）')
+        else:
+            self.log(f'[{label}] 检测到空缓存文件，已删除并重新生成：{path}')
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return ''
+
+    def _chapter_body_text(self, chapter: dict[str, Any], draft_text: str) -> str:
+        chapter_number = int(chapter.get('chapter_number', 0) or 0)
+        chapter_title = str(chapter.get('title', '') or '').strip()
+        return strip_generated_draft_heading(chapter_number, chapter_title, draft_text).strip()
+
+    def _assess_chapter_draft_integrity(self, chapter: dict[str, Any], draft_text: str) -> dict[str, Any]:
+        report = dict(assess_chapter_tail_integrity(self._chapter_body_text(chapter, draft_text)))
+        report.update({
+            'chapter_number': int(chapter.get('chapter_number', 0) or 0),
+            'title': str(chapter.get('title', '') or '').strip(),
+            'draft_file': str(chapter.get('draft_file', '') or ''),
+        })
+        return report
+
+    def _load_cached_draft_if_valid(self, chapter: dict[str, Any], *, min_chars: int, label: str) -> str:
+        draft_path = Path(chapter['draft_file'])
+        text = self._load_cached_text_if_valid(
+            draft_path,
+            min_chars=min_chars,
+            label=label,
+        )
+        if not text:
+            return ''
+
+        integrity = self._assess_chapter_draft_integrity(chapter, text)
+        if not integrity.get('high_confidence'):
+            return text
+
+        self.log(
+            f'[{label}] 检测到疑似残章缓存，已删除并重新生成：{draft_path}'
+            f'（{integrity.get("reason")}，结尾：{integrity.get("tail", "")}）'
+        )
+        try:
+            draft_path.unlink()
+        except FileNotFoundError:
+            pass
+        return ''
+
+    def _repair_chapter_draft_text(
+        self,
+        chapter: dict[str, Any],
+        current_text: str,
+        *,
+        outline_text: str = '',
+        plot_text: str = '',
+        previous_summary: str = '',
+        next_excerpt: str = '',
+        issue_reason: str = '',
+        issue_tail: str = '',
+        label: str = '',
+    ) -> str:
+        chapter_number = int(chapter.get('chapter_number', 0) or 0)
+        chapter_title = str(chapter.get('title', '') or '').strip()
+        stage_label = label or f'第{chapter_number}章结尾修补'
+        project_role_rule = self._project_role_only_rule()
+        current_body = self._chapter_body_text(chapter, current_text)
+        tail_excerpt = tail_text(current_body, 1800)
+        prompt = f"""
+你正在修补一章已经基本成型、但结尾疑似被截断的中文网文章节。
+
+目标不是重写整章，而是只补出“缺失的结尾续写”，让现有正文可以直接接上去，变成完整可发布章节。
+
+硬要求：
+- 只输出“可以直接拼接到现有正文末尾”的续写内容，不要重复已有正文，不要重写标题，不要解释，不要分点。
+- 续写优先接住当前最后一句的半截内容，把断掉的动作、对话、画面、信息交代补完整。
+- 正常只需补最后一小段到两三小段，控制在必要范围内；不要无端扩成整章重写。
+- 不要新增全新角色、全新地点、全新势力、全新规则；只能用本章和相邻章节已建立的元素补齐。
+- 允许保留章节悬念，但禁止停在半句话、半个人名、半个动作、半截引号、半截倒计时说明上。
+- 如果提供了下一章开头，只能把本章修到能自然衔接，不要抢写下一章已经发生的核心事件。
+- 结尾必须落在完整动作、完整对话句、完整画面或完整倒计时/进度提示上。
+{f'- {project_role_rule}' if project_role_rule else ''}
+
+【疑似问题】
+- 问题类型：{issue_reason or 'bad_ending'}
+- 当前尾句：{issue_tail or '（无）'}
+
+【本章标题】
+第{chapter_number}章 {chapter_title}
+
+【本章大纲】
+{truncate_text(outline_text, 1200) or '（无）'}
+
+【本章剧情】
+{truncate_text(plot_text, 1600) or '（无）'}
+
+【上一章摘要】
+{truncate_text(previous_summary, 500) or '（无）'}
+
+【下一章开头】
+{truncate_text(next_excerpt, 800) or '（无）'}
+
+【当前正文尾段】
+{tail_excerpt}
+""".strip()
+
+        continuation = self._call_llm_raw(
+            stage_label,
+            prompt,
+            self.ending_polish_model,
+            system_prompt='你是资深中文网文章节修补编辑，擅长保留原稿主体，只修断裂处与结尾落点。',
+            response_json=False,
+            stream_output=True,
+        ).strip()
+        continuation = self._sanitize_text(continuation)
+        if not continuation:
+            raise RuntimeError(f'{stage_label} 返回空文本。')
+
+        continuation = strip_generated_draft_heading(
+            chapter_number,
+            chapter_title,
+            continuation,
+        ).lstrip()
+        revised = current_text.rstrip() + continuation
+        revised = normalize_chapter_draft_text(
+            chapter_number,
+            chapter_title,
+            revised,
+            heading_mode=self._draft_heading_mode(),
+        )
+        revised = self._enforce_project_role_labels(stage_label, revised)
+        self.clear_error()
+        revised = normalize_chapter_draft_text(
+            chapter_number,
+            chapter_title,
+            revised,
+            heading_mode=self._draft_heading_mode(),
+        )
+        if len(revised.strip()) <= len(current_text.strip()):
+            raise RuntimeError(f'{stage_label} 未能补出有效续写。')
+        repaired_integrity = self._assess_chapter_draft_integrity(chapter, revised)
+        if repaired_integrity.get('high_confidence'):
+            raise RuntimeError(
+                f'{stage_label} 后结尾仍疑似不完整：'
+                f'{repaired_integrity.get("reason")} | {repaired_integrity.get("tail", "")}'
+            )
+        return revised
+
+    def _repair_chapter_draft_if_needed(
+        self,
+        chapter: dict[str, Any],
+        draft_text: str,
+        *,
+        outline_text: str = '',
+        plot_text: str = '',
+        previous_summary: str = '',
+        next_excerpt: str = '',
+        label: str = '',
+        force: bool = False,
+    ) -> str:
+        integrity = self._assess_chapter_draft_integrity(chapter, draft_text)
+        if not force and not integrity.get('high_confidence'):
+            return draft_text
+
+        stage_label = label or f'第{int(chapter.get("chapter_number", 0) or 0)}章结尾修补'
+        self.log(
+            f'[{stage_label}] 检测到章节结尾疑似不完整，启动定向修补：'
+            f'{integrity.get("reason")} | {integrity.get("tail", "")}'
+        )
+        return self.with_retry(
+            stage_label,
+            lambda: self._repair_chapter_draft_text(
+                chapter,
+                draft_text,
+                outline_text=outline_text,
+                plot_text=plot_text,
+                previous_summary=previous_summary,
+                next_excerpt=next_excerpt,
+                issue_reason=str(integrity.get('reason', '') or ''),
+                issue_tail=str(integrity.get('tail', '') or ''),
+                label=stage_label,
+            ),
+        )
 
     def mark_stage(self, label: str, force: bool = False) -> None:
         current_time = time.time()
@@ -2232,6 +3124,8 @@ class AutoNovelRunner:
         )
         self.clear_error()
         write_text(self.series_bible_short_path, short_text)
+        self._sync_memory_retrieval_file('series_bible', self.series_bible_path)
+        self._sync_memory_retrieval_file('series_bible_short', self.series_bible_short_path)
 
         title_match = re.search(r'推荐书名[：:]\s*(.+)', bible_text)
         if title_match:
@@ -3609,6 +4503,7 @@ class AutoNovelRunner:
         )
         self.clear_error()
         write_text(self.story_memory_path, memory_text)
+        self._sync_memory_retrieval_file('story_memory', self.story_memory_path)
         self.state['last_memory_refresh_chapter'] = self.state.get('generated_chapters', 0)
         self._save_state()
 
@@ -3634,11 +4529,13 @@ class AutoNovelRunner:
         batch_size = max(1, batch_size)
 
         chapter_end = next_chapter + batch_size - 1
+        retrieval_context = self._memory_retrieval_context('plan')
         context = '\n\n'.join(
             item for item in [
                 f'【系列圣经短版】\n{truncate_text(read_text(self.series_bible_short_path), 1200)}',
                 f'【卷规划】\n{truncate_text(read_text(plan_path), 1000)}',
                 f'【故事记忆】\n{truncate_text(read_text(self.story_memory_path), 1200)}',
+                retrieval_context,
                 f'【最近章节摘要】\n{truncate_text(self.recent_chapter_summaries(limit=4), 800)}',
                 self._ending_guidance_text(limit=1000),
             ] if item.strip()
@@ -3700,6 +4597,8 @@ class AutoNovelRunner:
 - {batch_scope_rule.lstrip('- ').strip()}
 - {batch_style_rule.lstrip('- ').strip()}
 - 章节编号必须使用阿拉伯数字格式“第1章”，禁止写成“第一章”“第Ⅰ章”“Chapter 1”
+- 每章第一行只允许写“第N章 标题”；标题必须是短标题，建议 4-12 字，最多 {MAX_CHAPTER_TITLE_LENGTH} 字，禁止把剧情推进句、人物关系说明、章末钩子写进标题行
+- 新章节标题必须全书唯一；禁止与任何已完成章节或本批次其他章节重名，若语义接近也要主动换一种叫法
 - {chapter_end_rule.lstrip('- ').strip()}
 - 单章定位是“章节大纲”，不是正文，不要写成小说正文
 {finale_extra_rules}
@@ -3736,6 +4635,7 @@ class AutoNovelRunner:
         outlines = self.with_retry(f'规划章节 {next_chapter}-{chapter_end}', _plan)
         self.clear_error()
         pending = self.state.get('pending_chapters', [])
+        existing_titles = self._existing_story_titles()
         for offset, outline in enumerate(outlines):
             chapter_number = next_chapter + offset
             volume_number, volume_chapter = self._chapter_volume_number(chapter_number)
@@ -3744,8 +4644,16 @@ class AutoNovelRunner:
             plot_path = chapter_dir / 'plot.md'
             draft_path = chapter_dir / 'draft.md'
             summary_path = chapter_dir / 'summary.md'
-            write_text(outline_path, outline)
-            story_heading_title = self._story_heading_title(safe_title(outline))
+            normalized_outline = normalize_outline_text(chapter_number, outline)
+            write_text(outline_path, normalized_outline)
+            story_heading_title = self._story_heading_title(safe_title(normalized_outline))
+            story_heading_title = ensure_unique_chapter_title(
+                chapter_number,
+                story_heading_title,
+                existing_titles,
+                normalized_outline,
+            )
+            existing_titles.add(story_heading_title)
             pending.append({
                 'chapter_number': chapter_number,
                 'volume_number': volume_number,
@@ -3764,13 +4672,24 @@ class AutoNovelRunner:
     def generate_plot(self, chapter: dict) -> str:
         outline_text = read_text(Path(chapter['outline_file']))
         plot_path = Path(chapter['plot_file'])
-        if plot_path.exists() and read_text(plot_path).strip():
-            return read_text(plot_path)
+        cached_plot = self._load_cached_text_if_valid(
+            plot_path,
+            min_chars=150,
+            label=f'第{chapter["chapter_number"]}章剧情',
+        )
+        if cached_plot:
+            return cached_plot
 
+        retrieval_context = self._memory_retrieval_context(
+            'plot',
+            chapter=chapter,
+            outline_text=outline_text,
+        )
         context_parts = [
             f'【系列圣经短版】\n{truncate_text(read_text(self.series_bible_short_path), 1000)}',
             f'【当前卷规划】\n{truncate_text(read_text(self.ensure_volume_plan(chapter["volume_number"])), 900)}',
             f'【故事记忆】\n{truncate_text(read_text(self.story_memory_path), 1000)}',
+            retrieval_context,
             f'【最近章节摘要】\n{truncate_text(self.recent_chapter_summaries(limit=3), 600)}',
             self._ending_guidance_text(limit=900),
         ]
@@ -3894,6 +4813,7 @@ class AutoNovelRunner:
         target_chars: int,
         max_chars: int,
         finale_draft_rules: str,
+        memory_context: str = '',
     ) -> str:
         specs = self._title_only_story_segment_specs(target_chars)
         weights = [1] * len(specs)
@@ -3949,6 +4869,8 @@ class AutoNovelRunner:
             role_only_rule = self._project_role_only_rule()
             if role_only_rule:
                 prompt += f"\n\n补充硬规则：\n- {role_only_rule}\n"
+            if memory_context:
+                prompt += f"\n\n{memory_context}\n"
             if previous_tail:
                 prompt += "\n你会收到前文尾段作为上下文，只允许顺着它继续，不得回头改写。\n"
             if is_final_segment:
@@ -3990,8 +4912,13 @@ class AutoNovelRunner:
 
     def generate_draft(self, chapter: dict, plot_text: str) -> str:
         draft_path = Path(chapter['draft_file'])
-        if draft_path.exists() and read_text(draft_path).strip():
-            return read_text(draft_path)
+        cached_draft = self._load_cached_draft_if_valid(
+            chapter,
+            min_chars=200,
+            label=f'第{chapter["chapter_number"]}章正文',
+        )
+        if cached_draft:
+            return cached_draft
 
         min_chars = max(1400, int(self.args.chapter_char_target * 0.8))
         target_chars = self.args.chapter_char_target
@@ -4034,6 +4961,11 @@ class AutoNovelRunner:
 - 禁止新增任何需要后续再解释的新设定、新势力、新证词、新地点；如有未说明空白，直接用最稳的解释收束
 - 本章必须至少写实一个终局落点；如果已经具备全文完结条件，就直接把本章写成正文终章、尾声章或后日谈章
 """
+        draft_memory_context = self._memory_retrieval_context(
+            'draft',
+            chapter=chapter,
+            plot_text=plot_text,
+        )
 
         def _draft(existing_text: str = '') -> str:
             draft_tension_rule = '- 兼顾情绪张力、场面张力、信息揭露、人物关系拉扯与章末钩子'
@@ -4093,6 +5025,8 @@ class AutoNovelRunner:
             role_only_rule = self._project_role_only_rule()
             if role_only_rule:
                 prompt += f"\n补充硬规则：\n- {role_only_rule}\n"
+            if draft_memory_context:
+                prompt += f"\n\n{draft_memory_context}\n"
             writer = DraftWriter(
                 [(plot_text, existing_text)],
                 {},
@@ -4115,6 +5049,7 @@ class AutoNovelRunner:
                     target_chars=target_chars,
                     max_chars=max_chars,
                     finale_draft_rules=finale_draft_rules,
+                    memory_context=draft_memory_context,
                 ),
             )
         else:
@@ -4171,6 +5106,19 @@ class AutoNovelRunner:
             draft_text,
             heading_mode=self._draft_heading_mode(),
         )
+        outline_text = read_text(Path(chapter['outline_file']))
+        previous_summary = ''
+        completed = list(self.state.get('completed_chapters', []) or [])
+        if completed:
+            previous_summary = read_text(Path(completed[-1].get('summary_file', ''))).strip()
+        draft_text = self._repair_chapter_draft_if_needed(
+            chapter,
+            draft_text,
+            outline_text=outline_text,
+            plot_text=plot_text,
+            previous_summary=previous_summary,
+            label=f'第{chapter["chapter_number"]}章结尾修补',
+        )
         write_text(draft_path, draft_text)
         chapter['status'] = 'drafted'
         self._save_state()
@@ -4205,11 +5153,52 @@ class AutoNovelRunner:
         )
         self.clear_error()
         write_text(summary_path, summary_text.strip())
+        self._sync_memory_retrieval_file(
+            'chapter_summary',
+            summary_path,
+            chapter_number=int(chapter.get('chapter_number', 0) or 0),
+            source_kind='summary',
+        )
         return summary_text.strip()
 
     def finalize_chapter(self, chapter: dict, draft_text: str, summary_text: str) -> None:
         draft_text = self._sanitize_text(draft_text)
         summary_text = self._sanitize_text(summary_text)
+        integrity = self._assess_chapter_draft_integrity(chapter, draft_text)
+        if integrity.get('high_confidence'):
+            raise RuntimeError(
+                f'第{chapter["chapter_number"]}章在入库前仍疑似残章：'
+                f'{integrity.get("reason")} | {integrity.get("tail", "")}'
+            )
+        existing_titles = [
+            str(item.get('title', '') or '').strip()
+            for item in self.state.get('completed_chapters', [])
+            if str(item.get('title', '') or '').strip()
+        ]
+        source_text = self._chapter_title_source_text(
+            chapter,
+            extra_texts=(draft_text, summary_text),
+        )
+        unique_title = ensure_unique_chapter_title(
+            int(chapter.get('chapter_number', 0) or 0),
+            str(chapter.get('title', '') or '').strip() or source_text,
+            existing_titles,
+            source_text,
+        )
+        if unique_title != str(chapter.get('title', '') or '').strip():
+            old_title = str(chapter.get('title', '') or '').strip()
+            chapter['title'] = unique_title
+            draft_text = normalize_chapter_draft_text(
+                chapter['chapter_number'],
+                unique_title,
+                draft_text,
+                heading_mode=self._draft_heading_mode(),
+            )
+            self._apply_title_to_record_files(chapter, unique_title)
+            self.log(
+                f'[title_guard] 第{chapter["chapter_number"]}章标题去重：'
+                f'{old_title or "（空标题）"} -> {unique_title}'
+            )
         self.state['generated_chars'] += len(draft_text)
         self.state['generated_chapters'] += 1
         self.state['next_chapter_number'] = chapter['chapter_number'] + 1
@@ -4261,6 +5250,7 @@ class AutoNovelRunner:
                     continue
                 if chapter_number >= rewrite_from_chapter:
                     shutil.rmtree(chapter_dir, ignore_errors=True)
+        self._invalidate_memory_retrieval()
 
     def _reset_story_memory_for_rewrite(self, rewrite_from_chapter: int, reason_lines: list[str]) -> None:
         lines = [
@@ -4392,6 +5382,218 @@ class AutoNovelRunner:
         self.state['generated_chars'] = generated_chars
         self.state['next_chapter_number'] = (max_chapter_number + 1) if max_chapter_number else 1
         self.state['manuscript_last_appended_chapter'] = len(recalculated_completed)
+        self._invalidate_memory_retrieval()
+
+    def scan_completed_chapter_integrity(self) -> dict[str, Any]:
+        completed = sorted(
+            self.state.get('completed_chapters', []),
+            key=lambda item: int(item.get('chapter_number', 0) or 0),
+        )
+        issues: list[dict[str, Any]] = []
+        summary = {
+            'project': self.project_dir.name,
+            'chapters_checked': len(completed),
+            'missing_draft': 0,
+            'empty_draft': 0,
+            'missing_summary': 0,
+            'empty_summary': 0,
+            'bad_ending_high': 0,
+            'bad_ending_low': 0,
+        }
+
+        for item in completed:
+            chapter_number = int(item.get('chapter_number', 0) or 0)
+            draft_path = Path(str(item.get('draft_file', '') or ''))
+            summary_path = Path(str(item.get('summary_file', '') or ''))
+
+            if not draft_path.exists():
+                summary['missing_draft'] += 1
+                issues.append({
+                    'project': self.project_dir.name,
+                    'chapter': chapter_number,
+                    'title': str(item.get('title', '') or '').strip(),
+                    'issue': 'missing_draft',
+                    'path': str(draft_path),
+                    'confidence': 'high',
+                })
+                continue
+
+            draft_text = read_text(draft_path)
+            if not draft_text.strip():
+                summary['empty_draft'] += 1
+                issues.append({
+                    'project': self.project_dir.name,
+                    'chapter': chapter_number,
+                    'title': str(item.get('title', '') or '').strip(),
+                    'issue': 'empty_draft',
+                    'path': str(draft_path),
+                    'confidence': 'high',
+                })
+                continue
+
+            if not summary_path.exists():
+                summary['missing_summary'] += 1
+                issues.append({
+                    'project': self.project_dir.name,
+                    'chapter': chapter_number,
+                    'title': str(item.get('title', '') or '').strip(),
+                    'issue': 'missing_summary',
+                    'path': str(summary_path),
+                    'confidence': 'high',
+                })
+            elif not read_text(summary_path).strip():
+                summary['empty_summary'] += 1
+                issues.append({
+                    'project': self.project_dir.name,
+                    'chapter': chapter_number,
+                    'title': str(item.get('title', '') or '').strip(),
+                    'issue': 'empty_summary',
+                    'path': str(summary_path),
+                    'confidence': 'high',
+                })
+
+            chapter_ref = {
+                'chapter_number': chapter_number,
+                'title': str(item.get('title', '') or '').strip(),
+                'draft_file': str(draft_path),
+            }
+            integrity = self._assess_chapter_draft_integrity(chapter_ref, draft_text)
+            if not integrity.get('suspicious'):
+                continue
+
+            confidence = 'high' if integrity.get('high_confidence') else 'low'
+            if confidence == 'high':
+                summary['bad_ending_high'] += 1
+            else:
+                summary['bad_ending_low'] += 1
+            issues.append({
+                'project': self.project_dir.name,
+                'chapter': chapter_number,
+                'title': str(item.get('title', '') or '').strip(),
+                'issue': 'bad_ending',
+                'reason': str(integrity.get('reason', '') or ''),
+                'tail': str(integrity.get('tail', '') or ''),
+                'path': str(draft_path),
+                'confidence': confidence,
+            })
+
+        return {
+            'summary': summary,
+            'issues': issues,
+        }
+
+    def repair_incomplete_completed_chapters(
+        self,
+        *,
+        include_low_confidence: bool = False,
+        limit: int = 0,
+    ) -> dict[str, Any]:
+        scan_report = self.scan_completed_chapter_integrity()
+        issues = [
+            item for item in scan_report.get('issues', [])
+            if item.get('issue') == 'bad_ending'
+            and (include_low_confidence or item.get('confidence') == 'high')
+        ]
+        if limit > 0:
+            issues = issues[:limit]
+
+        completed = sorted(
+            self.state.get('completed_chapters', []),
+            key=lambda item: int(item.get('chapter_number', 0) or 0),
+        )
+        chapter_map = {
+            int(item.get('chapter_number', 0) or 0): item
+            for item in completed
+        }
+        original_status = str(self.state.get('status', '') or '')
+        repaired: list[dict[str, Any]] = []
+
+        for index, issue in enumerate(issues):
+            chapter_number = int(issue.get('chapter', 0) or 0)
+            chapter = chapter_map.get(chapter_number)
+            if not chapter:
+                continue
+
+            chapter_index = next(
+                (
+                    idx for idx, item in enumerate(completed)
+                    if int(item.get('chapter_number', 0) or 0) == chapter_number
+                ),
+                -1,
+            )
+            if chapter_index < 0:
+                continue
+
+            draft_path = Path(str(chapter.get('draft_file', '') or ''))
+            summary_path = Path(str(chapter.get('summary_file', '') or ''))
+            current_text = read_text(draft_path).strip()
+            if not current_text:
+                continue
+
+            chapter_paths = self._chapter_record_paths(chapter)
+            outline_text = read_text(chapter_paths.get('outline', Path())) if chapter_paths.get('outline') else ''
+            plot_text = read_text(chapter_paths.get('plot', Path())) if chapter_paths.get('plot') else ''
+            previous_summary = ''
+            if chapter_index > 0:
+                previous_summary = read_text(Path(str(completed[chapter_index - 1].get('summary_file', '') or ''))).strip()
+            next_excerpt = ''
+            if chapter_index + 1 < len(completed):
+                next_chapter = completed[chapter_index + 1]
+                next_text = self._chapter_body_text(next_chapter, read_text(Path(str(next_chapter.get('draft_file', '') or ''))))
+                next_excerpt = next_text[:1000].strip()
+
+            revised = self._repair_chapter_draft_if_needed(
+                chapter,
+                current_text,
+                outline_text=outline_text,
+                plot_text=plot_text,
+                previous_summary=previous_summary,
+                next_excerpt=next_excerpt,
+                label=f'第{chapter_number}章历史残章修补',
+                force=True,
+            )
+            write_text(draft_path, revised)
+            if summary_path.exists():
+                summary_path.unlink()
+            summary_text = self.summarize_chapter(
+                {
+                    'chapter_number': chapter_number,
+                    'title': str(chapter.get('title', '') or '').strip(),
+                    'summary_file': str(summary_path),
+                },
+                outline_text,
+                plot_text,
+                revised,
+            )
+            repaired.append({
+                'chapter': chapter_number,
+                'title': str(chapter.get('title', '') or '').strip(),
+                'path': str(draft_path),
+                'summary_file': str(summary_path),
+                'old_tail': str(issue.get('tail', '') or ''),
+                'new_tail': str(self._assess_chapter_draft_integrity(chapter, revised).get('tail', '') or ''),
+                'confidence': str(issue.get('confidence', '') or ''),
+                'summary_preview': summary_text.strip(),
+            })
+            self.log(
+                f'[chapter_integrity] 已修补第{chapter_number}章，'
+                f'进度 {index + 1}/{len(issues)}'
+            )
+
+        if repaired:
+            self._recalculate_completed_state_from_disk()
+            self.rebuild_full_manuscript(export_chapters_txt=True)
+            self.state['status'] = original_status or 'initialized'
+            self.state['last_error'] = ''
+            self._save_state()
+
+        remaining_report = self.scan_completed_chapter_integrity()
+        return {
+            'project': self.project_dir.name,
+            'requested_repairs': len(issues),
+            'repaired': repaired,
+            'remaining': remaining_report,
+        }
 
     def _polish_title_only_story_in_place(
         self,
@@ -4725,6 +5927,8 @@ class AutoNovelRunner:
 
         if not self.story_memory_path.exists():
             write_text(self.story_memory_path, '# 故事至今\n尚未生成正文。')
+            self._sync_memory_retrieval_file('story_memory', self.story_memory_path)
+        self._ensure_memory_retrieval_ready()
 
         while not self.should_stop():
             self.refresh_ending_guidance()
@@ -4758,8 +5962,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--project-dir', default=str(Path('auto_projects') / 'default_project'))
     parser.add_argument('--brief-file', default=str(Path('novel_brief.md')))
     parser.add_argument('--brief-text', default='')
-    parser.add_argument('--main-model', default='gpt/gpt-5.4')
-    parser.add_argument('--sub-model', default='gpt/gpt-5.4')
+    parser.add_argument('--main-model', default='sub2api/gpt-5.4')
+    parser.add_argument('--sub-model', default='sub2api/gpt-5.4')
     parser.add_argument('--completion-mode', choices=['hard_target', 'min_chars_and_story_end'], default='hard_target')
     parser.add_argument('--target-chars', type=int, default=2_000_000)
     parser.add_argument('--min-target-chars', type=int, default=0)
@@ -4769,16 +5973,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--chapters-per-volume', type=int, default=30)
     parser.add_argument('--chapters-per-batch', type=int, default=5)
     parser.add_argument('--memory-refresh-interval', type=int, default=5)
-    parser.add_argument('--planner-reasoning-effort', default='medium')
-    parser.add_argument('--writer-reasoning-effort', default='medium')
-    parser.add_argument('--sub-reasoning-effort', default='low')
-    parser.add_argument('--summary-reasoning-effort', default='low')
+    parser.add_argument('--disable-memory-retrieval', action='store_true')
+    parser.add_argument('--memory-retrieval-hits', type=int, default=4)
+    parser.add_argument('--memory-retrieval-max-chars', type=int, default=1200)
+    parser.add_argument('--planner-reasoning-effort', default='high')
+    parser.add_argument('--writer-reasoning-effort', default='high')
+    parser.add_argument('--sub-reasoning-effort', default='medium')
+    parser.add_argument('--summary-reasoning-effort', default='medium')
     parser.add_argument('--critic-model', default='')
     parser.add_argument('--critic-every-chapters', type=int, default=0)
-    parser.add_argument('--critic-reasoning-effort', default='high')
+    parser.add_argument('--critic-reasoning-effort', default='xhigh')
     parser.add_argument('--critic-max-passes', type=int, default=0)
     parser.add_argument('--ending-polish-model', default='')
-    parser.add_argument('--ending-polish-reasoning-effort', default='high')
+    parser.add_argument('--ending-polish-reasoning-effort', default='xhigh')
     parser.add_argument('--ending-polish-max-cycles', type=int, default=2)
     parser.add_argument('--max-thread-num', type=int, default=1)
     parser.add_argument('--max-retries', type=int, default=0)
@@ -4787,6 +5994,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--title-only-story', action='store_true')
     parser.add_argument('--live-stream', action='store_true')
     parser.add_argument('--evaluate-completion-only', action='store_true')
+    parser.add_argument('--scan-chapter-integrity-only', action='store_true')
+    parser.add_argument('--repair-incomplete-chapters', action='store_true')
+    parser.add_argument('--repair-include-low-confidence', action='store_true')
+    parser.add_argument('--repair-limit', type=int, default=0)
     return parser.parse_args()
 
 
@@ -4799,6 +6010,27 @@ def main() -> int:
             return 3
         if args.evaluate_completion_only:
             report = runner.evaluate_completion_status(force=True)
+            payload = json.dumps(report, ensure_ascii=False, indent=2)
+            try:
+                print(payload)
+            except UnicodeEncodeError:
+                sys.stdout.buffer.write((payload + '\n').encode('utf-8', errors='replace'))
+                sys.stdout.flush()
+            return 0
+        if args.scan_chapter_integrity_only:
+            report = runner.scan_completed_chapter_integrity()
+            payload = json.dumps(report, ensure_ascii=False, indent=2)
+            try:
+                print(payload)
+            except UnicodeEncodeError:
+                sys.stdout.buffer.write((payload + '\n').encode('utf-8', errors='replace'))
+                sys.stdout.flush()
+            return 0
+        if args.repair_incomplete_chapters:
+            report = runner.repair_incomplete_completed_chapters(
+                include_low_confidence=bool(args.repair_include_low_confidence),
+                limit=int(args.repair_limit or 0),
+            )
             payload = json.dumps(report, ensure_ascii=False, indent=2)
             try:
                 print(payload)
