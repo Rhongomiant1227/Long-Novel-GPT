@@ -1,0 +1,23 @@
+{
+  "display_name": "第零天证词",
+  "target_chars": 1200000,
+  "chapter_char_target": 3000,
+  "chapters_per_volume": 32,
+  "chapters_per_batch": 4,
+  "memory_refresh_interval": 4,
+  "main_model": "gpt/gpt-5.4",
+  "sub_model": "gpt/gpt-5.4",
+  "planner_reasoning_effort": "medium",
+  "writer_reasoning_effort": "medium",
+  "sub_reasoning_effort": "low",
+  "summary_reasoning_effort": "low",
+  "max_thread_num": 1,
+  "max_retries": 0,
+  "retry_backoff_seconds": 15,
+  "max_chapters": 0,
+  "stall_timeout_seconds": 480,
+  "restart_delay_seconds": 15,
+  "heartbeat_interval_seconds": 30,
+  "runner_heartbeat_grace_seconds": 90,
+  "max_stage_runtime_seconds": 0
+}
