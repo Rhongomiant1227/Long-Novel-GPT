@@ -48,10 +48,10 @@ def build_runner_args(project_dir: Path, args: argparse.Namespace) -> SimpleName
         chapters_per_volume=int(state.get('chapters_per_volume', 30) or 30),
         chapters_per_batch=int(state.get('chapters_per_batch', 5) or 5),
         memory_refresh_interval=int(state.get('memory_refresh_interval', 5) or 5),
-        planner_reasoning_effort='medium',
-        writer_reasoning_effort='medium',
-        sub_reasoning_effort='low',
-        summary_reasoning_effort='low',
+        planner_reasoning_effort='high',
+        writer_reasoning_effort='high',
+        sub_reasoning_effort='medium',
+        summary_reasoning_effort='medium',
         critic_model=critic_model,
         critic_every_chapters=1,
         critic_reasoning_effort=args.critic_reasoning_effort,
@@ -73,10 +73,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Review and, if needed, rewrite a completed novel ending for higher ending quality.')
     parser.add_argument('--project-dir', action='append', required=True, help='Project directory; may be specified multiple times.')
     parser.add_argument('--critic-model', default='')
-    parser.add_argument('--critic-reasoning-effort', default='high')
+    parser.add_argument('--critic-reasoning-effort', default='xhigh')
     parser.add_argument('--critic-max-passes', type=int, default=3)
     parser.add_argument('--ending-polish-model', default='')
-    parser.add_argument('--ending-polish-reasoning-effort', default='high')
+    parser.add_argument('--ending-polish-reasoning-effort', default='xhigh')
     parser.add_argument('--max-cycles', type=int, default=2, help='Maximum automatic ending polish cycles.')
     parser.add_argument('--max-retries', type=int, default=0)
     parser.add_argument('--retry-backoff-seconds', type=int, default=15)

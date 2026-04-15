@@ -131,6 +131,18 @@ class Writer:
 
     def get_sub_model(self):
         return self.sub_model
+
+    def _ensure_chunk_mappable(self, chunk: Chunk, prompt_name: str = '创作文本'):
+        text = (chunk.y_chunk or '').strip()
+        if len(text) >= 5:
+            return
+        raise RuntimeError(
+            f'{prompt_name} 返回文本过短（{len(text)} 字），无法继续映射；通常是上游接口空输出、被拦截或异常截断。'
+        )
+
+    def _ensure_chunks_mappable(self, chunks, prompt_name: str = '创作文本'):
+        for chunk in chunks:
+            self._ensure_chunk_mappable(chunk, prompt_name=prompt_name)
     
     def count_span_length(self, span):
         pairs = self.xy_pairs[span[0]:span[1]]
@@ -460,6 +472,7 @@ class Writer:
 
     def map_text(self, chunk:Chunk):
         # TODO: map会检查映射的内容是否大致匹配，是否有错误映射到context的情况
+        self._ensure_chunk_mappable(chunk, prompt_name='待映射文本')
 
         if chunk.x_chunk.strip():
             x_pairs = split_text_into_chunks(chunk.x_chunk, self.x_chunk_length, min_chunk_n=1, min_chunk_size=5, max_chunk_n=20)
@@ -510,6 +523,7 @@ class Writer:
         new_chunks = yield from self.batch_yield(
             [self.write_text(e, prompt_main, user_prompt_text) for e in chunks], 
             chunks, prompt_name='创作文本')
+        self._ensure_chunks_mappable(new_chunks, prompt_name='创作文本')
         
         results = yield from self.batch_map_text(new_chunks)
         new_chunks2 = [e[0] for e in results]
@@ -526,6 +540,7 @@ class Writer:
         new_chunks = yield from self.batch_yield(
             [self.write_text(chunk, write_prompt_main, review + rewrite_instrustion) for chunk, review in zip(chunks, reviews)], 
             chunks, prompt_name='创作文本')
+        self._ensure_chunks_mappable(new_chunks, prompt_name='创作文本')
         
         results = yield from self.batch_map_text(new_chunks)
         new_chunks2 = [e[0] for e in results]

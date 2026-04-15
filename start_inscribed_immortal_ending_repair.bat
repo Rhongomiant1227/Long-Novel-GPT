@@ -20,19 +20,19 @@ if "%GPT_API_KEY%"=="" (
   for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "$p = Join-Path $env:USERPROFILE '.codex\\auth.json'; if (Test-Path $p) { $json = Get-Content $p -Raw | ConvertFrom-Json; if ($json.OPENAI_API_KEY) { [Console]::Write($json.OPENAI_API_KEY) } }"`) do set "GPT_API_KEY=%%I"
 )
 
-if "%GPT_BASE_URL%"=="" set "GPT_BASE_URL=https://fast.vpsairobot.com/v1"
+if "%GPT_BASE_URL%"=="" set "GPT_BASE_URL=https://www.ananapi.com/"
 if /I "%GPT_BASE_URL%"=="https://vpsairobot.com" set "GPT_BASE_URL=https://vpsairobot.com/v1"
-if /I "%GPT_BASE_URL%"=="https://fast.vpsairobot.com" set "GPT_BASE_URL=https://fast.vpsairobot.com/v1"
+if /I "%GPT_BASE_URL%"=="https://www.ananapi.com" set "GPT_BASE_URL=https://www.ananapi.com/"
 if "%GPT_AVAILABLE_MODELS%"=="" set "GPT_AVAILABLE_MODELS=gpt-5.4"
 if "%GPT_MAX_INPUT_TOKENS%"=="" set "GPT_MAX_INPUT_TOKENS=350000"
 if "%GPT_MAX_OUTPUT_TOKENS%"=="" set "GPT_MAX_OUTPUT_TOKENS=65536"
 
 "%PYTHON_CMD%" -X utf8 scripts\ending_quality_repair.py ^
   --project-dir auto_projects\inscribed_immortal ^
-  --critic-model gpt/gpt-5.4 ^
-  --critic-reasoning-effort high ^
+  --critic-model sub2api/gpt-5.4 ^
+  --critic-reasoning-effort xhigh ^
   --critic-max-passes 3 ^
-  --ending-polish-model gpt/gpt-5.4 ^
+  --ending-polish-model sub2api/gpt-5.4 ^
   --ending-polish-reasoning-effort xhigh ^
   --max-cycles 3 ^
   1>"%OUT_LOG%" 2>"%ERR_LOG%"

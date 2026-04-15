@@ -199,12 +199,16 @@ function Register-WeeklyTask {
 function Remove-TaskIfExists {
     param([string]$TaskNameForDelete)
 
-    $queryOutput = & schtasks /Query /TN $TaskNameForDelete /FO LIST 2>&1
+    try {
+        $queryOutput = & cmd.exe /d /c schtasks /Query /TN $TaskNameForDelete /FO LIST 2>$null
+    } catch {
+        return $false
+    }
     if ($LASTEXITCODE -ne 0) {
         return $false
     }
 
-    $deleteOutput = & schtasks /Delete /TN $TaskNameForDelete /F 2>&1
+    $deleteOutput = & cmd.exe /d /c schtasks /Delete /TN $TaskNameForDelete /F 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw ($deleteOutput -join [Environment]::NewLine)
     }

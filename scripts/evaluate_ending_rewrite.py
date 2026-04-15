@@ -314,8 +314,8 @@ def write_report(project_dir: Path, result: dict[str, Any]) -> Path:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Evaluate whether a completed novel ending needs rewrite and from which chapter.')
     parser.add_argument('--project-dir', action='append', required=True, help='Project directory; may be specified multiple times.')
-    parser.add_argument('--model', default='gpt/gpt-5.4')
-    parser.add_argument('--reasoning-effort', default='high')
+    parser.add_argument('--model', default='sub2api/gpt-5.4')
+    parser.add_argument('--reasoning-effort', default='xhigh')
     parser.add_argument('--summary-window', type=int, default=240)
     parser.add_argument('--full-window', type=int, default=16)
     parser.add_argument('--max-output-tokens', type=int, default=6000)

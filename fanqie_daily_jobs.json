@@ -1,7 +1,7 @@
 {
   "taskSchedule": {
     "taskName": "LongNovelFanqieDailyUpload",
-    "startTime": "18:00",
+    "startTime": "08:00",
     "days": [
       "MON",
       "TUE",
@@ -16,7 +16,7 @@
     "enabled": true,
     "runAfterUpload": true,
     "taskName": "LongNovelFanqieAuthorCheckIn",
-    "startTime": "18:00",
+    "startTime": "08:00",
     "days": [
       "MON",
       "TUE",
@@ -39,11 +39,11 @@
     "startUrl": "https://fanqienovel.com/main/writer/?enter_from=author_zone",
     "aiUsage": "no",
     "headless": true,
-    "seedProfileDir": "%USERPROFILE%/.openclaw/browser/openclaw/user-data",
+    "seedProfileDir": ".run/fanqie_writer_seed_profile",
     "profileRoot": ".run/fanqie_daily_profiles",
     "artifactsRoot": ".run/fanqie_daily_artifacts",
     "publishWindowMinutes": 120,
-    "publishTime": "18:00",
+    "publishTime": "08:00",
     "chaptersPerRunByWeekday": {
       "mon": 3,
       "tue": 3,
@@ -61,7 +61,7 @@
       "bookTitle": "删史成仙",
       "aiUsage": "no",
       "chaptersDir": "auto_projects/inscribed_immortal/manuscript/chapters_txt",
-      "publishTime": "18:00",
+      "publishTime": "08:00",
       "chaptersPerRunByWeekday": {
         "mon": 3,
         "tue": 3,
@@ -78,7 +78,7 @@
       "bookTitle": "众生黑匣",
       "aiUsage": "no",
       "chaptersDir": "auto_projects/crowd_blackbox/manuscript/chapters_txt",
-      "publishTime": "18:00",
+      "publishTime": "08:00",
       "chaptersPerRunByWeekday": {
         "mon": 3,
         "tue": 3,

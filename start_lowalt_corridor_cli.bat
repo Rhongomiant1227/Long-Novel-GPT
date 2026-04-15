@@ -9,6 +9,11 @@ set "LONG_NOVEL_USER_AGENT=Long-Novel-GPT/lowalt_corridor"
 set "PROJECT_DIR=%~dp0auto_projects\lowalt_corridor"
 set "BRIEF_FILE=%PROJECT_DIR%\brief.md"
 set "PYTHON_CMD=.venv\Scripts\python.exe"
+if not defined STOP_AT_LOCAL_TIME (
+  set "STOP_AT_LOCAL_TIME="
+) else (
+  if /I "%STOP_AT_LOCAL_TIME%"=="disabled" set "STOP_AT_LOCAL_TIME="
+)
 
 if not exist "%BRIEF_FILE%" (
   echo brief file not found: %BRIEF_FILE%
@@ -33,15 +38,15 @@ if "%GPT_API_KEY%"=="" (
 )
 
 if "%GPT_BASE_URL%"=="" (
-  set "GPT_BASE_URL=https://fast.vpsairobot.com/v1"
+  set "GPT_BASE_URL=https://www.ananapi.com/"
 )
 
 if /I "%GPT_BASE_URL%"=="https://vpsairobot.com" (
   set "GPT_BASE_URL=https://vpsairobot.com/v1"
 )
 
-if /I "%GPT_BASE_URL%"=="https://fast.vpsairobot.com" (
-  set "GPT_BASE_URL=https://fast.vpsairobot.com/v1"
+if /I "%GPT_BASE_URL%"=="https://www.ananapi.com" (
+  set "GPT_BASE_URL=https://www.ananapi.com/"
 )
 
 if "%GPT_AVAILABLE_MODELS%"=="" (
@@ -66,7 +71,7 @@ if "%GPT_API_KEY%"=="" (
 echo Starting visible auto-novel watchdog...
 echo Project: %PROJECT_DIR%
 echo Brief: %BRIEF_FILE%
-echo Model: gpt/gpt-5.4
+echo Model: sub2api/gpt-5.4
 echo Base URL: %GPT_BASE_URL%
 echo Input budget: %GPT_MAX_INPUT_TOKENS%
 echo Output budget: %GPT_MAX_OUTPUT_TOKENS%
@@ -76,40 +81,77 @@ echo Min chars: 4000000
 echo Force finish chars: 4800000
 echo Target chars: 5000000
 echo Max chars: 6000000
-echo Critic: gpt/gpt-5.4 high on batch tail, unlimited until clean or stalled
+if defined STOP_AT_LOCAL_TIME (
+  echo Stop at local time: %STOP_AT_LOCAL_TIME%
+) else (
+  echo Stop at local time: disabled
+)
+echo Critic: sub2api/gpt-5.4 xhigh on batch tail, unlimited until clean or stalled
 echo.
 echo This window shows live LLM output and auto-restarts on crashes or stalls.
 echo Close this window to stop the watchdog.
 echo.
 
-"%PYTHON_CMD%" watch_auto_novel_visible.py ^
-  --project-dir "%PROJECT_DIR%" ^
-  --brief-file "%BRIEF_FILE%" ^
-  --completion-mode min_chars_and_story_end ^
-  --target-chars 5000000 ^
-  --min-target-chars 4000000 ^
-  --force-finish-chars 4800000 ^
-  --max-target-chars 6000000 ^
-  --chapter-char-target 2200 ^
-  --chapters-per-volume 30 ^
-  --chapters-per-batch 5 ^
-  --memory-refresh-interval 5 ^
-  --main-model gpt/gpt-5.4 ^
-  --sub-model gpt/gpt-5.4 ^
-  --planner-reasoning-effort medium ^
-  --writer-reasoning-effort medium ^
-  --sub-reasoning-effort low ^
-  --summary-reasoning-effort low ^
-  --critic-model gpt/gpt-5.4 ^
-  --critic-every-chapters 0 ^
-  --critic-reasoning-effort high ^
-  --critic-max-passes 0 ^
-  --max-thread-num 1 ^
-  --max-retries 0 ^
-  --retry-backoff-seconds 15 ^
-  --stall-timeout-seconds 480 ^
-  --restart-delay-seconds 15 ^
-  --max-stage-runtime-seconds 0 %*
+if defined STOP_AT_LOCAL_TIME (
+  "%PYTHON_CMD%" watch_auto_novel_visible.py ^
+    --project-dir "%PROJECT_DIR%" ^
+    --brief-file "%BRIEF_FILE%" ^
+    --completion-mode min_chars_and_story_end ^
+    --target-chars 5000000 ^
+    --min-target-chars 4000000 ^
+    --force-finish-chars 4800000 ^
+    --max-target-chars 6000000 ^
+    --chapter-char-target 2200 ^
+    --chapters-per-volume 30 ^
+    --chapters-per-batch 5 ^
+    --memory-refresh-interval 5 ^
+    --main-model sub2api/gpt-5.4 ^
+    --sub-model sub2api/gpt-5.4 ^
+    --planner-reasoning-effort high ^
+    --writer-reasoning-effort high ^
+    --sub-reasoning-effort medium ^
+    --summary-reasoning-effort medium ^
+    --critic-model sub2api/gpt-5.4 ^
+    --critic-every-chapters 0 ^
+    --critic-reasoning-effort xhigh ^
+    --critic-max-passes 0 ^
+    --max-thread-num 1 ^
+    --max-retries 0 ^
+    --retry-backoff-seconds 15 ^
+    --stall-timeout-seconds 480 ^
+    --restart-delay-seconds 15 ^
+    --max-stage-runtime-seconds 0 ^
+    --stop-at-local-time %STOP_AT_LOCAL_TIME% %*
+) else (
+  "%PYTHON_CMD%" watch_auto_novel_visible.py ^
+    --project-dir "%PROJECT_DIR%" ^
+    --brief-file "%BRIEF_FILE%" ^
+    --completion-mode min_chars_and_story_end ^
+    --target-chars 5000000 ^
+    --min-target-chars 4000000 ^
+    --force-finish-chars 4800000 ^
+    --max-target-chars 6000000 ^
+    --chapter-char-target 2200 ^
+    --chapters-per-volume 30 ^
+    --chapters-per-batch 5 ^
+    --memory-refresh-interval 5 ^
+    --main-model sub2api/gpt-5.4 ^
+    --sub-model sub2api/gpt-5.4 ^
+    --planner-reasoning-effort high ^
+    --writer-reasoning-effort high ^
+    --sub-reasoning-effort medium ^
+    --summary-reasoning-effort medium ^
+    --critic-model sub2api/gpt-5.4 ^
+    --critic-every-chapters 0 ^
+    --critic-reasoning-effort xhigh ^
+    --critic-max-passes 0 ^
+    --max-thread-num 1 ^
+    --max-retries 0 ^
+    --retry-backoff-seconds 15 ^
+    --stall-timeout-seconds 480 ^
+    --restart-delay-seconds 15 ^
+    --max-stage-runtime-seconds 0 %*
+)
 
 set "EXIT_CODE=%ERRORLEVEL%"
 echo.

@@ -59,8 +59,8 @@ def build_runner_args(project_dir: Path, args: argparse.Namespace) -> SimpleName
         project_dir=str(project_dir),
         brief_file=str(brief_file),
         brief_text='',
-        main_model=state.get('main_model', 'gpt/gpt-5.4'),
-        sub_model=state.get('sub_model', state.get('main_model', 'gpt/gpt-5.4')),
+        main_model=state.get('main_model', 'sub2api/gpt-5.4'),
+        sub_model=state.get('sub_model', state.get('main_model', 'sub2api/gpt-5.4')),
         completion_mode=state.get('completion_mode', 'hard_target'),
         target_chars=int(state.get('target_chars', 2_000_000) or 2_000_000),
         min_target_chars=int(state.get('min_target_chars', 0) or 0),
@@ -70,16 +70,16 @@ def build_runner_args(project_dir: Path, args: argparse.Namespace) -> SimpleName
         chapters_per_volume=int(state.get('chapters_per_volume', 30) or 30),
         chapters_per_batch=int(state.get('chapters_per_batch', 5) or 5),
         memory_refresh_interval=int(state.get('memory_refresh_interval', 5) or 5),
-        planner_reasoning_effort='medium',
-        writer_reasoning_effort='medium',
-        sub_reasoning_effort='low',
-        summary_reasoning_effort='low',
+        planner_reasoning_effort='high',
+        writer_reasoning_effort='high',
+        sub_reasoning_effort='medium',
+        summary_reasoning_effort='medium',
         critic_model=args.critic_model,
         critic_every_chapters=1,
         critic_reasoning_effort=args.critic_reasoning_effort,
         critic_max_passes=args.critic_max_passes,
         ending_polish_model='',
-        ending_polish_reasoning_effort='high',
+        ending_polish_reasoning_effort='xhigh',
         ending_polish_max_cycles=2,
         max_thread_num=1,
         max_retries=args.max_retries,
@@ -97,7 +97,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--chapters', default='', help='Comma/range chapter list, e.g. 12,18-20')
     parser.add_argument('--all-completed', action='store_true')
     parser.add_argument('--critic-model', default='')
-    parser.add_argument('--critic-reasoning-effort', default='high')
+    parser.add_argument('--critic-reasoning-effort', default='xhigh')
     parser.add_argument('--critic-max-passes', type=int, default=3)
     parser.add_argument('--max-retries', type=int, default=0)
     parser.add_argument('--retry-backoff-seconds', type=int, default=15)

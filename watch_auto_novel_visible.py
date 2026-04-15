@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import traceback
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -106,6 +107,38 @@ def get_signal_age_seconds(timestamp_text: str) -> float | None:
     return max(0.0, time.time() - timestamp)
 
 
+def parse_stop_at_local_time(value: str) -> tuple[int, int] | None:
+    text = str(value or '').strip()
+    if not text:
+        return None
+    parts = text.split(':', 1)
+    if len(parts) != 2:
+        raise ValueError(f'invalid local stop time: {value!r}')
+    hour = int(parts[0])
+    minute = int(parts[1])
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        raise ValueError(f'invalid local stop time: {value!r}')
+    return hour, minute
+
+
+def compute_next_local_stop_epoch(stop_at_local_time: str) -> float | None:
+    parsed = parse_stop_at_local_time(stop_at_local_time)
+    if parsed is None:
+        return None
+    hour, minute = parsed
+    now = datetime.now()
+    deadline = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if deadline <= now:
+        deadline += timedelta(days=1)
+    return deadline.timestamp()
+
+
+def format_local_epoch(epoch_seconds: float | None) -> str:
+    if epoch_seconds is None:
+        return '-'
+    return datetime.fromtimestamp(epoch_seconds).strftime('%Y-%m-%d %H:%M:%S')
+
+
 def is_pid_running(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -116,10 +149,51 @@ def is_pid_running(pid: int) -> bool:
     return True
 
 
-def claim_instance(lock_path: Path) -> tuple[bool, int | None]:
+def get_pid_command_line(pid: int) -> str:
+    if pid <= 0:
+        return ''
+    command = (
+        f'$p = Get-CimInstance Win32_Process -Filter "ProcessId = {pid}" -ErrorAction SilentlyContinue; '
+        'if ($p) { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8; [Console]::Write($p.CommandLine) }'
+    )
+    try:
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-Command', command],
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='ignore',
+            timeout=5,
+        )
+    except Exception:
+        return ''
+    if result.returncode != 0:
+        return ''
+    return (result.stdout or '').strip()
+
+
+def is_matching_watchdog_process(pid: int, lock_data: dict, project_dir: Path) -> bool:
+    if not is_pid_running(pid):
+        return False
+    command_line = get_pid_command_line(pid)
+    if not command_line:
+        return False
+    normalized_command = command_line.replace('/', '\\').lower()
+    if 'watch_auto_novel_visible.py' not in normalized_command:
+        return False
+    locked_project_dir = str(lock_data.get('project_dir', '') or '').strip()
+    expected_project_dir = str(project_dir.resolve())
+    for candidate in (locked_project_dir, expected_project_dir):
+        normalized_candidate = candidate.replace('/', '\\').lower().strip()
+        if normalized_candidate and normalized_candidate in normalized_command:
+            return True
+    return False
+
+
+def claim_instance(lock_path: Path, project_dir: Path) -> tuple[bool, int | None]:
     data = read_json_file(lock_path)
     existing_pid = int(data.get('pid', 0) or 0)
-    if existing_pid and existing_pid != os.getpid() and is_pid_running(existing_pid):
+    if existing_pid and existing_pid != os.getpid() and is_matching_watchdog_process(existing_pid, data, project_dir):
         return False, existing_pid
 
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,6 +201,7 @@ def claim_instance(lock_path: Path) -> tuple[bool, int | None]:
         'pid': os.getpid(),
         'started_at': now_str(),
         'script': str(Path(__file__).resolve()),
+        'project_dir': str(project_dir.resolve()),
     }
     lock_path.write_text(json.dumps(lock_payload, ensure_ascii=False, indent=2), encoding='utf-8')
     return True, None
@@ -228,7 +303,7 @@ def terminate_process(process: subprocess.Popen[bytes], grace_seconds: int = 10)
         pass
 
 
-def run_once(args: argparse.Namespace, state_path: Path) -> bool:
+def run_once(args: argparse.Namespace, state_path: Path) -> str:
     command = build_child_command(args)
     log('starting child runner')
     log(f"command: {' '.join(command)}")
@@ -246,6 +321,8 @@ def run_once(args: argparse.Namespace, state_path: Path) -> bool:
     )
     assert process.stdout is not None
     log(f'child pid={process.pid}')
+    if args.stop_deadline_epoch is not None:
+        log(f'local stop deadline: {format_local_epoch(args.stop_deadline_epoch)}')
 
     output_queue: queue.Queue[str] = queue.Queue()
     reader = ReaderThread(process.stdout, output_queue)
@@ -255,6 +332,7 @@ def run_once(args: argparse.Namespace, state_path: Path) -> bool:
     last_child_output_time = last_output_time
     next_heartbeat_at = last_output_time + args.heartbeat_interval_seconds
     eof_seen = False
+    run_status = 'restart'
 
     try:
         while True:
@@ -277,6 +355,14 @@ def run_once(args: argparse.Namespace, state_path: Path) -> bool:
 
             if process.poll() is None:
                 now = time.time()
+                if args.stop_deadline_epoch is not None and now >= args.stop_deadline_epoch:
+                    log(
+                        f'local stop deadline reached at {format_local_epoch(args.stop_deadline_epoch)}; '
+                        'terminating child without restart'
+                    )
+                    run_status = 'deadline'
+                    terminate_process(process)
+                    break
                 idle_seconds = now - last_child_output_time
                 state_snapshot = None
                 runner_heartbeat = None
@@ -359,7 +445,9 @@ def run_once(args: argparse.Namespace, state_path: Path) -> bool:
         f'chapters={state_snapshot["generated_chapters"]}, chars={state_snapshot["generated_chars"]}, '
         f'next={state_snapshot["next_chapter_number"]}'
     )
-    return state_snapshot['status'] in {'completed', 'manual_review_required'}
+    if state_snapshot['status'] in {'completed', 'manual_review_required'}:
+        return 'completed'
+    return run_status
 
 
 def parse_args() -> argparse.Namespace:
@@ -379,18 +467,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--chapters-per-volume', type=int, default=30)
     parser.add_argument('--chapters-per-batch', type=int, default=5)
     parser.add_argument('--memory-refresh-interval', type=int, default=5)
-    parser.add_argument('--main-model', default='gpt/gpt-5.4')
-    parser.add_argument('--sub-model', default='gpt/gpt-5.4')
-    parser.add_argument('--planner-reasoning-effort', default='medium')
-    parser.add_argument('--writer-reasoning-effort', default='medium')
-    parser.add_argument('--sub-reasoning-effort', default='low')
-    parser.add_argument('--summary-reasoning-effort', default='low')
-    parser.add_argument('--critic-model', default='gpt/gpt-5.4')
+    parser.add_argument('--main-model', default='sub2api/gpt-5.4')
+    parser.add_argument('--sub-model', default='sub2api/gpt-5.4')
+    parser.add_argument('--planner-reasoning-effort', default='high')
+    parser.add_argument('--writer-reasoning-effort', default='high')
+    parser.add_argument('--sub-reasoning-effort', default='medium')
+    parser.add_argument('--summary-reasoning-effort', default='medium')
+    parser.add_argument('--critic-model', default='sub2api/gpt-5.4')
     parser.add_argument('--critic-every-chapters', type=int, default=0)
-    parser.add_argument('--critic-reasoning-effort', default='high')
+    parser.add_argument('--critic-reasoning-effort', default='xhigh')
     parser.add_argument('--critic-max-passes', type=int, default=0)
-    parser.add_argument('--ending-polish-model', default='gpt/gpt-5.4')
-    parser.add_argument('--ending-polish-reasoning-effort', default='high')
+    parser.add_argument('--ending-polish-model', default='sub2api/gpt-5.4')
+    parser.add_argument('--ending-polish-reasoning-effort', default='xhigh')
     parser.add_argument('--ending-polish-max-cycles', type=int, default=2)
     parser.add_argument('--max-thread-num', type=int, default=1)
     parser.add_argument('--max-retries', type=int, default=0)
@@ -403,6 +491,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--runner-heartbeat-grace-seconds', type=int, default=1200)
     parser.add_argument('--max-stage-runtime-seconds', type=int, default=0)
     parser.add_argument('--max-silent-seconds', type=int, default=2400)
+    parser.add_argument('--stop-at-local-time', default='')
     args = parser.parse_args()
     args.repo_root = Path(args.repo_root).resolve()
     args.python_exe = Path(args.python_exe).resolve()
@@ -413,6 +502,10 @@ def parse_args() -> argparse.Namespace:
     args.child_output_log_path = args.project_dir / 'logs' / 'console.out.log'
     args.runner_heartbeat_path = args.project_dir / 'logs' / 'runner_heartbeat.json'
     args.instance_lock_path = args.project_dir / 'logs' / 'watchdog.instance.json'
+    try:
+        args.stop_deadline_epoch = compute_next_local_stop_epoch(args.stop_at_local_time)
+    except ValueError as exc:
+        parser.error(str(exc))
     return args
 
 
@@ -433,7 +526,7 @@ def main() -> int:
             print(f'Python virtualenv not found: {args.python_exe}', file=sys.stderr)
             return 1
 
-    claimed, existing_pid = claim_instance(args.instance_lock_path)
+    claimed, existing_pid = claim_instance(args.instance_lock_path, args.project_dir)
     if not claimed:
         log(f'another watchdog is already running (pid={existing_pid}), exiting')
         return 2
@@ -444,13 +537,16 @@ def main() -> int:
             if state_snapshot['status'] == 'manual_review_required':
                 log('project already marked manual_review_required; watchdog exits without starting child')
                 return 0
-            completed = run_once(args, state_path)
-            if completed:
+            run_status = run_once(args, state_path)
+            if run_status == 'completed':
                 state_snapshot = read_state_snapshot(state_path)
                 if state_snapshot['status'] == 'manual_review_required':
                     log('project stopped for manual review, watchdog exits')
                 else:
                     log('project completed, watchdog exits')
+                return 0
+            if run_status == 'deadline':
+                log('watchdog stop deadline reached; exits without restart')
                 return 0
             log(f'restarting after {args.restart_delay_seconds}s')
             time.sleep(args.restart_delay_seconds)

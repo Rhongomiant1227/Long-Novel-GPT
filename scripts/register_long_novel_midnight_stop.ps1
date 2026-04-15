@@ -4,7 +4,9 @@ param(
 
     [datetime]$StopAt = [datetime]::MinValue,
 
-    [int]$GraceSeconds = 20
+    [int]$GraceSeconds = 20,
+
+    [switch]$ForceRegistration
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,6 +21,11 @@ if (-not (Test-Path $runnerScript)) {
 }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+$disableFlagPath = Join-Path $repoRoot '.run\disable_long_novel_auto_stop.flag'
+if ((Test-Path $disableFlagPath) -and -not $ForceRegistration) {
+    throw ("Scheduled long-novel auto stop is globally disabled by flag: {0}" -f $disableFlagPath)
+}
+
 $now = Get-Date
 $stopTime = if ($StopAt -eq [datetime]::MinValue) {
     $now.Date.AddDays(1)

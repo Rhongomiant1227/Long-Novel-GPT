@@ -9,6 +9,7 @@ import { chromium } from "playwright-core";
 
 const 默认起始网址 = "https://fanqienovel.com/main/writer/?enter_from=author_zone";
 const 默认_OPENCLAW_CDP_网址 = "http://127.0.0.1:18800";
+const 番茄章节标题最大长度 = 30;
 let 当前日志文件 = "";
 const 作品路由缓存 = new Map();
 
@@ -179,6 +180,10 @@ function 规范空白(value) {
   return value.replace(/\s+/g, " ").trim();
 }
 
+function 统计文本字符数(value) {
+  return Array.from(String(value ?? "")).length;
+}
+
 function 转义正则文本(value) {
   return String(value ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -299,6 +304,13 @@ function 解析章节文件内容(content, filePath) {
   if (!Number.isFinite(chapterNumber) || chapterNumber <= 0) {
     throw new Error(`章节标题中的章节号无效: ${filePath}`);
   }
+  const title = match[2].trim();
+  const titleLength = 统计文本字符数(title);
+  if (titleLength > 番茄章节标题最大长度) {
+    throw new Error(
+      `章节标题过长: ${filePath}；标题长度=${titleLength}/${番茄章节标题最大长度}；标题=${JSON.stringify(title)}`,
+    );
+  }
 
   let body = lines.slice(1).join("\n");
   body = body.replace(/^\s+/, "").replace(/\s+$/, "");
@@ -308,7 +320,7 @@ function 解析章节文件内容(content, filePath) {
 
   return {
     number: chapterNumber,
-    title: match[2].trim(),
+    title,
     body,
     heading: titleLine,
   };
@@ -810,12 +822,33 @@ async function 检测明确发布完成(page, chapter) {
 }
 
 async function 是登录页(page) {
-  const locator = page.getByRole("button", { name: /立即登录|登录/ }).first();
+  if (/\/main\/writer\/login(?:[/?#]|$)/.test(page.url())) {
+    return true;
+  }
+
+  const pageText = await page.evaluate(() => String(document.body?.innerText || ""))
+    .catch(() => "");
+  if (/验证码登录|扫码登录|密码登录/.test(pageText) && /登录\/注册|登录/.test(pageText)) {
+    return true;
+  }
+
+  const locator = page.getByRole("button", { name: /立即登录|登录\/注册|登录/ }).first();
   try {
     return (await locator.count()) > 0 && (await locator.isVisible());
   } catch {
     return false;
   }
+}
+
+async function 自动等待登录完成(page, timeoutMs = 10 * 60 * 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await 是登录页(page))) {
+      return true;
+    }
+    await page.waitForTimeout(1000);
+  }
+  return false;
 }
 
 async function 等待工作台就绪(page, bookTitle) {
@@ -1213,14 +1246,18 @@ async function 解析自动续传任务(session, args) {
 async function 确保已登录(page, startUrl) {
   记录日志(`打开作家后台: ${startUrl}`);
   await page.goto(startUrl, { waitUntil: "domcontentloaded" });
+  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
   if (!(await 是登录页(page))) {
     记录日志("检测到已登录状态");
     return;
   }
 
-  记录日志("检测到未登录状态，请在打开的浏览器里完成番茄作家登录。");
-  await 等待回车("登录完成后回到终端，按 Enter 继续...");
+  记录日志("检测到未登录状态，请直接在打开的浏览器里完成番茄作家登录，脚本会自动等待。");
+  if (!(await 自动等待登录完成(page))) {
+    throw new Error("等待番茄作家登录超时，终止上传");
+  }
   await page.goto(startUrl, { waitUntil: "domcontentloaded" });
+  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
   if (await 是登录页(page)) {
     throw new Error("仍处于未登录状态，终止上传");
   }
@@ -1282,6 +1319,10 @@ async function 填写编辑器(page, chapter) {
   }
 
   await page.waitForTimeout(1000);
+  const editorValidationError = await 读取编辑页校验错误(page);
+  if (editorValidationError) {
+    throw new Error(`第${chapter.number}章编辑页校验失败: ${editorValidationError}`);
+  }
   记录日志(`已填入第${chapter.number}章标题和正文`);
 }
 
@@ -1299,6 +1340,47 @@ function 获取AI使用选择配置(aiUsage) {
     locatorPattern: /没有使用AI|未使用AI|不使用AI|否/,
     description: "已选择 AI 使用为否",
   };
+}
+
+async function 读取编辑页校验错误(page) {
+  return await page.evaluate((maxTitleLength) => {
+    const normalize = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
+    const isVisible = (el) => {
+      if (!(el instanceof Element)) {
+        return false;
+      }
+      const style = window.getComputedStyle(el);
+      if (!style || style.display === "none" || style.visibility === "hidden") {
+        return false;
+      }
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    };
+
+    const messages = new Set();
+    for (const el of document.querySelectorAll(
+      ".serial-editor-tip, .serial-editor-tip span, .arco-form-message, .arco-form-item-message",
+    )) {
+      if (!(el instanceof Element) || !isVisible(el)) {
+        continue;
+      }
+      const text = normalize(el.innerText || el.textContent || "");
+      if (text) {
+        messages.add(text);
+      }
+    }
+
+    const titleInput = document.querySelector("input[placeholder='请输入标题']");
+    if (titleInput instanceof HTMLInputElement) {
+      const title = normalize(titleInput.value);
+      const titleLength = Array.from(title).length;
+      if (titleLength > maxTitleLength) {
+        messages.add(`标题不能超过${maxTitleLength}个字（当前 ${titleLength}/${maxTitleLength}）`);
+      }
+    }
+
+    return Array.from(messages).join("；");
+  }, 番茄章节标题最大长度).catch(() => "");
 }
 
 async function 处理错别字和AI弹窗(page, chapter, { draftOnly, debug, aiUsage }) {
@@ -1342,10 +1424,17 @@ async function 处理错别字和AI弹窗(page, chapter, { draftOnly, debug, aiU
     }
 
     let progressed = false;
+    const editorValidationError = await 读取编辑页校验错误(page);
+    if (editorValidationError) {
+      throw new Error(`编辑页校验失败，未进入发布确认步骤: ${editorValidationError}`);
+    }
 
     const pageText = await page.locator("body").innerText().catch(() => "");
     if (/已到达当日发布字数上限，无法继续发布|已到达当日发布字数上限/.test(pageText)) {
       throw new Error("平台限制：已到达当日发布字数上限，无法继续发布");
+    }
+    if (/本书中存在重复标题|重复标题，请修改后再发布/.test(pageText)) {
+      throw new Error("发布设置校验失败：本书中存在重复标题，请修改后再发布");
     }
     const hasRiskDialog = /内容风险|风险检测|开启检测/.test(pageText);
 
@@ -1565,14 +1654,16 @@ async function 上传单章(session, args, chapter) {
     try {
       await 校验上一章匹配(editorPage, chapter, args.chaptersDir);
       await 填写编辑器(editorPage, chapter);
-      await 点击首个可见元素(
+      if (!(await 点击首个可见元素(
         editorPage,
         [
           (p) => p.getByRole("button", { name: "下一步" }),
           (p) => p.locator("button").filter({ hasText: /^下一步$/ }),
         ],
-        "已进入发布确认步骤",
-      );
+        "已点击下一步，等待发布确认步骤",
+      ))) {
+        throw new Error("未找到“下一步”按钮");
+      }
       await 处理错别字和AI弹窗(editorPage, chapter, args);
       if (!args.draftOnly) {
         await 在工作台校验已发布(dashboardPage, args.startUrl, args.bookTitle, chapter);

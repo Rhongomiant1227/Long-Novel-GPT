@@ -2493,6 +2493,13 @@ class AutoNovelRunner:
         if stream_output:
             self._stream_text(label, response, finish=True)
         self.clear_stage()
+        endpoint_name = str(getattr(final_messages, 'api_endpoint_name', '') or '').strip()
+        endpoint_base_url = str(getattr(final_messages, 'api_endpoint_base_url', '') or '').strip()
+        if endpoint_name or endpoint_base_url:
+            endpoint_label = endpoint_name or endpoint_base_url
+            if endpoint_name and endpoint_base_url:
+                endpoint_label = f'{endpoint_name} | {endpoint_base_url}'
+            self.log(f'[{label}] API链路命中：{endpoint_label}')
         self.log(f'[{label}] 完成，用时 {time.time() - start_time:.1f}s，输出 {len(response)} 字，成本 {final_messages.cost_info}')
         return response
 

@@ -55,8 +55,8 @@ echo.
   --chapters-per-volume 30 ^
   --chapters-per-batch 5 ^
   --memory-refresh-interval 5 ^
-  --main-model gpt/gpt-5.4 ^
-  --sub-model gpt/gpt-5.4 ^
+  --main-model sub2api/gpt-5.4 ^
+  --sub-model sub2api/gpt-5.4 ^
   --planner-reasoning-effort medium ^
   --writer-reasoning-effort medium ^
   --sub-reasoning-effort low ^

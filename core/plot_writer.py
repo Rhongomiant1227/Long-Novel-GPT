@@ -25,6 +25,7 @@ class PlotWriter(Writer):
         new_chunks = yield from self.batch_yield(
             [self.write_text(e, prompt_plot, user_prompt) for e in chunks], 
             chunks, prompt_name='创作文本')
+        self._ensure_chunks_mappable(new_chunks, prompt_name='创作文本')
         
         results = yield from self.batch_map_text(new_chunks)
         new_chunks2 = [e[0] for e in results]
