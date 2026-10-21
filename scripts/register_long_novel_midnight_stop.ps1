@@ -39,11 +39,16 @@ if ($stopTime -le $now) {
 
 $taskDate = $stopTime.ToString('yyyy/MM/dd')
 $taskClock = $stopTime.ToString('HH:mm')
+$removeTasksScript = Join-Path $PSScriptRoot 'remove_long_novel_stop_tasks.ps1'
 
 foreach ($projectTag in $ProjectTags) {
     $projectDir = Join-Path $repoRoot ("auto_projects\" + $projectTag)
     if (-not (Test-Path $projectDir)) {
         throw "Project directory not found: $projectDir"
+    }
+
+    if (Test-Path $removeTasksScript) {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $removeTasksScript -ProjectTags $projectTag
     }
 
     $taskName = 'LongNovel_Stop_{0}_{1}' -f $projectTag, $stopTime.ToString('yyyyMMdd_HHmm')

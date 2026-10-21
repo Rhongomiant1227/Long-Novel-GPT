@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import math
 import hashlib
 import threading
 from datetime import datetime, timedelta
@@ -35,6 +36,16 @@ gpt_model_config = {
 
 _API_CHAIN_STATE = {}
 _API_CHAIN_STATE_LOCK = threading.Lock()
+_PROMPT_CORRUPTION_PATTERNS = (
+    re.compile(r"your message (?:got )?garbled", re.IGNORECASE),
+    re.compile(r"(?:string|bunch) of question marks", re.IGNORECASE),
+    re.compile(r"could(?:n['’]t| not) make sense of your message", re.IGNORECASE),
+    re.compile(r"unable to (?:recognize|understand).{0,80}(?:message|question)", re.IGNORECASE),
+    re.compile(r"无法理解您?发出的消息"),
+    re.compile(r"无法识别这段内容"),
+    re.compile(r"消息.*(?:问号|乱码)"),
+    re.compile(r"请重新发送(?:你的)?问题"),
+)
 
 
 def _read_positive_float_env(name):
@@ -110,6 +121,7 @@ def _normalize_api_chain(api_chain, api_key=None, base_url=None, proxies=None):
                 'api_key': entry_api_key,
                 'base_url': _normalize_base_url(entry_base_url),
                 'proxies': str(entry.get('proxies') or proxies or '').strip(),
+                'cooldown_overrides': entry.get('cooldown_overrides') if isinstance(entry.get('cooldown_overrides'), dict) else None,
             })
 
     if normalized_chain:
@@ -123,6 +135,7 @@ def _normalize_api_chain(api_chain, api_key=None, base_url=None, proxies=None):
         'api_key': api_key,
         'base_url': _normalize_base_url(base_url),
         'proxies': str(proxies or '').strip(),
+        'cooldown_overrides': None,
     }]
 
 
@@ -133,6 +146,7 @@ def _api_chain_signature(model, api_chain):
             'name': str(entry.get('name', '')).strip(),
             'base_url': _normalize_base_url(entry.get('base_url')),
             'api_key_hash': hashlib.sha1(str(entry.get('api_key', '')).encode('utf-8')).hexdigest(),
+            'cooldown_overrides': entry.get('cooldown_overrides') if isinstance(entry.get('cooldown_overrides'), dict) else None,
         })
     return json.dumps({'model': model, 'chain': payload}, ensure_ascii=False, sort_keys=True)
 
@@ -169,14 +183,53 @@ def _get_api_chain_start_index(signature, api_chain, reset_time):
         state = _API_CHAIN_STATE.setdefault(signature, {
             'active_index': 0,
             'rollover_marker': marker,
+            'cooldowns': {},
         })
         if state.get('rollover_marker') != marker:
             state['active_index'] = 0
             state['rollover_marker'] = marker
+            state['cooldowns'] = {}
+        if not isinstance(state.get('cooldowns'), dict):
+            state['cooldowns'] = {}
         active_index = int(state.get('active_index', 0) or 0)
     if not api_chain:
         return 0, marker
     return max(0, min(active_index, len(api_chain) - 1)), marker
+
+
+def _build_api_chain_attempt_plan(active_index, chain_length, rate_limit_retries):
+    if chain_length <= 0:
+        return []
+
+    normalized_active_index = max(0, min(int(active_index or 0), chain_length - 1))
+    normalized_rate_limit_retries = max(0, int(rate_limit_retries or 0))
+    plan = []
+
+    if normalized_active_index > 0:
+        # When already running on a lower-priority fallback endpoint, probe higher-priority
+        # endpoints once per new request so recovery switches back immediately without
+        # blocking the active fallback behind repeated 429 retries.
+        for endpoint_index in range(0, normalized_active_index):
+            plan.append({
+                'endpoint_index': endpoint_index,
+                'rate_limit_retries': 0,
+                'mode': 'higher_priority_probe',
+            })
+
+    plan.append({
+        'endpoint_index': normalized_active_index,
+        'rate_limit_retries': normalized_rate_limit_retries,
+        'mode': 'active',
+    })
+
+    for endpoint_index in range(normalized_active_index + 1, chain_length):
+        plan.append({
+            'endpoint_index': endpoint_index,
+            'rate_limit_retries': normalized_rate_limit_retries,
+            'mode': 'lower_priority_fallback',
+        })
+
+    return plan
 
 
 def _set_api_chain_active_index(signature, index, reset_time, marker=None):
@@ -184,9 +237,114 @@ def _set_api_chain_active_index(signature, index, reset_time, marker=None):
         state = _API_CHAIN_STATE.setdefault(signature, {
             'active_index': 0,
             'rollover_marker': _current_rollover_marker(reset_time),
+            'cooldowns': {},
         })
         state['active_index'] = max(0, int(index or 0))
         state['rollover_marker'] = marker or _current_rollover_marker(reset_time)
+        if not isinstance(state.get('cooldowns'), dict):
+            state['cooldowns'] = {}
+
+
+def _get_api_chain_endpoint_cooldown(signature, endpoint_index, reset_time, marker=None):
+    resolved_marker = marker or _current_rollover_marker(reset_time)
+    now = time.time()
+    with _API_CHAIN_STATE_LOCK:
+        state = _API_CHAIN_STATE.setdefault(signature, {
+            'active_index': 0,
+            'rollover_marker': resolved_marker,
+            'cooldowns': {},
+        })
+        if state.get('rollover_marker') != resolved_marker:
+            state['active_index'] = 0
+            state['rollover_marker'] = resolved_marker
+            state['cooldowns'] = {}
+            return None
+        if not isinstance(state.get('cooldowns'), dict):
+            state['cooldowns'] = {}
+        info = state['cooldowns'].get(int(endpoint_index))
+        if not info:
+            return None
+        until = float(info.get('until', 0) or 0)
+        if until <= now:
+            state['cooldowns'].pop(int(endpoint_index), None)
+            return None
+        return {
+            'until': until,
+            'category': str(info.get('category', '') or '').strip(),
+            'detail': str(info.get('detail', '') or '').strip(),
+        }
+
+
+def _set_api_chain_endpoint_cooldown(signature, endpoint_index, reset_time, cooldown_seconds, category='', detail='', marker=None):
+    duration = max(0.0, float(cooldown_seconds or 0))
+    if duration <= 0:
+        return
+    resolved_marker = marker or _current_rollover_marker(reset_time)
+    with _API_CHAIN_STATE_LOCK:
+        state = _API_CHAIN_STATE.setdefault(signature, {
+            'active_index': 0,
+            'rollover_marker': resolved_marker,
+            'cooldowns': {},
+        })
+        if state.get('rollover_marker') != resolved_marker:
+            state['active_index'] = 0
+            state['rollover_marker'] = resolved_marker
+            state['cooldowns'] = {}
+        if not isinstance(state.get('cooldowns'), dict):
+            state['cooldowns'] = {}
+        state['cooldowns'][int(endpoint_index)] = {
+            'until': time.time() + duration,
+            'category': str(category or '').strip(),
+            'detail': str(detail or '').strip(),
+        }
+
+
+def _get_api_chain_next_retry_after_seconds(signature, reset_time, marker=None):
+    resolved_marker = marker or _current_rollover_marker(reset_time)
+    now = time.time()
+    with _API_CHAIN_STATE_LOCK:
+        state = _API_CHAIN_STATE.get(signature)
+        if not state:
+            return None
+        if state.get('rollover_marker') != resolved_marker:
+            return None
+        cooldowns = state.get('cooldowns')
+        if not isinstance(cooldowns, dict) or not cooldowns:
+            return None
+        future_untils = []
+        expired_keys = []
+        for key, info in cooldowns.items():
+            try:
+                until = float((info or {}).get('until', 0) or 0)
+            except Exception:
+                until = 0
+            if until <= now:
+                expired_keys.append(key)
+            else:
+                future_untils.append(until)
+        for key in expired_keys:
+            cooldowns.pop(key, None)
+        if not future_untils:
+            return None
+        return max(0.0, min(future_untils) - now)
+
+
+def _clear_api_chain_endpoint_cooldown(signature, endpoint_index, reset_time, marker=None):
+    resolved_marker = marker or _current_rollover_marker(reset_time)
+    with _API_CHAIN_STATE_LOCK:
+        state = _API_CHAIN_STATE.setdefault(signature, {
+            'active_index': 0,
+            'rollover_marker': resolved_marker,
+            'cooldowns': {},
+        })
+        if state.get('rollover_marker') != resolved_marker:
+            state['active_index'] = 0
+            state['rollover_marker'] = resolved_marker
+            state['cooldowns'] = {}
+            return
+        if not isinstance(state.get('cooldowns'), dict):
+            state['cooldowns'] = {}
+        state['cooldowns'].pop(int(endpoint_index), None)
 
 
 def _extract_status_code(exc):
@@ -220,6 +378,36 @@ def _extract_status_code(exc):
 def _classify_api_chain_error(exc):
     status_code = _extract_status_code(exc)
     lowered = _exception_chain_text(exc).lower()
+    quota_markers = (
+        'usage_limit_exceeded',
+        'insufficient_quota',
+        'api_key_quota_exhausted',
+        'quota_exhausted',
+        'quota exceeded',
+        'quota_exceeded',
+        'credit balance',
+        'balance exhausted',
+        '余额已用尽',
+        '余额用尽',
+        '订阅余额已用尽',
+        'subscription balance has been exhausted',
+    )
+
+    if any(marker in lowered for marker in quota_markers):
+        return 'quota_exhausted'
+
+    gateway_markers = (
+        'cloudflare_524_timeout',
+        'cloudflare_gateway_html_error',
+        'unexpected_html_gateway_response',
+    )
+    for marker in gateway_markers:
+        if marker in lowered:
+            return marker
+
+    normalized = _normalize_provider_error(exc)
+    if normalized in gateway_markers:
+        return normalized
 
     if (
         status_code == 401
@@ -242,7 +430,6 @@ def _classify_api_chain_error(exc):
     if status_code in {500, 502, 503, 504, 520, 522, 524}:
         return 'server_error'
 
-    normalized = _normalize_provider_error(exc)
     if normalized:
         return normalized
 
@@ -255,7 +442,53 @@ def _classify_api_chain_error(exc):
 def _resolve_rate_limit_retry_count(value):
     if value not in (None, ''):
         return max(0, int(value))
-    return _read_positive_int_env('GPT_API_CHAIN_RATE_LIMIT_RETRIES') or 10
+    value = _read_positive_int_env('GPT_API_CHAIN_RATE_LIMIT_RETRIES')
+    return value if value is not None else 0
+
+
+def _resolve_api_chain_cooldown_seconds(category, endpoint=None):
+    endpoint = endpoint if isinstance(endpoint, dict) else {}
+    endpoint_overrides = endpoint.get('cooldown_overrides')
+    if isinstance(endpoint_overrides, dict):
+        override_value = endpoint_overrides.get(category)
+        if override_value not in (None, ''):
+            try:
+                return max(0.0, float(override_value))
+            except Exception:
+                pass
+
+    env_names = {
+        'auth': 'GPT_API_CHAIN_AUTH_COOLDOWN_SECONDS',
+        'client_error': 'GPT_API_CHAIN_CLIENT_ERROR_COOLDOWN_SECONDS',
+        'quota_exhausted': 'GPT_API_CHAIN_QUOTA_COOLDOWN_SECONDS',
+        'rate_limit': 'GPT_API_CHAIN_RATE_LIMIT_COOLDOWN_SECONDS',
+        'server_error': 'GPT_API_CHAIN_SERVER_ERROR_COOLDOWN_SECONDS',
+        'transport': 'GPT_API_CHAIN_TRANSPORT_COOLDOWN_SECONDS',
+        'provider_prompt_corrupted': 'GPT_API_CHAIN_PROMPT_CORRUPTION_COOLDOWN_SECONDS',
+        'cloudflare_524_timeout': 'GPT_API_CHAIN_GATEWAY_COOLDOWN_SECONDS',
+        'cloudflare_gateway_html_error': 'GPT_API_CHAIN_GATEWAY_COOLDOWN_SECONDS',
+        'unexpected_html_gateway_response': 'GPT_API_CHAIN_GATEWAY_COOLDOWN_SECONDS',
+    }
+    default_values = {
+        # Auth and gateway/client blocks usually require operator action or a provider reset.
+        # Do not hammer the same bad endpoint on every outer retry.
+        'auth': 86400,
+        'client_error': 3600,
+        'quota_exhausted': 3600,
+        'rate_limit': 3600,
+        'server_error': 120,
+        'transport': 60,
+        'provider_prompt_corrupted': 300,
+        'cloudflare_524_timeout': 3600,
+        'cloudflare_gateway_html_error': 3600,
+        'unexpected_html_gateway_response': 3600,
+    }
+    env_name = env_names.get(category)
+    if env_name:
+        raw_value = os.getenv(env_name, '').strip()
+        if raw_value:
+            return max(0.0, float(raw_value))
+    return float(default_values.get(category, 0))
 
 
 def _rate_limit_backoff_seconds(attempt):
@@ -313,7 +546,23 @@ def _normalize_provider_error(exc):
     if re.search(r'<html[\s>]', lowered) and re.search(r'</html>', lowered):
         return 'unexpected_html_gateway_response'
 
+    if 'provider_prompt_corrupted' in lowered:
+        return 'provider_prompt_corrupted'
+
     return None
+
+
+def _looks_like_prompt_corruption_response(text):
+    candidate = str(text or "").strip()
+    if not candidate or len(candidate) > 1_200:
+        return False
+    return any(pattern.search(candidate) for pattern in _PROMPT_CORRUPTION_PATTERNS)
+
+
+def _ensure_valid_model_response(text):
+    if _looks_like_prompt_corruption_response(text):
+        raise RuntimeError("provider_prompt_corrupted: gateway returned a prompt-garbled refusal")
+    return text
 
 
 def _build_timeout(timeout=None, streaming=False):
@@ -656,7 +905,13 @@ def _create_with_chat_completions_api(
 
     try:
         response = completion_client.chat.completions.create(**request_kwargs)
-        result_messages[-1]['content'] = _extract_response_content(response, n)
+        content = _extract_response_content(response, n)
+        if n == 1:
+            _ensure_valid_model_response(content)
+        elif isinstance(content, list):
+            for item in content:
+                _ensure_valid_model_response(item)
+        result_messages[-1]['content'] = content
         yield result_messages
         return result_messages
     finally:
@@ -713,6 +968,8 @@ def _stream_chat_with_chat_completions_api(
                     result_messages[-1]['content'] = content if n > 1 else content[0]
                     yield result_messages
             if any((item or '').strip() for item in content):
+                for item in content:
+                    _ensure_valid_model_response(item)
                 return result_messages
             return result_messages
         except Exception:
@@ -774,6 +1031,7 @@ def _create_with_responses_api(
     try:
         response = response_client.responses.create(**request_kwargs)
         final_text = _extract_responses_output_text(response)
+        _ensure_valid_model_response(final_text)
         result_messages[-1]['content'] = final_text
         yield result_messages
         return result_messages
@@ -854,6 +1112,7 @@ def _stream_chat_with_responses_api(
 
             final_response = stream.get_final_response()
             final_text = getattr(final_response, 'output_text', '') or content
+            _ensure_valid_model_response(final_text)
             result_messages[-1]['content'] = final_text
             yield result_messages
             return result_messages
@@ -896,6 +1155,7 @@ def _stream_chat_with_gpt_single_endpoint(
     messages,
     model='gpt-3.5-turbo-1106',
     response_json=False,
+    endpoint_name=None,
     api_key=None,
     base_url=None,
     max_tokens=4_096,
@@ -913,6 +1173,12 @@ def _stream_chat_with_gpt_single_endpoint(
     request_messages = _prepare_request_messages(messages, model)
     result_messages = ChatMessages([dict(message) for message in request_messages], model=model)
     result_messages.append({'role': 'assistant', 'content': ['' for _ in range(n)] if n > 1 else ''})
+    _apply_api_chain_metadata(
+        result_messages,
+        endpoint_name=str(endpoint_name or '').strip() or 'default',
+        endpoint_base_url=str(base_url or '').strip(),
+    )
+    yield result_messages
 
     if _should_use_responses_api(model, response_json, n, base_url=base_url):
         if _should_bypass_responses_stream(reasoning_effort, output_token_limit):
@@ -993,20 +1259,52 @@ def _stream_chat_with_gpt_via_api_chain(
         normalized_chain,
         api_chain_reset_time,
     )
-    attempt_order = list(range(start_index, len(normalized_chain))) + list(range(0, start_index))
     rate_limit_retries = _resolve_rate_limit_retry_count(api_chain_rate_limit_retries)
+    attempt_plan = _build_api_chain_attempt_plan(
+        start_index,
+        len(normalized_chain),
+        rate_limit_retries,
+    )
     effective_max_retries = 0 if len(normalized_chain) > 1 else max_retries
     errors = []
 
-    for endpoint_index in attempt_order:
+    for attempt in attempt_plan:
+        endpoint_index = int(attempt.get('endpoint_index', 0) or 0)
         endpoint = normalized_chain[endpoint_index]
-        total_attempts = 1 + rate_limit_retries
+        cooldown_info = _get_api_chain_endpoint_cooldown(
+            chain_signature,
+            endpoint_index,
+            api_chain_reset_time,
+            marker=request_marker,
+        )
+        # A higher-priority probe is deliberately one request even while that
+        # endpoint is cooling down. This lets a recovered provider take over
+        # immediately; its rate-limit retry budget remains zero below.
+        endpoint_overrides = endpoint.get('cooldown_overrides')
+        probe_rate_limit = (
+            attempt.get('mode') == 'higher_priority_probe'
+            and cooldown_info.get('category') == 'rate_limit'
+            and not (
+                isinstance(endpoint_overrides, dict)
+                and endpoint_overrides.get('rate_limit') not in (None, '')
+            )
+        ) if cooldown_info else False
+        if cooldown_info and not probe_rate_limit:
+            errors.append({
+                'endpoint_name': str(endpoint.get('name', '')).strip() or f'endpoint_{endpoint_index + 1}',
+                'category': f"cooldown/{cooldown_info.get('category') or 'hold'}",
+                'detail': f"skip until {datetime.fromtimestamp(cooldown_info['until']).strftime('%Y-%m-%d %H:%M:%S')}",
+            })
+            continue
+        endpoint_rate_limit_retries = max(0, int(attempt.get('rate_limit_retries', 0) or 0))
+        total_attempts = 1 + endpoint_rate_limit_retries
         for endpoint_attempt in range(1, total_attempts + 1):
             try:
                 result = yield from _stream_chat_with_gpt_single_endpoint(
                     messages,
                     model=model,
                     response_json=response_json,
+                    endpoint_name=str(endpoint.get('name', '')).strip(),
                     api_key=endpoint.get('api_key'),
                     base_url=endpoint.get('base_url'),
                     max_tokens=max_tokens,
@@ -1019,6 +1317,12 @@ def _stream_chat_with_gpt_via_api_chain(
                     top_p=top_p,
                     timeout=timeout,
                     max_retries=effective_max_retries,
+                )
+                _clear_api_chain_endpoint_cooldown(
+                    chain_signature,
+                    endpoint_index,
+                    api_chain_reset_time,
+                    marker=request_marker,
                 )
                 _set_api_chain_active_index(
                     chain_signature,
@@ -1036,9 +1340,21 @@ def _stream_chat_with_gpt_via_api_chain(
                 category = _classify_api_chain_error(exc)
                 detail = _normalize_provider_error(exc) or str(exc)
 
-                if category == 'rate_limit' and endpoint_attempt <= rate_limit_retries:
+                if category == 'rate_limit' and endpoint_attempt <= endpoint_rate_limit_retries:
                     time.sleep(_rate_limit_backoff_seconds(endpoint_attempt))
                     continue
+
+                cooldown_seconds = _resolve_api_chain_cooldown_seconds(category, endpoint=endpoint)
+                if cooldown_seconds > 0:
+                    _set_api_chain_endpoint_cooldown(
+                        chain_signature,
+                        endpoint_index,
+                        api_chain_reset_time,
+                        cooldown_seconds,
+                        category=category,
+                        detail=detail,
+                        marker=request_marker,
+                    )
 
                 errors.append({
                     'endpoint_name': str(endpoint.get('name', '')).strip() or f'endpoint_{endpoint_index + 1}',
@@ -1048,9 +1364,18 @@ def _stream_chat_with_gpt_via_api_chain(
                 break
 
     _set_api_chain_active_index(chain_signature, 0, api_chain_reset_time, marker=request_marker)
+    next_retry_after_seconds = _get_api_chain_next_retry_after_seconds(
+        chain_signature,
+        api_chain_reset_time,
+        marker=request_marker,
+    )
+    retry_hint = ''
+    if next_retry_after_seconds is not None:
+        retry_hint = f' earliest_retry_after={int(max(1, math.ceil(next_retry_after_seconds)))}s.'
     raise RuntimeError(
         'all configured API endpoints failed; next retry will restart from the highest priority endpoint. '
         + _format_api_chain_errors(errors)
+        + retry_hint
     )
 
 
@@ -1105,6 +1430,7 @@ def stream_chat_with_gpt(
             messages,
             model=model,
             response_json=response_json,
+            endpoint_name=str(endpoint.get('name', '')).strip() or 'default',
             api_key=endpoint.get('api_key'),
             base_url=endpoint.get('base_url'),
             max_tokens=max_tokens,

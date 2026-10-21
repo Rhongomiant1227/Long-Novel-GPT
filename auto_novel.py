@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import logging
 import math
@@ -15,9 +16,16 @@ import unicodedata
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from urllib.parse import urlparse
 
 from backend.backend_utils import get_model_config_from_provider_model
 from core.draft_writer import DraftWriter
+from core.humanizer import (
+    build_humanizer_prompt,
+    build_humanizer_review_prompt,
+    normalize_humanizer_output,
+    validate_humanizer_revision,
+)
 from core.novel_memory_retrieval import NovelMemoryRetrieval
 from core.outline_writer import OutlineWriter
 from core.plot_writer import PlotWriter
@@ -78,6 +86,20 @@ def now_str() -> str:
     return time.strftime('%Y-%m-%d %H:%M:%S')
 
 
+def extract_retry_after_seconds_from_error(exc: Exception) -> int | None:
+    text = str(exc or '')
+    if not text:
+        return None
+    match = re.search(r'earliest_retry_after=(\d+)s', text)
+    if not match:
+        return None
+    try:
+        value = int(match.group(1))
+    except Exception:
+        return None
+    return value if value > 0 else None
+
+
 def ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -87,6 +109,59 @@ def read_text(path: Path, default: str = '') -> str:
     if not path.exists():
         return default
     return path.read_text(encoding='utf-8')
+
+
+def format_api_endpoint_display(value: str) -> str:
+    text = str(value or '').strip()
+    if not text:
+        return ''
+
+    if '|' in text:
+        parts = [part.strip() for part in text.split('|') if part.strip()]
+        if parts:
+            text = parts[-1]
+
+    try:
+        parsed = urlparse(text)
+    except Exception:
+        parsed = None
+
+    if parsed and parsed.scheme and parsed.netloc:
+        display = f'{parsed.netloc}{parsed.path or ""}'.strip()
+        return display.rstrip('/')
+
+    return text.rstrip('/')
+
+
+def extract_primary_api_endpoint(model: ModelConfig) -> tuple[str, str, str]:
+    api_chain = model.get('api_chain') or []
+    primary = api_chain[0] if api_chain else {}
+    endpoint_name = str(primary.get('name') or '').strip()
+    endpoint_base_url = str(primary.get('base_url') or model.get('base_url') or '').strip()
+    display = format_api_endpoint_display(endpoint_base_url or endpoint_name)
+    return endpoint_name, endpoint_base_url, display
+
+
+def is_probably_local_base_url(value: str) -> bool:
+    text = str(value or '').strip()
+    if not text:
+        return False
+    try:
+        parsed = urlparse(text)
+    except Exception:
+        return False
+    hostname = (parsed.hostname or '').strip().lower()
+    if not hostname:
+        return False
+    if hostname in {'localhost', '0.0.0.0'}:
+        return True
+    if hostname.endswith('.local'):
+        return True
+    try:
+        ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return bool(ip.is_loopback or ip.is_private or ip.is_link_local)
 
 
 def project_name_from_path(path: Path | None) -> str:
@@ -449,8 +524,9 @@ SHORT_STORY_BIBLE_PART_SPECS = [
 
 
 CHAPTER_NUMBER_TOKEN_RE = r'[\d零〇一二两三四五六七八九十百千万IVXLCDMivxlcdmⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]+'
-MAX_CHAPTER_TITLE_LENGTH = 30
-MAX_EXTRACTED_TITLE_LENGTH = 12
+MAX_CHAPTER_TITLE_LENGTH = 10
+MAX_EXTRACTED_TITLE_LENGTH = 10
+MIN_READER_FACING_TITLE_LENGTH = 4
 CHAPTER_HEADING_PATTERNS = (
     re.compile(
         rf'^\s*第\s*(?P<number>{CHAPTER_NUMBER_TOKEN_RE})\s*章(?:\s+|[：:，,、.．。—-]\s*)?(?P<title>.*)$',
@@ -472,6 +548,8 @@ ROMAN_NUMERAL_VALUES = {
 }
 TITLE_SENTENCE_SPLIT_RE = re.compile(r'[，,。！？；：]')
 TITLE_OUTER_PUNCTUATION = ' \t\r\n-—:：，,、.．。;；“”‘’"\'《》()（）[]【】'
+INVISIBLE_TEXT_RE = re.compile(r'[\ufeff\u200b\u200c\u200d]')
+LEADING_INVISIBLE_TEXT_RE = re.compile(r'^[\ufeff\u200b\u200c\u200d]+')
 TITLE_NOISE_PREFIXES = (
     '本章核心目标是',
     '本章目标是',
@@ -533,6 +611,99 @@ GENERIC_TITLE_PREFIXES = (
     '本回',
     '本节',
 )
+TITLE_META_TERMS = (
+    '尾声',
+    '合章',
+    '收束',
+    '结局',
+    '后日谈',
+    '普通日',
+    '是否继续',
+)
+TITLE_MACHINE_STYLE_EXACT = {
+    '建议清除',
+    '执行期',
+    '归档期',
+    '规则',
+    '定义',
+    '续生',
+    '终判',
+    '落款',
+    '存活',
+    '活法',
+    '模板名',
+    '方案体',
+}
+TITLE_ADMIN_TERMS = (
+    '回执',
+    '归档',
+    '样本',
+    '验证',
+    '存续',
+    '签发',
+    '执行',
+    '裁定',
+    '留痕',
+    '协议',
+    '权限',
+    '入口',
+    '模板',
+    '方案',
+    '编号',
+    '字段',
+    '定义权',
+    '连续性',
+    '终判',
+    '复核',
+    '基线',
+    '终裁',
+)
+TITLE_HUMAN_SIGNAL_TERMS = (
+    '她',
+    '他',
+    '我',
+    '你',
+    '谁',
+    '别',
+    '不',
+    '还',
+    '竟',
+    '原来',
+    '真的',
+    '终于',
+    '先',
+    '只',
+    '要',
+    '来',
+    '醒',
+    '死',
+    '活',
+    '说',
+    '问',
+    '签',
+    '按',
+    '看',
+    '拿',
+    '走',
+    '回',
+    '开',
+    '关',
+    '杀',
+    '救',
+)
+TITLE_UNIQUE_FALLBACK_PREFIXES = (
+    '这次',
+    '又见',
+    '再问',
+    '重开',
+    '门后',
+    '暗处',
+    '今夜',
+    '后来',
+)
+DRAFT_CODE_FENCE_RE = re.compile(r'`{3,}')
+DRAFT_BODY_LABEL_RE = re.compile(r'^\s*[【\[]?(?:正文|小说正文)[】\]]?\s*[:：]?\s*')
+DRAFT_SENTENCE_RE = re.compile(r'[^\n。！？!?；;]+(?:[。！？!?；;]+|$)|\n+')
 
 
 def parse_chinese_number_token(text: str) -> int | None:
@@ -600,8 +771,16 @@ def parse_chapter_number_token(text: str) -> int | None:
     return parse_roman_number_token(value)
 
 
-def parse_chapter_heading_line(text: str) -> tuple[int | None, str]:
-    line = re.sub(r'\s+', ' ', (text or '').strip())
+def strip_invisible_text(text: str) -> str:
+    return INVISIBLE_TEXT_RE.sub('', text or '')
+
+
+def strip_leading_invisible_text(text: str) -> str:
+    return LEADING_INVISIBLE_TEXT_RE.sub('', text or '')
+
+
+def _parse_raw_chapter_heading_line(text: str) -> tuple[int | None, str]:
+    line = re.sub(r'\s+', ' ', strip_leading_invisible_text((text or '').strip()))
     if not line:
         return None, ''
     for pattern in CHAPTER_HEADING_PATTERNS:
@@ -612,14 +791,60 @@ def parse_chapter_heading_line(text: str) -> tuple[int | None, str]:
         if chapter_number is None:
             continue
         title = match.group('title') or ''
-        title = re.sub(r'\s+', ' ', title).strip(' \t\r\n-—:：，,、.．。')
+        title = strip_invisible_text(re.sub(r'\s+', ' ', title)).strip(' \t\r\n-—:：，,、.．。')
         return chapter_number, title
     return None, line
 
 
+def unwrap_nested_chapter_title(text: str) -> str:
+    current = clean_title_fragment(text)
+    previous = ''
+    while current and current != previous:
+        previous = current
+        nested_number, nested_title = _parse_raw_chapter_heading_line(current)
+        if nested_number is None or not nested_title:
+            break
+        current = clean_title_fragment(nested_title)
+    return current
+
+
+def parse_chapter_heading_line(text: str) -> tuple[int | None, str]:
+    chapter_number, title = _parse_raw_chapter_heading_line(text)
+    if chapter_number is None:
+        return None, title
+    return chapter_number, unwrap_nested_chapter_title(title)
+
+
 def clean_title_fragment(text: str) -> str:
-    normalized = re.sub(r'\s+', ' ', text or '').strip()
+    normalized = re.sub(r'\s+', ' ', strip_invisible_text(text or '')).strip()
     return normalized.strip(TITLE_OUTER_PUNCTUATION)
+
+
+def chapter_title_quality_issues(text: str) -> list[str]:
+    candidate = clean_title_fragment(text)
+    issues: list[str] = []
+    if not candidate:
+        return ['标题为空']
+    if len(candidate) < MIN_READER_FACING_TITLE_LENGTH:
+        issues.append(f'标题少于{MIN_READER_FACING_TITLE_LENGTH}字')
+    if len(candidate) > MAX_CHAPTER_TITLE_LENGTH:
+        issues.append(f'标题超过{MAX_CHAPTER_TITLE_LENGTH}字')
+    if re.search(r'[0-9A-Za-z，。！？；：、,.!?;:“”"\'‘’（）()【】\[\]《》<>+·—-]', candidate):
+        issues.append('标题含数字、字母或标点')
+    if candidate in TITLE_MACHINE_STYLE_EXACT:
+        issues.append('标题是后台提示或抽象流程词')
+    matched_meta = [term for term in TITLE_META_TERMS if term in candidate]
+    if matched_meta:
+        issues.append(f'标题含写作提纲词:{"/".join(matched_meta)}')
+    admin_hits = [term for term in TITLE_ADMIN_TERMS if term in candidate]
+    has_human_signal = any(term in candidate for term in TITLE_HUMAN_SIGNAL_TERMS)
+    if len(admin_hits) >= 2 or (admin_hits and not has_human_signal):
+        issues.append(f'标题后台术语过重:{"/".join(admin_hits)}')
+    return issues
+
+
+def is_reader_facing_chapter_title(text: str) -> bool:
+    return not chapter_title_quality_issues(text)
 
 
 def is_preferred_title_candidate(text: str, *, allow_long: bool = False) -> bool:
@@ -843,6 +1068,8 @@ def ensure_unique_chapter_title(
             return
         if not is_preferred_title_candidate(candidate, allow_long=allow_long):
             return
+        if not is_reader_facing_chapter_title(candidate):
+            return
         seen_candidates.add(normalized)
         candidate_titles.append(candidate)
 
@@ -855,11 +1082,24 @@ def ensure_unique_chapter_title(
             return candidate
 
     fallback = candidate_titles[0] if candidate_titles else safe_title(preferred_title or source_text)
-    suffix = f'·{chapter_number}'
-    available = max(1, MAX_CHAPTER_TITLE_LENGTH - len(suffix))
-    fallback = clean_title_fragment(fallback)[:available].strip()
     fallback = clean_title_fragment(fallback) or '未命名章节'
-    return f'{fallback}{suffix}'
+    prefix_count = len(TITLE_UNIQUE_FALLBACK_PREFIXES)
+    start_index = chapter_number % prefix_count
+    for offset in range(prefix_count):
+        prefix = TITLE_UNIQUE_FALLBACK_PREFIXES[(start_index + offset) % prefix_count]
+        available = max(1, MAX_CHAPTER_TITLE_LENGTH - len(prefix))
+        candidate = clean_title_fragment(f'{prefix}{fallback[:available]}')
+        candidate_key = normalize_heading_compare_text(candidate)
+        if (
+            candidate_key
+            and candidate_key not in normalized_existing
+            and is_reader_facing_chapter_title(candidate)
+        ):
+            return candidate
+
+    raise RuntimeError(
+        f'第{chapter_number}章无法从现有正文生成自然且唯一的章节标题，请重新规划标题。'
+    )
 
 
 def extract_json_payload(text: str) -> dict[str, Any]:
@@ -885,11 +1125,152 @@ def extract_json_payload(text: str) -> dict[str, Any]:
 
 
 def normalize_heading_compare_text(text: str) -> str:
-    normalized = unicodedata.normalize('NFKC', text or '').strip().lower()
+    normalized = unicodedata.normalize('NFKC', strip_invisible_text(text or '')).strip().lower()
     normalized = normalized.strip('#')
     normalized = normalized.replace('《', '').replace('》', '')
     normalized = re.sub(r'[\s:：\-—_]+', '', normalized)
     return normalized
+
+
+def normalize_draft_compare_text(text: str) -> str:
+    normalized = strip_invisible_text(text or '')
+    normalized = normalized.replace('\r\n', '\n').replace('\r', '\n')
+    normalized = re.sub(r'\s+', '', normalized)
+    return normalized
+
+
+def clean_live_draft_stream_text(text: str) -> str:
+    cleaned = strip_invisible_text(text or '')
+    cleaned = cleaned.replace('\r\n', '\n').replace('\r', '\n')
+    cleaned = DRAFT_CODE_FENCE_RE.sub('', cleaned)
+    cleaned = re.sub(r'(?m)^\s*[【\[]?(?:正文|小说正文)[】\]]?\s*[:：]?\s*', '', cleaned)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned
+
+
+def collapse_repeated_sentences(text: str, *, min_sentence_len: int = 14, window_size: int = 12) -> str:
+    if not text:
+        return ''
+    recent: list[str] = []
+    parts: list[str] = []
+    for unit in DRAFT_SENTENCE_RE.findall(text):
+        if not unit:
+            continue
+        if unit.startswith('\n'):
+            if parts and not parts[-1].endswith('\n'):
+                parts.append('\n')
+            continue
+        candidate = unit.strip()
+        if not candidate:
+            continue
+        normalized = normalize_draft_compare_text(candidate)
+        if len(normalized) >= min_sentence_len and normalized in recent:
+            continue
+        parts.append(candidate)
+        if len(normalized) >= min_sentence_len:
+            recent.append(normalized)
+            if len(recent) > window_size:
+                recent.pop(0)
+    collapsed = ''.join(parts)
+    collapsed = re.sub(r'\n{3,}', '\n\n', collapsed)
+    return collapsed.strip()
+
+
+def clean_generated_draft_body(
+    chapter_number: int,
+    title: str,
+    text: str,
+    *,
+    heading_mode: str = 'chapter',
+) -> str:
+    source = strip_invisible_text(text or '')
+    source = source.replace('\r\n', '\n').replace('\r', '\n')
+    source = DRAFT_CODE_FENCE_RE.sub('\n', source)
+
+    cleaned_lines: list[str] = []
+    for raw_line in source.splitlines():
+        line = strip_leading_invisible_text(raw_line).strip()
+        if not line:
+            cleaned_lines.append('')
+            continue
+        line = DRAFT_BODY_LABEL_RE.sub('', line)
+        line = line.strip()
+        if not line:
+            continue
+        cleaned_lines.append(line)
+
+    normalized_source = '\n'.join(cleaned_lines).strip()
+    if not normalized_source:
+        return ''
+
+    body = strip_generated_draft_leading_headings(
+        chapter_number,
+        title,
+        normalized_source.splitlines(),
+        heading_mode=heading_mode,
+    )
+    if not body:
+        body = normalized_source
+
+    paragraphs = [
+        collapse_repeated_sentences(part.strip())
+        for part in re.split(r'\n\s*\n+', body)
+        if part.strip()
+    ]
+    deduped_paragraphs: list[str] = []
+    seen_paragraphs: set[str] = set()
+    for paragraph in paragraphs:
+        cleaned = collapse_repeated_sentences(paragraph).strip()
+        normalized = normalize_draft_compare_text(cleaned)
+        if not normalized:
+            continue
+        if len(normalized) >= 12 and normalized in seen_paragraphs:
+            continue
+        if (
+            deduped_paragraphs
+            and len(normalized) >= 12
+            and normalized == normalize_draft_compare_text(deduped_paragraphs[-1])
+        ):
+            continue
+        seen_paragraphs.add(normalized)
+        deduped_paragraphs.append(cleaned)
+
+    cleaned_body = '\n\n'.join(deduped_paragraphs).strip() if deduped_paragraphs else body.strip()
+    cleaned_body = collapse_repeated_sentences(cleaned_body)
+    cleaned_body = re.sub(r'\n{3,}', '\n\n', cleaned_body).strip()
+    return cleaned_body
+
+
+def strip_generated_draft_leading_headings(
+    chapter_number: int,
+    title: str,
+    lines: list[str],
+    *,
+    heading_mode: str = 'chapter',
+) -> str:
+    normalized_title = normalize_heading_compare_text(title)
+    start_index = 0
+    while start_index < len(lines):
+        stripped = strip_leading_invisible_text(lines[start_index]).strip()
+        if not stripped:
+            start_index += 1
+            continue
+        parsed_number, parsed_title = parse_chapter_heading_line(stripped)
+        if parsed_number is not None:
+            if parsed_number == chapter_number:
+                start_index += 1
+                continue
+            if normalized_title and normalize_heading_compare_text(parsed_title) == normalized_title:
+                start_index += 1
+                continue
+        elif heading_mode == 'title_only':
+            normalized_line = normalize_heading_compare_text(stripped)
+            if normalized_line and normalized_line == normalized_title:
+                start_index += 1
+                continue
+        break
+    body = '\n'.join(lines[start_index:]).strip()
+    return body or '\n'.join(lines).strip()
 
 
 def normalize_chapter_draft_text(
@@ -904,20 +1285,12 @@ def normalize_chapter_draft_text(
     else:
         heading = format_chapter_heading(chapter_number, title)
     source = (text or '').strip()
-    body = source
-    lines = source.splitlines()
-    normalized_title = normalize_heading_compare_text(title)
-    for index, line in enumerate(lines):
-        if not line.strip():
-            continue
-        parsed_number, _ = parse_chapter_heading_line(line)
-        if parsed_number is not None:
-            body = '\n'.join(lines[index + 1:]).strip()
-        elif heading_mode == 'title_only':
-            normalized_line = normalize_heading_compare_text(line)
-            if normalized_line and normalized_line == normalized_title:
-                body = '\n'.join(lines[index + 1:]).strip()
-        break
+    body = clean_generated_draft_body(
+        chapter_number,
+        title,
+        source,
+        heading_mode=heading_mode,
+    )
     if not body:
         body = source
     if not body:
@@ -934,21 +1307,12 @@ def strip_generated_draft_heading(
     if not source:
         return ''
 
-    body = source
-    lines = source.splitlines()
-    normalized_title = normalize_heading_compare_text(title)
-    for index, line in enumerate(lines):
-        if not line.strip():
-            continue
-        parsed_number, _ = parse_chapter_heading_line(line)
-        if parsed_number is not None:
-            body = '\n'.join(lines[index + 1:]).strip()
-        else:
-            normalized_line = normalize_heading_compare_text(line)
-            if normalized_line and normalized_line == normalized_title:
-                body = '\n'.join(lines[index + 1:]).strip()
-        break
-
+    body = clean_generated_draft_body(
+        chapter_number,
+        title,
+        source,
+        heading_mode='title_only',
+    )
     return body or source
 
 
@@ -1323,6 +1687,7 @@ class AutoNovelRunner:
         self._last_live_stage_payload_key = ''
         self._live_stream_available = True
         self._live_stream_error_logged = False
+        self._live_stream_line_open = False
         self.memory_retrieval = NovelMemoryRetrieval(
             self.project_dir,
             wing=self.project_dir.name,
@@ -1338,6 +1703,7 @@ class AutoNovelRunner:
         base_sub = get_model_config_from_provider_model(args.sub_model)
         base_critic = get_model_config_from_provider_model(args.critic_model or args.main_model)
         base_ending_polish = get_model_config_from_provider_model(args.ending_polish_model or args.critic_model or args.main_model)
+        base_humanizer = get_model_config_from_provider_model(args.humanizer_model or args.main_model)
 
         self.writer_model = clone_model_config(
             base_main,
@@ -1368,6 +1734,11 @@ class AutoNovelRunner:
             reasoning_effort=args.ending_polish_reasoning_effort,
             **cap_model_output_tokens(base_ending_polish, 10_000),
         )
+        self.humanizer_model = clone_model_config(
+            base_humanizer,
+            reasoning_effort=args.humanizer_reasoning_effort,
+            **cap_model_output_tokens(base_humanizer, 12_000),
+        )
         critic_model_name = str(args.critic_model or args.main_model or '').strip().lower()
         critic_interval = int(args.critic_every_chapters or 0)
         critic_max_passes = int(args.critic_max_passes or 0)
@@ -1376,6 +1747,7 @@ class AutoNovelRunner:
             self.critic_enabled = False
 
         self.state = self._load_or_init_state()
+        self._sync_configured_api_endpoint_state(clear_current=True)
         self._repair_duplicate_chapter_titles(rewrite_files=True, rebuild_manuscript=True, reason='startup')
         self._sync_manuscript()
         self._write_heartbeat(force=True)
@@ -1403,7 +1775,15 @@ class AutoNovelRunner:
         return logger
 
     def log(self, message: str) -> None:
+        if self.args.live_stream and self._live_stream_available and self._live_stream_line_open:
+            try:
+                sys.stdout.write('\n')
+                sys.stdout.flush()
+            except (OSError, ValueError, UnicodeEncodeError):
+                pass
+            self._live_stream_line_open = False
         self.logger.info(message)
+        self._live_stream_line_open = False
         with self.events_path.open('a', encoding='utf-8') as handle:
             handle.write(f'[{now_str()}] {message}\n')
 
@@ -1425,6 +1805,13 @@ class AutoNovelRunner:
             'generated_chapters': self.state.get('generated_chapters', 0),
             'generated_chars': self.state.get('generated_chars', 0),
             'next_chapter_number': self.state.get('next_chapter_number', 0),
+            'current_api_endpoint': self.state.get('current_api_endpoint', ''),
+            'current_api_endpoint_name': self.state.get('current_api_endpoint_name', ''),
+            'current_api_endpoint_base_url': self.state.get('current_api_endpoint_base_url', ''),
+            'current_api_endpoint_updated_at': self.state.get('current_api_endpoint_updated_at', ''),
+            'configured_primary_api_endpoint': self.state.get('configured_primary_api_endpoint', ''),
+            'configured_primary_api_endpoint_name': self.state.get('configured_primary_api_endpoint_name', ''),
+            'configured_primary_api_endpoint_base_url': self.state.get('configured_primary_api_endpoint_base_url', ''),
         }
 
     def _write_heartbeat(self, force: bool = False) -> None:
@@ -1453,14 +1840,67 @@ class AutoNovelRunner:
         if self._heartbeat_thread.is_alive():
             self._heartbeat_thread.join(timeout=1.0)
 
+    def _sync_configured_api_endpoint_state(self, *, clear_current: bool = False) -> None:
+        endpoint_name, endpoint_base_url, display = extract_primary_api_endpoint(self.writer_model)
+        changed = False
+
+        updates = {
+            'configured_primary_api_endpoint': display,
+            'configured_primary_api_endpoint_name': endpoint_name,
+            'configured_primary_api_endpoint_base_url': endpoint_base_url,
+        }
+        for key, value in updates.items():
+            if self.state.get(key, '') != value:
+                self.state[key] = value
+                changed = True
+
+        if clear_current:
+            cleared_fields = {
+                'current_api_endpoint': '',
+                'current_api_endpoint_name': '',
+                'current_api_endpoint_base_url': '',
+                'current_api_endpoint_updated_at': '',
+            }
+            for key, value in cleared_fields.items():
+                if self.state.get(key, '') != value:
+                    self.state[key] = value
+                    changed = True
+
+        if changed:
+            self._save_state()
+            self._write_heartbeat(force=True)
+
+    def _set_current_api_endpoint(self, endpoint_name: str, endpoint_base_url: str) -> None:
+        display = format_api_endpoint_display(endpoint_base_url or endpoint_name)
+        if not display:
+            return
+
+        changed = False
+        updates = {
+            'current_api_endpoint': display,
+            'current_api_endpoint_name': str(endpoint_name or '').strip(),
+            'current_api_endpoint_base_url': str(endpoint_base_url or '').strip(),
+            'current_api_endpoint_updated_at': now_str(),
+        }
+        for key, value in updates.items():
+            if self.state.get(key, '') != value:
+                self.state[key] = value
+                changed = True
+
+        if changed:
+            self._save_state()
+            self._write_heartbeat(force=True)
+
     def live_print(self, text: str) -> None:
         if not self.args.live_stream or not self._live_stream_available or not text:
             return
         try:
             sys.stdout.write(text)
             sys.stdout.flush()
+            self._live_stream_line_open = not text.endswith('\n')
         except (OSError, ValueError, UnicodeEncodeError) as exc:
             self._live_stream_available = False
+            self._live_stream_line_open = False
             if not self._live_stream_error_logged:
                 self._live_stream_error_logged = True
                 self.log(f'[live_stream] 控制台实时输出已关闭：{exc}')
@@ -1603,6 +2043,8 @@ class AutoNovelRunner:
             existing_titles.append(unique_title)
 
             if unique_title == current_title:
+                if rewrite_files:
+                    self._apply_title_to_record_files(chapter, unique_title)
                 continue
 
             chapter['title'] = unique_title
@@ -1790,8 +2232,7 @@ class AutoNovelRunner:
             self._log_event_only(f'[live_stage] 写入失败：{exc}')
 
     def _stream_text(self, label: str, full_text: str, reset: bool = False, finish: bool = False) -> None:
-
-        full_text = self._sanitize_text(full_text or '')
+        full_text = clean_live_draft_stream_text(self._sanitize_text(full_text or ''))
         if reset or label not in self._stream_cache:
             self._stream_cache[label] = ''
             self.live_print(f'\n===== [{label}] 实时输出开始 =====\n')
@@ -1850,6 +2291,17 @@ class AutoNovelRunner:
             state.setdefault('ending_quality_history', [])
             state.setdefault('ending_polish_cycles', 0)
             state.setdefault('ending_polish_last_rewrite_from_chapter', 0)
+            state.setdefault('humanizer_mode', self.args.humanizer_mode)
+            state.setdefault('humanizer_model', self.args.humanizer_model or self.args.main_model)
+            state.setdefault('humanized_chapters', [])
+            state.setdefault('humanizer_history', [])
+            state.setdefault('current_api_endpoint', '')
+            state.setdefault('current_api_endpoint_name', '')
+            state.setdefault('current_api_endpoint_base_url', '')
+            state.setdefault('current_api_endpoint_updated_at', '')
+            state.setdefault('configured_primary_api_endpoint', '')
+            state.setdefault('configured_primary_api_endpoint_name', '')
+            state.setdefault('configured_primary_api_endpoint_base_url', '')
             self.log(f'检测到已有项目状态，准备续跑：{self.state_path}')
             return state
 
@@ -1887,11 +2339,22 @@ class AutoNovelRunner:
             'current_stage': '',
             'stage_started_at': '',
             'last_stage_heartbeat_at': '',
+            'current_api_endpoint': '',
+            'current_api_endpoint_name': '',
+            'current_api_endpoint_base_url': '',
+            'current_api_endpoint_updated_at': '',
+            'configured_primary_api_endpoint': '',
+            'configured_primary_api_endpoint_name': '',
+            'configured_primary_api_endpoint_base_url': '',
             'completion_check': {},
             'ending_quality_check': {},
             'ending_quality_history': [],
             'ending_polish_cycles': 0,
             'ending_polish_last_rewrite_from_chapter': 0,
+            'humanizer_mode': self.args.humanizer_mode,
+            'humanizer_model': self.args.humanizer_model or self.args.main_model,
+            'humanized_chapters': [],
+            'humanizer_history': [],
         }
         self._save_state(state)
         return state
@@ -2458,6 +2921,7 @@ class AutoNovelRunner:
         last_log_time = start_time
         last_length = 0
         fallback_logged = False
+        last_endpoint_label = None
         final_messages: ChatMessages | None = None
 
         self.mark_stage(label, force=True)
@@ -2471,6 +2935,16 @@ class AutoNovelRunner:
 
             if isinstance(current, ChatMessages):
                 final_messages = current
+                endpoint_name = str(getattr(current, 'api_endpoint_name', '') or '').strip()
+                endpoint_base_url = str(getattr(current, 'api_endpoint_base_url', '') or '').strip()
+                if endpoint_name or endpoint_base_url:
+                    self._set_current_api_endpoint(endpoint_name, endpoint_base_url)
+                    endpoint_label = endpoint_name or endpoint_base_url
+                    if endpoint_name and endpoint_base_url:
+                        endpoint_label = f'{endpoint_name} | {endpoint_base_url}'
+                    if endpoint_label != last_endpoint_label:
+                        self.log(f'[{label}] 当前API链路：{endpoint_label}')
+                        last_endpoint_label = endpoint_label
                 response_text = self._sanitize_text(current.response or '')
                 if getattr(current, 'stream_fallback', False) and not fallback_logged:
                     reason = getattr(current, 'stream_fallback_reason', '') or 'stream transport error'
@@ -2496,6 +2970,7 @@ class AutoNovelRunner:
         endpoint_name = str(getattr(final_messages, 'api_endpoint_name', '') or '').strip()
         endpoint_base_url = str(getattr(final_messages, 'api_endpoint_base_url', '') or '').strip()
         if endpoint_name or endpoint_base_url:
+            self._set_current_api_endpoint(endpoint_name, endpoint_base_url)
             endpoint_label = endpoint_name or endpoint_base_url
             if endpoint_name and endpoint_base_url:
                 endpoint_label = f'{endpoint_name} | {endpoint_base_url}'
@@ -2523,6 +2998,155 @@ class AutoNovelRunner:
             stream_output=False,
         )
         return extract_json_payload(raw)
+
+    def _humanizer_protected_terms(self) -> tuple[str, ...]:
+        rule = self._project_role_only_rule() or {}
+        terms = []
+        for key in ('allowed_names', 'preserved_labels', 'role_labels'):
+            terms.extend(str(item).strip() for item in (rule.get(key) or []) if str(item).strip())
+        return tuple(dict.fromkeys(terms))
+
+    def _humanizer_should_run(self, chapter_number: int) -> bool:
+        mode = str(getattr(self.args, 'humanizer_mode', 'off') or 'off').strip().lower()
+        if mode not in {'review', 'rewrite'}:
+            return False
+        every = max(1, int(getattr(self.args, 'humanizer_every_chapters', 1) or 1))
+        if chapter_number % every != 0:
+            return False
+        completed = {
+            int(item)
+            for item in (self.state.get('humanized_chapters') or [])
+            if str(item).isdigit()
+        }
+        return chapter_number not in completed
+
+    def _record_humanizer_result(
+        self,
+        chapter_number: int,
+        payload: dict[str, Any],
+        *,
+        mark_complete: bool = True,
+    ) -> None:
+        history = list(self.state.get('humanizer_history') or [])
+        history.append({
+            'chapter_number': int(chapter_number),
+            'mode': str(getattr(self.args, 'humanizer_mode', 'off') or 'off'),
+            'at': now_str(),
+            **payload,
+        })
+        self.state['humanizer_history'] = history[-100:]
+        if mark_complete:
+            completed = list(self.state.get('humanized_chapters') or [])
+            if chapter_number not in completed:
+                completed.append(int(chapter_number))
+            self.state['humanized_chapters'] = sorted(set(completed))
+        self._save_state()
+
+    def _apply_humanizer(
+        self,
+        chapter: dict[str, Any],
+        body_text: str,
+        *,
+        outline_text: str = '',
+        plot_text: str = '',
+        previous_summary: str = '',
+    ) -> str:
+        chapter_number = int(chapter.get('chapter_number', 0) or 0)
+        if not self._humanizer_should_run(chapter_number):
+            return body_text
+
+        mode = str(self.args.humanizer_mode).strip().lower()
+        title = str(chapter.get('title', '') or '').strip()
+        protected_terms = self._humanizer_protected_terms()
+        if mode == 'review':
+            prompt = build_humanizer_review_prompt(
+                chapter_number=chapter_number,
+                title=title,
+                body=body_text,
+                outline=outline_text,
+                plot=plot_text,
+            )
+            try:
+                report = self.with_retry(
+                    f'第{chapter_number}章人味审校',
+                    lambda: self.call_llm_json(
+                        f'第{chapter_number}章人味审校',
+                        prompt,
+                        self.humanizer_model,
+                        system_prompt='你是中文网文语言质量审校员，只返回合法 JSON，不改剧情，不讨论AI检测。',
+                    ),
+                    retries=1,
+                )
+            except Exception as exc:
+                self.log(f'[humanizer] 第{chapter_number}章审校失败，保留原稿：{exc}')
+                return body_text
+            self._record_humanizer_result(chapter_number, {
+                'quality_score': report.get('quality_score', 0),
+                'should_rewrite': bool(report.get('should_rewrite')),
+                'issues': list(report.get('issues') or [])[:8],
+                'rewrite_focus': list(report.get('rewrite_focus') or [])[:3],
+            })
+            self.log(
+                f'[humanizer] 第{chapter_number}章审校完成：'
+                f'评分={report.get("quality_score", 0)}，建议改写={bool(report.get("should_rewrite"))}'
+            )
+            return body_text
+
+        prompt = build_humanizer_prompt(
+            chapter_number=chapter_number,
+            title=title,
+            body=body_text,
+            outline=outline_text,
+            plot=plot_text,
+            previous_summary=previous_summary,
+            protected_terms=protected_terms,
+        )
+        try:
+            revised = self.with_retry(
+                f'第{chapter_number}章人味改写',
+                lambda: self._call_llm_raw(
+                    f'第{chapter_number}章人味改写',
+                    prompt,
+                    self.humanizer_model,
+                    system_prompt='你是中文网文质量编辑，只做语言层改写，不能改变剧情事实和章节边界。',
+                    response_json=False,
+                    stream_output=True,
+                ),
+                retries=1,
+            )
+            revised = normalize_humanizer_output(
+                revised,
+                chapter_number=chapter_number,
+                title=title,
+            )
+            validation = validate_humanizer_revision(
+                body_text,
+                revised,
+                protected_terms=protected_terms,
+            )
+            if not validation.valid:
+                raise RuntimeError(
+                    f'人味改写未通过保护校验：{validation.reason}'
+                    + (f'，缺失专名={",".join(validation.protected_missing)}' if validation.protected_missing else '')
+                )
+        except Exception as exc:
+            self._record_humanizer_result(chapter_number, {
+                'rewritten': False,
+                'skipped_reason': str(exc),
+            }, mark_complete=False)
+            self.log(f'[humanizer] 第{chapter_number}章改写未通过，保留原稿：{exc}')
+            return body_text
+        self._record_humanizer_result(chapter_number, {
+            'quality_score': 0,
+            'rewritten': True,
+            'original_chars': validation.original_chars,
+            'revised_chars': validation.revised_chars,
+        })
+        self.log(
+            f'[humanizer] 第{chapter_number}章改写完成：'
+            f'{validation.original_chars}->{validation.revised_chars}字，已通过边界校验'
+        )
+        return revised
 
     def _should_run_critic_for_chapter(self, chapter_number: int, force: bool = False) -> bool:
         if force:
@@ -2929,8 +3553,9 @@ class AutoNovelRunner:
                     if not output:
                         continue
                     response_msgs = output.get('response_msgs') if isinstance(output, dict) else None
-                    text_part = getattr(response_msgs, 'response', '') if response_msgs is not None else ''
-                    text_part = text_part or (output.get('text', '') if isinstance(output, dict) else '')
+                    text_part = output.get('text', '') if isinstance(output, dict) else ''
+                    if not text_part and response_msgs is not None:
+                        text_part = getattr(response_msgs, 'response', '')
                     if text_part and '正在建立映射关系' not in text_part:
                         merged_parts.append(text_part)
                 merged_text = '\n'.join(part for part in merged_parts if part)
@@ -2964,7 +3589,11 @@ class AutoNovelRunner:
                 if attempt > 1:
                     suffix = '（无限重试模式）' if infinite_retry else ''
                     self.log(f'[{label}] 第 {attempt} 次尝试{suffix}')
-                return func()
+                result = func()
+                if self.state.get('last_error'):
+                    self.state['last_error'] = ''
+                    self._save_state()
+                return result
             except Exception as exc:
                 last_error = exc
                 self.state['last_error'] = f'{label}: {exc}'
@@ -2975,13 +3604,49 @@ class AutoNovelRunner:
                 if not infinite_retry and attempt >= retries:
                     raise
                 sleep_seconds = self.args.retry_backoff_seconds * attempt
+                provider_retry_after = extract_retry_after_seconds_from_error(exc)
+                fast_retry = self._should_fast_retry(label, exc)
+                if fast_retry:
+                    sleep_seconds = 0
                 if infinite_retry:
-                    sleep_seconds = min(sleep_seconds, max(self.args.retry_backoff_seconds, 300))
+                    if not fast_retry:
+                        sleep_seconds = min(sleep_seconds, max(self.args.retry_backoff_seconds, 300))
+                    if provider_retry_after is not None and not fast_retry:
+                        sleep_seconds = min(sleep_seconds, max(provider_retry_after, 5))
                     self.log(f'[{label}] 无限重试模式，{sleep_seconds}s 后继续重试')
                 else:
+                    if provider_retry_after is not None and not fast_retry:
+                        sleep_seconds = min(sleep_seconds, max(provider_retry_after, 5))
                     self.log(f'[{label}] {sleep_seconds}s 后重试')
                 time.sleep(sleep_seconds)
         raise RuntimeError(str(last_error))
+
+    def _model_uses_local_endpoint(self, model: ModelConfig | None) -> bool:
+        if not model:
+            return False
+        api_chain = model.get('api_chain') or []
+        for entry in api_chain:
+            base_url = entry.get('base_url') or entry.get('endpoint') or entry.get('url')
+            if is_probably_local_base_url(base_url):
+                return True
+        return is_probably_local_base_url(model.get('base_url'))
+
+    def _uses_local_writer_endpoint(self) -> bool:
+        return self._model_uses_local_endpoint(getattr(self, 'writer_model', None))
+
+    def _should_fast_retry(self, label: str, exc: Exception) -> bool:
+        if not self._uses_local_writer_endpoint():
+            return False
+        text = str(exc or '')
+        if '扩写后字数仍不足' in text:
+            return True
+        if '返回文本过短' in text:
+            return True
+        if 'expand still below min chars' in text:
+            return True
+        if '字数不足' in text and ('正文' in label or '扩写' in label):
+            return True
+        return False
 
     def _series_bible_part_path(self, part_index: int) -> Path:
         return self.series_bible_parts_dir / f'part_{part_index:02d}.md'
@@ -4604,7 +5269,11 @@ class AutoNovelRunner:
 - {batch_scope_rule.lstrip('- ').strip()}
 - {batch_style_rule.lstrip('- ').strip()}
 - 章节编号必须使用阿拉伯数字格式“第1章”，禁止写成“第一章”“第Ⅰ章”“Chapter 1”
-- 每章第一行只允许写“第N章 标题”；标题必须是短标题，建议 4-12 字，最多 {MAX_CHAPTER_TITLE_LENGTH} 字，禁止把剧情推进句、人物关系说明、章末钩子写进标题行
+- 每章第一行只允许写“第N章 标题”；标题必须是 4-10 字、最多 {MAX_CHAPTER_TITLE_LENGTH} 字，禁止把完整剧情说明或被截断的长句塞进标题行
+- 标题是给读者看的，不是后台日志或大纲标签；优先使用本章独有的危险、秘密、动作、人物冲突、关键对白或情绪反差
+- 标题句式要自然变化：对白式、动作式、悬念式、人物关系式交替使用，不能整批都是四字名词，也不能整批都以“她”“谁”“不”开头
+- 除非是本章不可替代的核心物件，标题禁止堆砌“回执、归档、样本、验证、存续、签发、执行、裁定、留痕、权限、入口、模板、方案、编号、字段、定义权、连续性”等后台术语
+- 即使本章承担终章功能，标题也禁止直接使用“尾声、合章、收束、结局、后日谈、普通日、是否继续”等写作提纲词
 - 新章节标题必须全书唯一；禁止与任何已完成章节或本批次其他章节重名，若语义接近也要主动换一种叫法
 - {chapter_end_rule.lstrip('- ').strip()}
 - 单章定位是“章节大纲”，不是正文，不要写成小说正文
@@ -4623,6 +5292,12 @@ class AutoNovelRunner:
         if project_role_rule:
             outline_prompt += f"\n补充硬规则：\n- {project_role_rule}\n"
 
+        reserved_title_keys = {
+            normalize_heading_compare_text(title)
+            for title in self._existing_story_titles()
+            if normalize_heading_compare_text(title)
+        }
+
         def _plan():
             writer = OutlineWriter(
                 [('', '')],
@@ -4637,7 +5312,27 @@ class AutoNovelRunner:
             outlines = [pair[1].strip() for pair in pairs if pair[1].strip()]
             if len(outlines) < batch_size:
                 raise RuntimeError(f'本批只产出 {len(outlines)} 章大纲，少于预期的 {batch_size} 章。')
-            return outlines[:batch_size]
+            selected_outlines = outlines[:batch_size]
+            if not self._is_title_only_story():
+                seen_title_keys = set(reserved_title_keys)
+                for offset, raw_outline in enumerate(selected_outlines):
+                    chapter_number = next_chapter + offset
+                    normalized_outline = normalize_outline_text(chapter_number, raw_outline)
+                    title = safe_title(normalized_outline)
+                    quality_issues = chapter_title_quality_issues(title)
+                    if quality_issues:
+                        raise RuntimeError(
+                            f'第{chapter_number}章标题“{title}”不符合读者向标题要求：'
+                            f'{"；".join(quality_issues)}。请重新规划整批标题。'
+                        )
+                    title_key = normalize_heading_compare_text(title)
+                    if title_key in seen_title_keys:
+                        raise RuntimeError(
+                            f'第{chapter_number}章标题“{title}”与已有章节或本批标题重复，'
+                            '请重新规划整批标题。'
+                        )
+                    seen_title_keys.add(title_key)
+            return selected_outlines
 
         outlines = self.with_retry(f'规划章节 {next_chapter}-{chapter_end}', _plan)
         self.clear_error()
@@ -4925,6 +5620,21 @@ class AutoNovelRunner:
             label=f'第{chapter["chapter_number"]}章正文',
         )
         if cached_draft:
+            if self._humanizer_should_run(int(chapter.get('chapter_number', 0) or 0)):
+                cached_body = self._chapter_body_text(chapter, cached_draft)
+                cached_body = self._apply_humanizer(
+                    chapter,
+                    cached_body,
+                    outline_text=read_text(Path(chapter['outline_file'])),
+                    plot_text=plot_text,
+                )
+                cached_draft = normalize_chapter_draft_text(
+                    chapter['chapter_number'],
+                    chapter['title'],
+                    cached_body,
+                    heading_mode=self._draft_heading_mode(),
+                )
+                write_text(draft_path, cached_draft)
             return cached_draft
 
         min_chars = max(1400, int(self.args.chapter_char_target * 0.8))
@@ -4990,9 +5700,15 @@ class AutoNovelRunner:
             if self._in_terminal_finish_mode():
                 draft_ending_rule = '- 结尾必须朝全文结束直接推进；若本章已适合成为正文终章、尾声章或后日谈章，就直接写到位，不得再留新的程序性悬念'
             title_line_rule = f'- 最终正文标题行必须使用阿拉伯数字格式“第{chapter["chapter_number"]}章 标题”，禁止写成“第一章”“第Ⅰ章”“Chapter 1”'
+            title_quality_rule = (
+                '- 章节标题必须保留大纲中的读者钩子感：像真人作者写给读者，'
+                '优先具体动作、危险、秘密、对白或人物关系；'
+                '禁止改成“回执、样本、归档、验证、执行期、尾声、合章”等后台或提纲标题'
+            )
             chapter_role_rule = f'- 这是第 {chapter["chapter_number"]} 章，必须保留并优化章节标题感'
             if self._draft_heading_mode() == 'title_only':
                 title_line_rule = f'- 这是单篇短故事，最终正文开头只保留作品标题“{chapter["title"]}”，禁止出现“第1章”“第一章”“第Ⅰ章”“Chapter 1”等章节编号'
+                title_quality_rule = '- 作品标题必须保留既定书名，不得擅自改名'
                 chapter_role_rule = '- 这是单篇短故事的唯一正文，不要写成连载章节'
             style_rule = '- 风格：番茄风、强代入、强画面、强对白、强追读'
             if self._is_title_only_story():
@@ -5003,6 +5719,7 @@ class AutoNovelRunner:
 要求：
 - {chapter_role_rule.lstrip('- ').strip()}
 - {title_line_rule.lstrip('- ').strip()}
+- {title_quality_rule.lstrip('- ').strip()}
 - {style_rule.lstrip('- ').strip()}
 - 题材、世界观、力量体系、人物关系和冲突类型必须严格服从本书设定
 - 重点写清人物目标、阻力、选择、代价、反制与变化
@@ -5077,27 +5794,56 @@ class AutoNovelRunner:
 """
 
             def _expand() -> str:
-                writer = DraftWriter(
-                    [(plot_text, draft_text)],
-                    {},
-                    model=self.writer_model,
-                    sub_model=self.sub_model,
-                    x_chunk_length=800,
-                    y_chunk_length=expand_y_chunk_length,
-                    max_thread_num=self.args.max_thread_num,
-                )
-                pairs = self.run_writer(f'第{chapter["chapter_number"]}章扩写', writer, expand_prompt, pair_span=(0, len(writer.xy_pairs)))
-                text = ''.join(pair[1] for pair in pairs).strip()
-                if len(text) < min_chars:
-                    raise RuntimeError('扩写后字数仍不足。')
-                return text
+                current_text = draft_text
+                previous_lengths: list[int] = []
+                max_expand_rounds = 12 if self._uses_local_writer_endpoint() else 4
+                min_growth = 120 if self._uses_local_writer_endpoint() else 180
+                expand_label = f'chapter_{chapter["chapter_number"]}_expand'
+                for round_index in range(1, max_expand_rounds + 1):
+                    writer = DraftWriter(
+                        [(plot_text, current_text)],
+                        {},
+                        model=self.writer_model,
+                        sub_model=self.sub_model,
+                        x_chunk_length=800,
+                        y_chunk_length=expand_y_chunk_length,
+                        max_thread_num=self.args.max_thread_num,
+                    )
+                    pairs = self.run_writer(
+                        expand_label,
+                        writer,
+                        expand_prompt,
+                        pair_span=(0, len(writer.xy_pairs)),
+                    )
+                    text = ''.join(pair[1] for pair in pairs).strip()
+                    if len(text) >= min_chars:
+                        return text
+                    growth = len(text) - len(current_text)
+                    self.log(
+                        f'[{expand_label}] round {round_index} still short: '
+                        f'{len(text)}/{min_chars}, growth {growth}'
+                    )
+                    if len(text) <= len(current_text):
+                        raise RuntimeError(
+                            f'expand still below min chars and not growing: current {len(text)}, min {min_chars}'
+                        )
+                    previous_lengths.append(len(text))
+                    if len(previous_lengths) >= 3:
+                        recent_deltas = [
+                            previous_lengths[i] - previous_lengths[i - 1]
+                            for i in range(1, len(previous_lengths))
+                        ][-2:]
+                        if len(recent_deltas) == 2 and all(delta < min_growth for delta in recent_deltas):
+                            raise RuntimeError(
+                                f'expand still below min chars and growth too small: current {len(text)}, min {min_chars}'
+                            )
+                    current_text = text
+                raise RuntimeError(f'expand still below min chars: current {len(current_text)}, min {min_chars}')
+
 
             draft_text = self.with_retry(f'第{chapter["chapter_number"]}章扩写', _expand)
             self.clear_error()
 
-        if not self._is_title_only_story():
-            draft_text = self._enforce_project_role_labels(f'第{chapter["chapter_number"]}章正文', draft_text)
-            self.clear_error()
         draft_text = normalize_chapter_draft_text(
             chapter['chapter_number'],
             chapter['title'],
@@ -5125,6 +5871,33 @@ class AutoNovelRunner:
             plot_text=plot_text,
             previous_summary=previous_summary,
             label=f'第{chapter["chapter_number"]}章结尾修补',
+        )
+        draft_body = self._chapter_body_text(chapter, draft_text)
+        draft_body = self._apply_humanizer(
+            chapter,
+            draft_body,
+            outline_text=outline_text,
+            plot_text=plot_text,
+            previous_summary=previous_summary,
+        )
+        draft_text = normalize_chapter_draft_text(
+            chapter['chapter_number'],
+            chapter['title'],
+            draft_body,
+            heading_mode=self._draft_heading_mode(),
+        )
+        draft_text = self._enforce_project_role_labels(
+            f'第{chapter["chapter_number"]}章人味后正文',
+            draft_text,
+        )
+        self.clear_error()
+        draft_text = self._repair_chapter_draft_if_needed(
+            chapter,
+            draft_text,
+            outline_text=outline_text,
+            plot_text=plot_text,
+            previous_summary=previous_summary,
+            label=f'第{chapter["chapter_number"]}章人味后结尾复核',
         )
         write_text(draft_path, draft_text)
         chapter['status'] = 'drafted'
@@ -5994,9 +6767,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--ending-polish-model', default='')
     parser.add_argument('--ending-polish-reasoning-effort', default='xhigh')
     parser.add_argument('--ending-polish-max-cycles', type=int, default=2)
+    parser.add_argument('--humanizer-mode', choices=['off', 'review', 'rewrite'], default='off')
+    parser.add_argument('--humanizer-model', default='')
+    parser.add_argument('--humanizer-reasoning-effort', default='high')
+    parser.add_argument('--humanizer-every-chapters', type=int, default=1)
     parser.add_argument('--max-thread-num', type=int, default=1)
     parser.add_argument('--max-retries', type=int, default=0)
-    parser.add_argument('--retry-backoff-seconds', type=int, default=15)
+    parser.add_argument('--retry-backoff-seconds', type=int, default=3600)
     parser.add_argument('--max-chapters', type=int, default=0)
     parser.add_argument('--title-only-story', action='store_true')
     parser.add_argument('--live-stream', action='store_true')

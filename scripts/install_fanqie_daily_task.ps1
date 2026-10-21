@@ -42,6 +42,10 @@ $runner = Join-Path $repoRoot 'run_daily_fanqie_uploads_once.bat'
 if (-not (Test-Path $runner)) {
     throw "未找到单次执行脚本：$runner"
 }
+$catchupRunner = Join-Path $repoRoot 'run_daily_fanqie_uploads_catchup.bat'
+if (-not (Test-Path $catchupRunner)) {
+    throw "未找到登录补传执行脚本：$catchupRunner"
+}
 $authorRunner = Join-Path $repoRoot 'run_daily_fanqie_author_checkin_once.bat'
 
 function Parse-TaskQueryOutput {
@@ -196,6 +200,40 @@ function Register-WeeklyTask {
     return $queryOutput
 }
 
+function Register-LogonTask {
+    param(
+        [string]$TaskNameForCreate,
+        [string]$RunnerPath
+    )
+
+    $createArgs = @(
+        '/Create',
+        '/SC', 'ONLOGON',
+        '/TN', $TaskNameForCreate,
+        '/TR', $RunnerPath,
+        '/F'
+    )
+
+    $queryArgs = @(
+        '/Query',
+        '/TN', $TaskNameForCreate,
+        '/V',
+        '/FO', 'LIST'
+    )
+
+    $createOutput = & schtasks @createArgs 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw ($createOutput -join [Environment]::NewLine)
+    }
+
+    $queryOutput = & schtasks @queryArgs 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw ($queryOutput -join [Environment]::NewLine)
+    }
+
+    return $queryOutput
+}
+
 function Remove-TaskIfExists {
     param([string]$TaskNameForDelete)
 
@@ -216,6 +254,24 @@ function Remove-TaskIfExists {
 }
 
 $queryOutput = Register-WeeklyTask -TaskNameForCreate $taskNameValue -StartTimeForCreate $startTimeValue -DaysForCreate (Normalize-Days -RawDays $days -FallbackDays @()) -RunnerPath $runner
+$catchupTaskNameValue = "$taskNameValue-OnLogonCatchUp"
+$catchupQueryOutput = Register-LogonTask -TaskNameForCreate $catchupTaskNameValue -RunnerPath $catchupRunner
+
+$mainTask = Get-ScheduledTask -TaskName $taskNameValue
+$mainSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 72) -MultipleInstances IgnoreNew
+Set-ScheduledTask -InputObject $mainTask -Settings $mainSettings | Out-Null
+$queryOutput = & schtasks /Query /TN $taskNameValue /V /FO LIST 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw ($queryOutput -join [Environment]::NewLine)
+}
+
+$catchupTask = Get-ScheduledTask -TaskName $catchupTaskNameValue
+$catchupSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 72) -MultipleInstances IgnoreNew
+Set-ScheduledTask -InputObject $catchupTask -Settings $catchupSettings | Out-Null
+$catchupQueryOutput = & schtasks /Query /TN $catchupTaskNameValue /V /FO LIST 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw ($catchupQueryOutput -join [Environment]::NewLine)
+}
 
 $authorTaskSummary = $null
 $authorTaskNameValue = if ($authorCheckIn) {
@@ -254,6 +310,7 @@ Write-Output "计划任务创建或更新命令已成功执行。"
 Write-Output ("计划任务已创建或更新：{0}" -f $taskNameValue)
 Write-Output ("配置文件：{0}" -f $resolvedConfig)
 Write-Output ("执行脚本：{0}" -f $runner)
+Write-Output ("登录补传脚本：{0}" -f $catchupRunner)
 Write-Output ("每周执行日：{0}" -f (Format-WeekdayList $days))
 Write-Output ("开始时间：{0}" -f $startTimeValue)
 if ($authorCheckInRunsAfterUpload) {
@@ -263,6 +320,9 @@ if ($authorCheckInRunsAfterUpload) {
 Write-Output ""
 Write-Output "当前任务状态："
 Write-Output ((Format-TaskSummary -TaskNameForDisplay $taskNameValue -QueryOutput $queryOutput) -join [Environment]::NewLine)
+Write-Output ""
+Write-Output "登录补传任务状态："
+Write-Output ((Format-TaskSummary -TaskNameForDisplay $catchupTaskNameValue -QueryOutput $catchupQueryOutput) -join [Environment]::NewLine)
 if ($authorTaskSummary) {
     Write-Output ""
     Write-Output "签到修复任务状态："

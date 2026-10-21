@@ -43,7 +43,8 @@ class ChatMessages(list):
             from .doubao_api import doubao_model_config
             from .openai_api import gpt_model_config
             from .zhipuai_api import zhipuai_model_config
-            model_config.update({**wenxin_model_config, **doubao_model_config, **gpt_model_config, **zhipuai_model_config})
+            from .anthropic_api import anthropic_model_config
+            model_config.update({**wenxin_model_config, **doubao_model_config, **gpt_model_config, **zhipuai_model_config, **anthropic_model_config})
     
     def __getitem__(self, index):
         result = super().__getitem__(index)

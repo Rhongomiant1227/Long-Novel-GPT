@@ -7,6 +7,12 @@ print("Loading .env file...")
 env_path = os.path.join(os.path.dirname(__file__), '.env')
 DEFAULT_OPENAI_COMPAT_BASE_URL = os.getenv('DEFAULT_OPENAI_COMPAT_BASE_URL', 'https://www.ananapi.com/')
 DEFAULT_SUB2API_CHAIN_FILE = Path.home() / '.codex' / 'sub2api_priority.json'
+DEFAULT_FAST_BASE_URL = os.getenv('DEFAULT_FAST_BASE_URL', 'https://fast.sbbbbbbbbb.xyz/v1')
+DEFAULT_FAST_AUTH_FILE = Path(
+    os.getenv('FAST_AUTH_FILE', str(Path.home() / '.codex' / 'fast_sbbbb_auth.json'))
+).expanduser()
+DEFAULT_CLAUDE_BASE_URL = os.getenv('DEFAULT_CLAUDE_BASE_URL', 'https://api.sbbbbbbbbb.xyz/v1')
+DEFAULT_CLAUDE_API_KEY = os.getenv('DEFAULT_CLAUDE_API_KEY', '')
 
 
 def _load_openai_fallback_env():
@@ -137,6 +143,7 @@ def _normalize_openai_chain_entry(prefix, entry, index, default_proxies=''):
         'base_url': base_url,
         'api_key': api_key,
         'proxies': str(entry.get('proxies') or default_proxies or '').strip(),
+        'cooldown_overrides': entry.get('cooldown_overrides') if isinstance(entry.get('cooldown_overrides'), dict) else None,
     }
 
 
@@ -215,13 +222,27 @@ def _default_token_limits(provider, available_models=None):
     default_input_tokens = 4096
     default_output_tokens = 4096
 
-    if provider in {'gpt', 'sub2api'} and any(model.startswith('gpt-5') for model in models):
+    if provider in {'gpt', 'sub2api', 'fast'} and any(
+        model.startswith(('gpt-5', 'grok-')) for model in models
+    ):
         # ChatMessages uses a rough heuristic tokenizer and underestimates Chinese prompts.
         # Keep a wide safety margin by default, while still using much more context than 200k.
-        context_window = _read_int_env('GPT_CONTEXT_WINDOW') or 1_000_000
-        input_budget_ratio = _read_float_env('GPT_INPUT_BUDGET_RATIO') or 0.35
-        default_input_tokens = max(200000, min(context_window, int(context_window * input_budget_ratio)))
-        default_output_tokens = 65536
+        context_window = _read_int_env(
+            'FAST_CONTEXT_WINDOW' if provider == 'fast' else 'GPT_CONTEXT_WINDOW'
+        ) or (256_000 if provider == 'fast' else 1_000_000)
+        input_budget_ratio = _read_float_env(
+            'FAST_INPUT_BUDGET_RATIO' if provider == 'fast' else 'GPT_INPUT_BUDGET_RATIO'
+        ) or 0.35
+        default_input_tokens = max(
+            60_000 if provider == 'fast' else 200_000,
+            min(context_window, int(context_window * input_budget_ratio)),
+        )
+        default_output_tokens = 16_000 if provider == 'fast' else 65_536
+    elif provider == 'claude':
+        context_window = _read_int_env('CLAUDE_CONTEXT_WINDOW') or 200_000
+        input_budget_ratio = _read_float_env('CLAUDE_INPUT_BUDGET_RATIO') or 0.75
+        default_input_tokens = max(120000, min(context_window, int(context_window * input_budget_ratio)))
+        default_output_tokens = 8192
 
     if legacy_max_tokens is not None:
         default_input_tokens = legacy_max_tokens
@@ -325,6 +346,31 @@ API_SETTINGS = {
         'available_models': _first_env('SUB2API_AVAILABLE_MODELS', 'GPT_AVAILABLE_MODELS').split(','),
         **SUB2API_API_CHAIN_SETTINGS,
         **_default_token_limits('sub2api', _first_env('SUB2API_AVAILABLE_MODELS', 'GPT_AVAILABLE_MODELS').split(',')),
+    },
+    'fast': {
+        'base_url': os.getenv('FAST_BASE_URL', DEFAULT_FAST_BASE_URL),
+        'api_key': (
+            os.getenv('FAST_API_KEY', '').strip()
+            or _read_openai_api_key_from_auth_file(str(DEFAULT_FAST_AUTH_FILE))
+        ),
+        'proxies': os.getenv('FAST_PROXIES', ''),
+        'reasoning_effort': os.getenv('FAST_REASONING_EFFORT', ''),
+        'temperature': os.getenv('FAST_TEMPERATURE', ''),
+        'top_p': os.getenv('FAST_TOP_P', ''),
+        'timeout': float(os.getenv('FAST_TIMEOUT_SECONDS', 3600)),
+        'max_retries': int(os.getenv('FAST_MAX_RETRIES', 3)),
+        'available_models': os.getenv('FAST_AVAILABLE_MODELS', 'grok-4.5,grok-4.6,gpt-5.5').split(','),
+        **_default_token_limits('fast', os.getenv('FAST_AVAILABLE_MODELS', 'grok-4.5,grok-4.6,gpt-5.5').split(',')),
+    },
+    'claude': {
+        'base_url': os.getenv('CLAUDE_BASE_URL', DEFAULT_CLAUDE_BASE_URL),
+        'api_key': os.getenv('CLAUDE_API_KEY', DEFAULT_CLAUDE_API_KEY),
+        'wire_api': 'anthropic_messages',
+        'temperature': os.getenv('CLAUDE_TEMPERATURE', ''),
+        'top_p': os.getenv('CLAUDE_TOP_P', ''),
+        'timeout': float(os.getenv('CLAUDE_TIMEOUT_SECONDS', 3600)),
+        'available_models': os.getenv('CLAUDE_AVAILABLE_MODELS', 'claude-opus-4-8').split(','),
+        **_default_token_limits('claude', os.getenv('CLAUDE_AVAILABLE_MODELS', 'claude-opus-4-8').split(',')),
     },
     'zhipuai': {
         'api_key': os.getenv('ZHIPUAI_API_KEY', ''),

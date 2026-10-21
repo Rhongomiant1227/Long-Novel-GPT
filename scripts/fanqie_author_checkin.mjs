@@ -368,8 +368,24 @@ async function cloneProfileSeed(seedDir, targetDir) {
 }
 
 function createLogger(logFile) {
+  const formatter = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Hong_Kong",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
   return (message) => {
-    const stamp = new Date().toISOString().replace("T", " ").slice(0, 19);
+    const parts = Object.create(null);
+    for (const part of formatter.formatToParts(new Date())) {
+      if (part.type !== "literal") {
+        parts[part.type] = part.value;
+      }
+    }
+    const stamp = `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
     const line = `${stamp} | ${message}`;
     console.log(line);
     fs.appendFileSync(logFile, `${line}\n`, "utf8");

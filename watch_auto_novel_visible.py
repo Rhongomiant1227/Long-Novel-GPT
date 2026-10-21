@@ -100,6 +100,37 @@ def read_runner_heartbeat(heartbeat_path: Path) -> dict:
     }
 
 
+def _read_single_provider_fast_restart_seconds() -> int:
+    raw_value = os.getenv('LONG_NOVEL_SINGLE_PROVIDER_RESTART_DELAY_SECONDS', '').strip()
+    if not raw_value:
+        return 30
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return 30
+    return max(0, value)
+
+
+def _count_configured_api_providers() -> int:
+    chain_file = Path.home() / '.codex' / 'sub2api_priority.json'
+    if not chain_file.exists():
+        return 0
+    try:
+        payload = json.loads(chain_file.read_text(encoding='utf-8-sig'))
+    except Exception:
+        return 0
+    providers = payload.get('providers')
+    if not isinstance(providers, list):
+        return 0
+    count = 0
+    for item in providers:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get('base_url') or '').strip():
+            count += 1
+    return count
+
+
 def get_signal_age_seconds(timestamp_text: str) -> float | None:
     timestamp = parse_timestamp(timestamp_text)
     if timestamp is None:
@@ -482,11 +513,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--ending-polish-max-cycles', type=int, default=2)
     parser.add_argument('--max-thread-num', type=int, default=1)
     parser.add_argument('--max-retries', type=int, default=0)
-    parser.add_argument('--retry-backoff-seconds', type=int, default=15)
+    parser.add_argument('--retry-backoff-seconds', type=int, default=3600)
     parser.add_argument('--max-chapters', type=int, default=0)
     parser.add_argument('--title-only-story', action='store_true')
     parser.add_argument('--stall-timeout-seconds', type=int, default=600)
-    parser.add_argument('--restart-delay-seconds', type=int, default=15)
+    parser.add_argument('--restart-delay-seconds', type=int, default=3600)
     parser.add_argument('--heartbeat-interval-seconds', type=int, default=30)
     parser.add_argument('--runner-heartbeat-grace-seconds', type=int, default=1200)
     parser.add_argument('--max-stage-runtime-seconds', type=int, default=0)
@@ -532,6 +563,13 @@ def main() -> int:
         return 2
 
     try:
+        configured_provider_count = _count_configured_api_providers()
+        effective_restart_delay_seconds = args.restart_delay_seconds
+        if configured_provider_count == 1:
+            effective_restart_delay_seconds = min(
+                args.restart_delay_seconds,
+                _read_single_provider_fast_restart_seconds(),
+            )
         while True:
             state_snapshot = read_state_snapshot(state_path)
             if state_snapshot['status'] == 'manual_review_required':
@@ -548,8 +586,8 @@ def main() -> int:
             if run_status == 'deadline':
                 log('watchdog stop deadline reached; exits without restart')
                 return 0
-            log(f'restarting after {args.restart_delay_seconds}s')
-            time.sleep(args.restart_delay_seconds)
+            log(f'restarting after {effective_restart_delay_seconds}s')
+            time.sleep(effective_restart_delay_seconds)
     except KeyboardInterrupt:
         log('watchdog interrupted by user')
         return 130

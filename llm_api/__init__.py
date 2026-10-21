@@ -6,6 +6,7 @@ from .doubao_api import stream_chat_with_doubao, doubao_model_config
 from .chat_messages import ChatMessages
 from .openai_api import stream_chat_with_gpt, gpt_model_config
 from .zhipuai_api import stream_chat_with_zhipuai, zhipuai_model_config
+from .anthropic_api import stream_chat_with_anthropic, anthropic_model_config
 
 
 class ModelConfig(dict):
@@ -42,6 +43,8 @@ class ModelConfig(dict):
             check_key("Doubao", ["api_key", "endpoint_id"])
         elif model_name in zhipuai_model_config:
             check_key("ZhipuAI", ["api_key"])
+        elif self.get("wire_api") == "anthropic_messages" or model_name in anthropic_model_config:
+            check_key("Anthropic", ["api_key"])
         else:
             # Unknown model names fall back to OpenAI-compatible calling.
             check_key("OpenAI", ["api_key"])
@@ -98,6 +101,20 @@ def stream_chat(model_config: ModelConfig, messages: list, response_json=False) 
             max_tokens=max_output_tokens,
             response_json=response_json,
         )
+    elif model_config.get("wire_api") == "anthropic_messages" or model_config["model"] in anthropic_model_config:
+        result = yield from stream_chat_with_anthropic(
+            messages,
+            model=model_config["model"],
+            api_key=model_config["api_key"],
+            base_url=model_config.get("base_url"),
+            max_tokens=max_output_tokens,
+            response_json=response_json,
+            proxies=model_config.get("proxies"),
+            temperature=model_config.get("temperature"),
+            top_p=model_config.get("top_p"),
+            timeout=model_config.get("timeout"),
+            extra_headers=model_config.get("headers"),
+        )
     else:
         result = yield from stream_chat_with_gpt(
             messages,
@@ -140,5 +157,6 @@ __all__ = [
     "doubao_model_config",
     "gpt_model_config",
     "zhipuai_model_config",
+    "anthropic_model_config",
     "ModelConfig",
 ]

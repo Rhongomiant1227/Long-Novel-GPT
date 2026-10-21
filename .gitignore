@@ -41,10 +41,11 @@ yarn-error.log*
 
 # OS
 .DS_Store
-Thumbs.db 
+Thumbs.db
 # Auto novel local data
 auto_projects/
 .run/
+external/
 test_output/
 novel_brief.md
 *.pid

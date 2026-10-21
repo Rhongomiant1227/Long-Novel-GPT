@@ -54,6 +54,10 @@ Write-Host ("updated_at            : {0}" -f $state.updated_at)
 if ($state.current_stage) { Write-Host ("current_stage         : {0}" -f $state.current_stage) }
 if ($state.stage_started_at) { Write-Host ("stage_started_at      : {0}" -f $state.stage_started_at) }
 if ($state.last_stage_heartbeat_at) { Write-Host ("stage_heartbeat_at    : {0}" -f $state.last_stage_heartbeat_at) }
+if ($state.current_api_endpoint) { Write-Host ("current_api_endpoint  : {0}" -f $state.current_api_endpoint) }
+elseif ($state.current_api_endpoint_base_url) { Write-Host ("current_api_endpoint  : {0}" -f $state.current_api_endpoint_base_url) }
+if ($state.configured_primary_api_endpoint) { Write-Host ("configured_api        : {0}" -f $state.configured_primary_api_endpoint) }
+elseif ($state.configured_primary_api_endpoint_base_url) { Write-Host ("configured_api        : {0}" -f $state.configured_primary_api_endpoint_base_url) }
 if ($state.last_error) {
     Write-Host ("last_error            : {0}" -f $state.last_error)
 }

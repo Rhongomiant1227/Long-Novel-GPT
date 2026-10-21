@@ -4,11 +4,32 @@ from prompts.chat_utils import chat, log
 from prompts.pf_parse_chat import parse_chat
 from prompts.prompt_utils import load_text, match_code_block
 
+
+def _normalize_compare_text(text):
+    return re.sub(r'\s+', '', text or '')
+
+
+def _dedupe_blocks(blocks):
+    deduped = []
+    seen = set()
+    for block in blocks:
+        cleaned = (block or '').strip()
+        if not cleaned:
+            continue
+        normalized = _normalize_compare_text(cleaned)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(cleaned)
+    return deduped
+
+
 def parser(response_msgs):
     content = response_msgs.response
     blocks = match_code_block(content)
     if blocks:
-        concat_blocks = "\n".join(blocks)
+        deduped_blocks = _dedupe_blocks(blocks)
+        concat_blocks = "\n".join(deduped_blocks)
         if concat_blocks.strip():
             content = concat_blocks
     return content

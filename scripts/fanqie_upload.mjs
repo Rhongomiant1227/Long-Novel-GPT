@@ -6,12 +6,30 @@ import process from "node:process";
 import readline from "node:readline/promises";
 
 import { chromium } from "playwright-core";
+import {
+  auditLocalProject,
+  compactText as 紧凑文本,
+  titleQualityIssues,
+} from "./fanqie_title_integrity.mjs";
 
 const 默认起始网址 = "https://fanqienovel.com/main/writer/?enter_from=author_zone";
 const 默认_OPENCLAW_CDP_网址 = "http://127.0.0.1:18800";
-const 番茄章节标题最大长度 = 30;
+const 番茄章节标题最大长度 = 10;
+const 香港时区 = "Asia/Hong_Kong";
+const 退出码_需要登录修复 = 20;
 let 当前日志文件 = "";
 const 作品路由缓存 = new Map();
+const 已绑定页面诊断 = new WeakSet();
+const 香港时间格式化器 = new Intl.DateTimeFormat("en-GB", {
+  timeZone: 香港时区,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+});
 
 function 打印帮助() {
   console.log(`番茄小说章节上传脚本
@@ -33,11 +51,13 @@ function 打印帮助() {
   --seed-profile-dir <dir>  从已登录 profile 复制工作副本后再启动
   --chrome-path <path>      Chrome 可执行文件路径
   --draft-only              只走到发布前，不点最终发布
+  --preflight-only          只执行本地/远端/连续性预检，不打开编辑器、不创建草稿
   --debug                   输出精简调试快照
   --headless                无头模式启动独立浏览器
   --keep-open               结束后不关闭独立浏览器
   --start-url <url>         作家后台首页
   --artifacts-dir <dir>     失败截图和 HTML 输出目录
+  --allow-weak-title        仅跳过“读者向标题”质量门禁；空标题、重复、超长、乱码仍会拦截
   --help                    显示帮助
 
 说明:
@@ -52,6 +72,7 @@ function 解析参数(argv) {
     startUrl: 默认起始网址,
     headless: false,
     draftOnly: false,
+    preflightOnly: false,
     debug: false,
     keepOpen: false,
     artifactsDir: path.resolve(".run", "fanqie_upload_artifacts"),
@@ -66,6 +87,7 @@ function 解析参数(argv) {
     aiUsage: "no",
     chromePath: "",
     seedProfileDir: "",
+    allowWeakTitle: false,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -122,6 +144,9 @@ function 解析参数(argv) {
       case "--draft-only":
         args.draftOnly = true;
         break;
+      case "--preflight-only":
+        args.preflightOnly = true;
+        break;
       case "--debug":
         args.debug = true;
         break;
@@ -136,6 +161,9 @@ function 解析参数(argv) {
         break;
       case "--artifacts-dir":
         args.artifactsDir = path.resolve(next());
+        break;
+      case "--allow-weak-title":
+        args.allowWeakTitle = true;
         break;
       default:
         throw new Error(`未知参数: ${arg}`);
@@ -186,6 +214,47 @@ function 统计文本字符数(value) {
 
 function 转义正则文本(value) {
   return String(value ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function 格式化香港时间(date = new Date()) {
+  const parts = Object.create(null);
+  for (const part of 香港时间格式化器.formatToParts(date)) {
+    if (part.type !== "literal") {
+      parts[part.type] = part.value;
+    }
+  }
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
+}
+
+function 是可重试页面跳转错误(error) {
+  const message = error?.message ?? String(error);
+  return /page\.goto: Timeout|Timeout \d+ms exceeded|net::ERR_CONNECTION_RESET|net::ERR_CONNECTION_CLOSED|net::ERR_CONNECTION_ABORTED|net::ERR_NETWORK_CHANGED|net::ERR_HTTP2_PROTOCOL_ERROR|net::ERR_TIMED_OUT|net::ERR_INTERNET_DISCONNECTED|net::ERR_NETWORK_IO_SUSPENDED/i.test(message);
+}
+
+async function 带重试打开页面(page, url, options = {}, {
+  description = "",
+  attempts = 3,
+  retryWaitMs = 1500,
+} = {}) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      if (description) {
+        记录日志(`${description}${attempt > 1 ? `（重试 ${attempt}/${attempts}）` : ""}: ${url}`);
+      }
+      await page.goto(url, options);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!是可重试页面跳转错误(error) || attempt >= attempts) {
+        throw error;
+      }
+      const reason = String(error?.message ?? error).split("\n")[0];
+      记录日志(`页面跳转异常，准备重试 ${attempt}/${attempts}: ${reason} | ${url}`);
+      await page.waitForTimeout(retryWaitMs).catch(() => {});
+    }
+  }
+  throw lastError;
 }
 
 function 解析中文章节数字(rawValue) {
@@ -271,7 +340,7 @@ function 解析作品ID(publishPath = "", chapterManagePath = "") {
 }
 
 function 记录日志(message) {
-  const stamp = new Date().toISOString().replace("T", " ").slice(0, 19);
+  const stamp = 格式化香港时间();
   const line = `${stamp} | ${message}`;
   console.log(line);
   if (当前日志文件) {
@@ -306,9 +375,18 @@ function 解析章节文件内容(content, filePath) {
   }
   const title = match[2].trim();
   const titleLength = 统计文本字符数(title);
+  if (!title) {
+    throw new Error(`章节标题为空: ${filePath}`);
+  }
   if (titleLength > 番茄章节标题最大长度) {
     throw new Error(
       `章节标题过长: ${filePath}；标题长度=${titleLength}/${番茄章节标题最大长度}；标题=${JSON.stringify(title)}`,
+    );
+  }
+  const hardTitleIssues = titleQualityIssues(title, { strictReaderFacing: false });
+  if (hardTitleIssues.length) {
+    throw new Error(
+      `章节标题存在硬错误: ${filePath}；${hardTitleIssues.join("；")}；标题=${JSON.stringify(title)}`,
     );
   }
 
@@ -322,6 +400,7 @@ function 解析章节文件内容(content, filePath) {
     number: chapterNumber,
     title,
     body,
+    bodyChars: 紧凑文本(body).length,
     heading: titleLine,
   };
 }
@@ -503,10 +582,16 @@ async function 保存失败产物(page, artifactsDir, prefix) {
 
 async function 获取首个可见定位器(factories) {
   for (const createLocator of factories) {
-    const locator = createLocator().first();
+    const locator = createLocator();
     try {
-      if ((await locator.count()) > 0 && (await locator.isVisible())) {
-        return locator;
+      const count = await locator.count();
+      for (let index = 0; index < count; index += 1) {
+        const candidate = locator.nth(index);
+        try {
+          if (await candidate.isVisible()) {
+            return candidate;
+          }
+        } catch {}
       }
     } catch {}
   }
@@ -527,7 +612,7 @@ async function 点击首个可见元素(page, factories, description) {
     if (!/intercepts pointer events|element click intercepted|another element would receive/i.test(message)) {
       throw error;
     }
-    记录日志(`常规点击被页面浮层拦截，改用强制点击: ${message.split("\n")[0]}`);
+    记录日志(`常规点击被页面浮层拦截，改用强制点击${description ? ` [${description}]` : ""}: ${message.split("\n")[0]}`);
     await locator.click({ force: true, timeout: 5000 });
   }
   if (description) {
@@ -548,6 +633,41 @@ function 是页面关闭错误(error) {
   return /Target page, context or browser has been closed|has been closed/i.test(message);
 }
 
+function 创建需要登录修复错误(message = "检测到未登录状态，且当前为 headless 模式；需要先修复种子登录态") {
+  const error = new Error(message);
+  error.exitCode = 退出码_需要登录修复;
+  error.code = "LOGIN_REQUIRED";
+  return error;
+}
+
+function 绑定页面诊断(page, label) {
+  if (!page || 已绑定页面诊断.has(page)) {
+    return;
+  }
+  已绑定页面诊断.add(page);
+
+  page.on("dialog", async (dialog) => {
+    const type = typeof dialog.type === "function" ? dialog.type() : "unknown";
+    const message = typeof dialog.message === "function"
+      ? 规范空白(dialog.message())
+      : "";
+    记录日志(`检测到浏览器对话框(${label}): type=${type}${message ? ` message=${message}` : ""}`);
+    if (type === "beforeunload") {
+      await dialog.dismiss().catch(() => {});
+      return;
+    }
+    await dialog.accept().catch(() => {});
+  });
+
+  page.on("close", () => {
+    记录日志(`页面已关闭(${label})`);
+  });
+
+  page.on("crash", () => {
+    记录日志(`页面已崩溃(${label})`);
+  });
+}
+
 async function 动作后等待(page, timeoutMs, publishClicked) {
   try {
     await page.waitForTimeout(timeoutMs);
@@ -562,12 +682,21 @@ async function 动作后等待(page, timeoutMs, publishClicked) {
 
 async function 点击作用域内可见文本(
   page,
-  { selectors, targetPattern, scopePattern, description, skipIfSelected = false },
+  {
+    selectors,
+    targetPattern,
+    scopePattern,
+    description,
+    skipIfSelected = false,
+    rootSelectors = "",
+    rootPattern = null,
+  },
 ) {
   const result = await page.evaluate(
-    ({ selectors: rawSelectors, target, scope, rawSkipIfSelected }) => {
+    ({ selectors: rawSelectors, target, scope, rawSkipIfSelected, rawRootSelectors, root }) => {
       const targetRe = new RegExp(target.source, target.flags);
       const scopeRe = scope ? new RegExp(scope.source, scope.flags) : null;
+      const rootRe = root ? new RegExp(root.source, root.flags) : null;
 
       const normalize = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
       const isVisible = (el) => {
@@ -584,6 +713,10 @@ async function 点击作用域内可见文本(
       const textOf = (el) => normalize(
         el.innerText || el.textContent || el.getAttribute?.("aria-label") || "",
       );
+      const parseZIndex = (value) => {
+        const parsed = Number.parseInt(String(value ?? ""), 10);
+        return Number.isFinite(parsed) ? parsed : 0;
+      };
       const isSelected = (el) => {
         const seen = new Set();
         const queue = [
@@ -605,7 +738,21 @@ async function 点击作用域内可见文本(
             if (
               node.getAttribute("aria-checked") === "true" ||
               node.getAttribute("aria-selected") === "true" ||
-              node.getAttribute("data-state") === "checked"
+              node.getAttribute("data-state") === "checked" ||
+              node.classList.contains("checked") ||
+              node.classList.contains("is-checked") ||
+              node.classList.contains("active") ||
+              /\barco-radio-checked\b|\barco-checkbox-checked\b|\bselected\b|\bactive\b/i.test(node.className || "")
+            ) {
+              return true;
+            }
+            const classText = normalize(node.className || "");
+            const nodeText = textOf(node);
+            if (
+              nodeText &&
+              classText &&
+              /是|否|使用AI|未使用AI|不使用AI|没有使用AI|有使用AI|已使用AI/.test(nodeText) &&
+              /checked|selected|active/.test(classText)
             ) {
               return true;
             }
@@ -617,8 +764,51 @@ async function 点击作用域内可见文本(
         return false;
       };
 
+      let scopedRoot = null;
+      if (rawRootSelectors && rootRe) {
+        const rootCandidates = Array.from(document.querySelectorAll(rawRootSelectors));
+        for (let index = 0; index < rootCandidates.length; index += 1) {
+          const candidate = rootCandidates[index];
+          if (!(candidate instanceof Element) || !isVisible(candidate)) {
+            continue;
+          }
+          const candidateText = textOf(candidate);
+          if (!candidateText || !rootRe.test(candidateText)) {
+            continue;
+          }
+          const rect = candidate.getBoundingClientRect();
+          const style = window.getComputedStyle(candidate);
+          const scored = {
+            el: candidate,
+            zIndex: parseZIndex(style?.zIndex),
+            area: Math.max(rect.width, 0) * Math.max(rect.height, 0),
+            domIndex: index,
+          };
+          if (
+            !scopedRoot ||
+            scored.zIndex > scopedRoot.zIndex ||
+            (
+              scored.zIndex === scopedRoot.zIndex &&
+              scored.area < scopedRoot.area
+            ) ||
+            (
+              scored.zIndex === scopedRoot.zIndex &&
+              scored.area === scopedRoot.area &&
+              scored.domIndex > scopedRoot.domIndex
+            )
+          ) {
+            scopedRoot = scored;
+          }
+        }
+      }
+
       let best = null;
-      const candidates = Array.from(document.querySelectorAll(rawSelectors));
+      if (rawRootSelectors && rootRe && !scopedRoot?.el) {
+        return { status: "root_not_found" };
+      }
+
+      const container = scopedRoot?.el ?? document;
+      const candidates = Array.from(container.querySelectorAll(rawSelectors));
       for (let index = 0; index < candidates.length; index += 1) {
         const el = candidates[index];
         if (!isVisible(el)) {
@@ -680,10 +870,18 @@ async function 点击作用域内可见文本(
       target: 序列化正则(targetPattern),
       scope: scopePattern ? 序列化正则(scopePattern) : null,
       rawSkipIfSelected: skipIfSelected,
+      rawRootSelectors: rootSelectors,
+      root: rootPattern ? 序列化正则(rootPattern) : null,
     },
   ).catch(() => ({ status: "not_found" }));
 
   if (result.status !== "clicked") {
+    if (result.status === "already_selected") {
+      if (description) {
+        记录日志(`${description}（已选中）`);
+      }
+      return true;
+    }
     return false;
   }
   if (description) {
@@ -890,8 +1088,9 @@ async function 在工作台选择作品(page, bookTitle) {
 
 async function 从作品管理解析作品路由(page, startUrl, bookTitle) {
   const bookManageUrl = new URL("/main/writer/book-manage", startUrl).toString();
-  记录日志(`进入作品管理，查找《${bookTitle}》`);
-  await page.goto(bookManageUrl, { waitUntil: "domcontentloaded" });
+  await 带重试打开页面(page, bookManageUrl, { waitUntil: "domcontentloaded" }, {
+    description: `进入作品管理，查找《${bookTitle}》`,
+  });
   await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
 
   const routeInfo = await page.evaluate((targetBookTitle) => {
@@ -1135,6 +1334,124 @@ async function 从章节管理页读取章节号列表(page, timeoutMs = 15000) 
   return [];
 }
 
+async function 从章节管理页读取标题明细(page) {
+  const rows = await page.evaluate(() => {
+    const normalize = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
+    const result = [];
+    const tableRows = Array.from(
+      document.querySelectorAll("tbody tr.arco-table-tr, tbody tr, .arco-table-tbody tr"),
+    );
+    for (const row of tableRows) {
+      const cells = Array.from(row.querySelectorAll("td")).map((cell) => normalize(cell.innerText || cell.textContent || ""));
+      if (!cells.length) {
+        continue;
+      }
+      const heading = cells[0] || "";
+      if (!/^第.+章/.test(heading)) {
+        continue;
+      }
+      const match = heading.match(/^第\s*([零〇一二两三四五六七八九十百千万\d]+)\s*章(?:\s+|[：:，,、.．。]\s*)?(.*)$/);
+      const previewLink = row.querySelector("a[href*='/preview/']");
+      result.push({
+        heading,
+        numberToken: match?.[1] ?? "",
+        title: normalize(match?.[2] ?? ""),
+        previewUrl: previewLink?.href || "",
+        chars: cells[1] || "",
+        typoCount: cells[2] || "",
+        status: cells[3] || "",
+        publishTime: cells[4] || "",
+      });
+    }
+    const currentPage = normalize(document.querySelector(".arco-pagination-item-active")?.textContent || "1");
+    const visiblePageNumbers = Array.from(
+      document.querySelectorAll(".arco-pagination-item[aria-label^='第 ' ]"),
+    )
+      .map((item) => Number((item.getAttribute("aria-label") || "").match(/第\\s*(\\d+)\\s*页/)?.[1] || 0))
+      .filter((number) => Number.isInteger(number) && number > 0);
+    const totalPages = visiblePageNumbers.length ? Math.max(...visiblePageNumbers) : 0;
+    const nextItem = document.querySelector(".arco-pagination-item-next");
+    const nextDisabled = !nextItem || nextItem.classList.contains("arco-pagination-item-disabled");
+    return { rows: result, currentPage, totalPages, nextDisabled };
+  }).catch(() => ({ rows: [], currentPage: "1", totalPages: 0, nextDisabled: true }));
+
+  return rows.rows.map((row) => {
+    const chapterNumber = /^\d+$/.test(row.numberToken)
+      ? Number(row.numberToken)
+      : 解析中文章节数字(row.numberToken);
+    return {
+      chapterNumber: Number.isFinite(chapterNumber) && chapterNumber > 0 ? chapterNumber : 0,
+      chapterTitle: 规范空白(row.title),
+      fullHeading: row.heading,
+      previewUrl: row.previewUrl,
+      status: row.status,
+      publishTime: row.publishTime,
+      chars: row.chars,
+      typoCount: row.typoCount,
+      currentPage: rows.currentPage,
+      totalPages: rows.totalPages,
+      nextDisabled: rows.nextDisabled,
+    };
+  });
+}
+
+async function 点击章节管理下一页(page) {
+  const currentPage = await page.locator(".arco-pagination-item-active").first().innerText().catch(() => "1");
+  const currentFirstRow = await page.locator("tbody tr, .arco-table-tbody tr").first().innerText().catch(() => "");
+  const currentPageNumber = Number(规范空白(currentPage).match(/\d+/)?.[0] || 1);
+  const nextPageNumber = currentPageNumber + 1;
+  const pageLocator = page
+    .locator(`.arco-pagination-item[aria-label="第 ${nextPageNumber} 页"]`)
+    .first();
+  const nextLocator = page.locator(".arco-pagination-item-next").first();
+  const pageCount = await pageLocator.count().catch(() => 0);
+  const nextClass = await nextLocator.getAttribute("class").catch(() => "");
+  if (!pageCount && (!nextClass || /arco-pagination-item-disabled/.test(nextClass))) {
+    return false;
+  }
+
+  const chapterListResponse = page.waitForResponse(
+    (response) => {
+      if (!response.url().includes("/api/author/chapter/chapter_list/v1")) {
+        return false;
+      }
+      try {
+        return Number(new URL(response.url()).searchParams.get("page_index")) === nextPageNumber - 1;
+      } catch {
+        return false;
+      }
+    },
+    { timeout: 20000 },
+  );
+
+  // Playwright's forced pointer click can be swallowed by Arco's pagination
+  // after the table refreshes. A native DOM click reliably reaches React.
+  const clickTarget = pageCount ? pageLocator : nextLocator;
+  await clickTarget.evaluate((element) => element.click());
+  const response = await chapterListResponse;
+  if (!response.ok()) {
+    throw new Error(
+      `章节管理翻页接口失败：目标页=${nextPageNumber}，HTTP=${response.status()}`,
+    );
+  }
+
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    const nextPage = await page.locator(".arco-pagination-item-active").first().innerText().catch(() => "");
+    const nextFirstRow = await page.locator("tbody tr, .arco-table-tbody tr").first().innerText().catch(() => "");
+    const nextPageNumberObserved = Number(规范空白(nextPage).match(/\d+/)?.[0] || 0);
+    if (
+      (nextPageNumberObserved && nextPageNumberObserved !== currentPageNumber) ||
+      (规范空白(nextFirstRow) && 规范空白(nextFirstRow) !== 规范空白(currentFirstRow))
+    ) {
+      return true;
+    }
+    await page.waitForTimeout(400);
+  }
+
+  throw new Error("章节管理翻页失败：当前页=" + (规范空白(currentPage) || "1"));
+}
+
 async function 章节管理已显示目标章节(page, expected, timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -1145,6 +1462,56 @@ async function 章节管理已显示目标章节(page, expected, timeoutMs = 200
     await page.waitForTimeout(1000);
   }
   return false;
+}
+
+async function 等待章节管理目标明细(page, chapter, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const rows = await 从章节管理页读取标题明细(page);
+    const target = rows.find(
+      (row) =>
+        row.chapterNumber === chapter.number &&
+        规范空白(row.chapterTitle) === 规范空白(chapter.title),
+    );
+    if (target) {
+      return target;
+    }
+    await page.waitForTimeout(1000);
+    await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
+  }
+  return null;
+}
+
+async function 校验官网预览正文(page, chapter, previewUrl) {
+  if (!previewUrl) {
+    throw new Error(`第${chapter.number}章章节管理行缺少预览链接，无法完成发布后正文复核`);
+  }
+  await 带重试打开页面(page, previewUrl, { waitUntil: "domcontentloaded" }, {
+    description: `打开第${chapter.number}章官网预览复核正文`,
+  });
+  await page.locator(".preview-content").waitFor({ state: "visible", timeout: 30000 });
+  const preview = await page.evaluate(() => ({
+    heading: String(document.querySelector(".preview-title")?.textContent ?? "")
+      .replace(/\s+/g, " ")
+      .trim(),
+    body: Array.from(document.querySelectorAll(".preview-content p"))
+      .map((paragraph) => String(paragraph.innerText || paragraph.textContent || "").trim())
+      .filter(Boolean)
+      .join("\n\n"),
+  }));
+  const expectedHeading = 规范空白(`第${chapter.number}章 ${chapter.title}`);
+  if (!规范空白(preview.heading).includes(expectedHeading)) {
+    throw new Error(
+      `第${chapter.number}章官网预览标题不一致：期望=${JSON.stringify(expectedHeading)}，实际=${JSON.stringify(preview.heading)}`,
+    );
+  }
+  if (紧凑文本(preview.body) !== 紧凑文本(chapter.body)) {
+    throw new Error(
+      `第${chapter.number}章官网预览正文不一致：期望=${紧凑文本(chapter.body).length}字，实际=${紧凑文本(preview.body).length}字`,
+    );
+  }
+  记录日志(`第${chapter.number}章官网预览标题与正文逐字复核通过`);
 }
 
 async function 从编辑器获取上次提交章节(page) {
@@ -1168,7 +1535,12 @@ async function 从编辑器获取上次提交章节(page) {
   return latestText ? { number: 0, title: "", raw: latestText } : null;
 }
 
-async function 校验上一章匹配(page, chapter, chaptersDir) {
+async function 校验上一章匹配(
+  page,
+  chapter,
+  chaptersDir,
+  verifiedRemoteTitlesByNumber = null,
+) {
   if (chapter.number <= 1) {
     记录日志("当前是第1章，跳过上一章连续性校验");
     return;
@@ -1176,7 +1548,18 @@ async function 校验上一章匹配(page, chapter, chaptersDir) {
 
   const previousLocal = await 按章节号加载章节(chaptersDir, chapter.number - 1);
   const previousRemote = await 从编辑器获取上次提交章节(page);
+  const verifiedRemoteTitle = verifiedRemoteTitlesByNumber?.get(previousLocal.number);
+  const chapterManageConfirmedPrevious =
+    verifiedRemoteTitle &&
+    规范空白(verifiedRemoteTitle) === 规范空白(previousLocal.title);
+
   if (!previousRemote || previousRemote.number === 0) {
+    if (chapterManageConfirmedPrevious) {
+      记录日志(
+        `发布页未提供可靠“上次提交”，但章节管理全集已确认前章为第${previousLocal.number}章 ${previousLocal.title}，按章节管理结果继续`,
+      );
+      return;
+    }
     const observedText = previousRemote?.raw ? `；页面文本片段：${previousRemote.raw.slice(0, 200)}` : "";
     throw new Error(
       `未能从发布页读取“上次提交”信息，拒绝上传第${chapter.number}章；期望上一章为第${previousLocal.number}章 ${previousLocal.title}${observedText}`,
@@ -1184,12 +1567,24 @@ async function 校验上一章匹配(page, chapter, chaptersDir) {
   }
 
   if (previousRemote.number !== previousLocal.number) {
+    if (chapterManageConfirmedPrevious) {
+      记录日志(
+        `发布页“上次提交”停留在第${previousRemote.number}章 ${previousRemote.title}，但章节管理全集已确认前章为第${previousLocal.number}章 ${previousLocal.title}，按章节管理结果继续`,
+      );
+      return;
+    }
     throw new Error(
       `发布页“上次提交”为第${previousRemote.number}章 ${previousRemote.title}，但本次上传前一章应为第${previousLocal.number}章 ${previousLocal.title}，已拒绝上传`,
     );
   }
 
   if (规范空白(previousRemote.title) !== 规范空白(previousLocal.title)) {
+    if (chapterManageConfirmedPrevious) {
+      记录日志(
+        `发布页“上次提交”标题为“${previousRemote.title}”，但章节管理全集已确认第${previousLocal.number}章标题为“${previousLocal.title}”，按章节管理结果继续`,
+      );
+      return;
+    }
     throw new Error(
       `发布页“上次提交”标题不匹配：远端为“${previousRemote.title}”，本地上一章为“${previousLocal.title}”，已拒绝上传`,
     );
@@ -1198,16 +1593,18 @@ async function 校验上一章匹配(page, chapter, chaptersDir) {
   记录日志(`上一章连续性校验通过：远端第${previousRemote.number}章 ${previousRemote.title}`);
 }
 
-async function 获取最新已发布章节(page, startUrl, bookTitle) {
+async function 获取最新已发布章节(page, startUrl, bookTitle, loginOptions = {}) {
   记录日志(`读取《${bookTitle}》远端最新已发布章节`);
-  await 确保已登录(page, startUrl);
+  await 确保已登录(page, startUrl, loginOptions);
   const routes = await 获取作品路由(page, startUrl, bookTitle);
   if (!routes.chapterManageUrl) {
     throw new Error(`未找到《${bookTitle}》的章节管理地址`);
   }
 
   记录日志("转到章节管理读取最新章节（含审核中章节）");
-  await page.goto(routes.chapterManageUrl, { waitUntil: "domcontentloaded" });
+  await 带重试打开页面(page, routes.chapterManageUrl, { waitUntil: "domcontentloaded" }, {
+    description: "转到章节管理读取最新章节（含审核中章节）",
+  });
   记录日志("已进入章节管理");
   await page.waitForLoadState("domcontentloaded");
   await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
@@ -1221,11 +1618,231 @@ async function 获取最新已发布章节(page, startUrl, bookTitle) {
   return latest;
 }
 
+async function 获取远端章节标题列表(page, startUrl, bookTitle, loginOptions = {}) {
+  记录日志(`读取《${bookTitle}》远端章节标题全集`);
+  await 确保已登录(page, startUrl, loginOptions);
+  const routes = await 获取作品路由(page, startUrl, bookTitle);
+  if (!routes.chapterManageUrl) {
+    throw new Error(`未找到《${bookTitle}》的章节管理地址`);
+  }
+
+  await 带重试打开页面(page, routes.chapterManageUrl, { waitUntil: "domcontentloaded" }, {
+    description: `进入《${bookTitle}》章节管理读取标题全集`,
+  });
+  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+
+  const seenPages = new Set();
+  const seenRows = new Set();
+  const rows = [];
+
+  let fallbackPageNumber = 1;
+  while (true) {
+    const pageRows = await 从章节管理页读取标题明细(page);
+    const currentPage = pageRows[0]?.currentPage ?? await page.locator(".arco-pagination-item-active").first().innerText().catch(() => "1");
+    const normalizedPage = 规范空白(currentPage) || "1";
+    const currentPageNumber = Number(normalizedPage) || fallbackPageNumber;
+    const totalPages = pageRows[0]?.totalPages || 0;
+    if (seenPages.has(normalizedPage)) {
+      throw new Error("章节管理分页重复：页码=" + normalizedPage + "，已读取" + rows.length + "章");
+    }
+    seenPages.add(normalizedPage);
+
+    for (const row of pageRows) {
+      const uniqueKey = `${row.fullHeading}@@${row.publishTime}@@${row.status}`;
+      if (seenRows.has(uniqueKey)) {
+        continue;
+      }
+      seenRows.add(uniqueKey);
+      rows.push({
+        chapterNumber: row.chapterNumber,
+        chapterTitle: row.chapterTitle,
+        fullHeading: row.fullHeading,
+        previewUrl: row.previewUrl,
+        status: row.status,
+        publishTime: row.publishTime,
+      });
+    }
+
+    if (!pageRows.length) {
+      break;
+    }
+    if ((totalPages && currentPageNumber >= totalPages) || pageRows[0].nextDisabled) {
+      break;
+    }
+    const moved = await 点击章节管理下一页(page);
+    if (!moved) {
+      throw new Error(
+        "章节管理翻页控件不可用：当前页=" + normalizedPage + "，总页数=" + (totalPages || "未知"),
+      );
+    }
+    fallbackPageNumber = currentPageNumber + 1;
+    if (currentPageNumber === 1 || currentPageNumber % 10 === 0) {
+      记录日志(
+        "远端标题审计已读取第" + currentPageNumber + "页" + (totalPages ? "/" + totalPages : "") + "，累计" + rows.length + "章",
+      );
+    }
+  }
+
+  rows.sort((a, b) => a.chapterNumber - b.chapterNumber);
+  记录日志(`远端共读取 ${rows.length} 个章节标题`);
+  return rows;
+}
+
+async function 校验待上传章节标题不重复(session, args, jobs) {
+  if (!jobs.length) {
+    return;
+  }
+
+  const page = await session.context.newPage();
+  绑定页面诊断(page, `title_audit_${args.bookTitle}`);
+  try {
+    const remoteRows = await 获取远端章节标题列表(page, args.startUrl, args.bookTitle, args);
+    const remoteTitleMap = new Map();
+    const remoteNumberSet = new Set();
+    const remoteErrors = [];
+    for (const row of remoteRows) {
+      const normalizedTitle = 规范空白(row.chapterTitle);
+      if (!Number.isInteger(row.chapterNumber) || row.chapterNumber <= 0) {
+        remoteErrors.push(`远端存在无法解析章号的章节：${row.fullHeading}`);
+        continue;
+      }
+      if (remoteNumberSet.has(row.chapterNumber)) {
+        remoteErrors.push(`远端第${row.chapterNumber}章出现多条记录`);
+      }
+      remoteNumberSet.add(row.chapterNumber);
+      const qualityIssues = titleQualityIssues(normalizedTitle, {
+        strictReaderFacing: !args.allowWeakTitle,
+      });
+      for (const issue of qualityIssues) {
+        remoteErrors.push(`远端第${row.chapterNumber}章 ${issue}：《${normalizedTitle}》`);
+      }
+      if (!normalizedTitle) {
+        continue;
+      }
+      if (!remoteTitleMap.has(normalizedTitle)) {
+        remoteTitleMap.set(normalizedTitle, []);
+      }
+      remoteTitleMap.get(normalizedTitle).push(row.chapterNumber);
+    }
+    for (const [title, numbers] of remoteTitleMap) {
+      if (numbers.length > 1) {
+        remoteErrors.push(
+          `远端标题重复：《${title}》出现在 ${numbers.map((number) => `第${number}章`).join("、")}`,
+        );
+      }
+    }
+    const latestRemoteNumber = Math.max(0, ...remoteRows.map((row) => row.chapterNumber || 0));
+    for (let number = 1; number <= latestRemoteNumber; number += 1) {
+      if (!remoteNumberSet.has(number)) {
+        remoteErrors.push(`远端章节号断档：缺少第${number}章`);
+      }
+    }
+    const remoteReportPath = 写入远端审计报告(args, remoteRows, remoteErrors);
+    if (remoteErrors.length) {
+      throw new Error(
+        `远端已发布章节全量审计失败，已停止发布；报告=${remoteReportPath}\n${remoteErrors.slice(0, 30).join("\n")}`,
+      );
+    }
+    记录日志(
+      `远端已发布章节全量审计通过：${remoteRows.length}章，标题质量、唯一性和章号连续性正常；报告=${remoteReportPath}`,
+    );
+    args.verifiedRemoteTitlesByNumber = new Map(
+      remoteRows.map((row) => [row.chapterNumber, row.chapterTitle]),
+    );
+    args.verifiedRemoteRowsByNumber = new Map(
+      remoteRows.map((row) => [row.chapterNumber, row]),
+    );
+
+    const allLocal = auditLocalProject({
+      chaptersDir: args.chaptersDir,
+      selectedNumbers: [],
+      strictReaderFacing: !args.allowWeakTitle,
+    });
+    const pendingRows = allLocal.rows.filter((row) => row.fileNumber > latestRemoteNumber);
+    const pendingErrors = [];
+    const pendingTitleMap = new Map();
+    for (const row of pendingRows) {
+      for (const issue of row.issues) {
+        pendingErrors.push(`第${row.fileNumber}章 ${issue}`);
+      }
+      const normalizedTitle = 规范空白(row.title);
+      const remoteNumbers = remoteTitleMap.get(normalizedTitle) ?? [];
+      if (remoteNumbers.length) {
+        pendingErrors.push(
+          `第${row.fileNumber}章标题《${row.title}》与远端章节 ${remoteNumbers.map((number) => `第${number}章`).join("、")} 重复`,
+        );
+      }
+      const previousPending = pendingTitleMap.get(normalizedTitle);
+      if (normalizedTitle && previousPending) {
+        pendingErrors.push(
+          `第${previousPending}章与第${row.fileNumber}章标题重复：《${row.title}》`,
+        );
+      }
+      if (normalizedTitle) {
+        pendingTitleMap.set(normalizedTitle, row.fileNumber);
+      }
+    }
+    const pendingReportPath = 写入上传前审计报告(
+      args,
+      {
+        selectedRows: pendingRows,
+        missingSelected: [],
+        errors: pendingErrors,
+      },
+      "all_pending",
+    );
+    if (pendingErrors.length) {
+      throw new Error(
+        `未上传章节全量审计失败，已停止发布；远端最新第${latestRemoteNumber}章，待上传${pendingRows.length}章，报告=${pendingReportPath}\n${pendingErrors.slice(0, 30).join("\n")}`,
+      );
+    }
+    记录日志(
+      `未上传章节全量审计通过：远端最新第${latestRemoteNumber}章，本地后续${pendingRows.length}章；报告=${pendingReportPath}`,
+    );
+
+    const seenBatchTitles = new Map();
+    for (const job of jobs) {
+      const normalizedTitle = 规范空白(job.title);
+      if (!normalizedTitle) {
+        throw new Error(`第${job.number}章标题为空，无法上传`);
+      }
+      const qualityIssues = titleQualityIssues(job.title, {
+        strictReaderFacing: !args.allowWeakTitle,
+      });
+      if (qualityIssues.length) {
+        throw new Error(
+          `第${job.number}章标题质量校验失败：《${job.title}》；${qualityIssues.join("；")}`,
+        );
+      }
+
+      const remoteNumbers = remoteTitleMap.get(normalizedTitle) ?? [];
+      if (remoteNumbers.length) {
+        throw new Error(
+          `待上传标题与远端重复：第${job.number}章《${job.title}》撞上远端章节 ${remoteNumbers.map((num) => `第${num}章`).join("、")}`,
+        );
+      }
+
+      const previousBatchNumber = seenBatchTitles.get(normalizedTitle);
+      if (previousBatchNumber) {
+        throw new Error(
+          `本次待上传章节存在重复标题：第${previousBatchNumber}章与第${job.number}章均为《${job.title}》`,
+        );
+      }
+      seenBatchTitles.set(normalizedTitle, job.number);
+    }
+
+    记录日志(`待上传章节标题校验通过：${jobs.length}章，未与远端或本批次重复`);
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
 async function 解析自动续传任务(session, args) {
   const page = await session.context.newPage();
+  绑定页面诊断(page, `auto_select_${args.bookTitle}`);
   try {
-    await 确保已登录(page, args.startUrl);
-    const latestPublished = await 获取最新已发布章节(page, args.startUrl, args.bookTitle);
+    await 确保已登录(page, args.startUrl, args);
+    const latestPublished = await 获取最新已发布章节(page, args.startUrl, args.bookTitle, args);
     const startNumber = latestPublished > 0 ? latestPublished + 1 : 1;
     const selected = await 按连续章节号加载任务(
       args.chaptersDir,
@@ -1243,36 +1860,45 @@ async function 解析自动续传任务(session, args) {
   }
 }
 
-async function 确保已登录(page, startUrl) {
-  记录日志(`打开作家后台: ${startUrl}`);
-  await page.goto(startUrl, { waitUntil: "domcontentloaded" });
+async function 确保已登录(page, startUrl, options = {}) {
+  await 带重试打开页面(page, startUrl, { waitUntil: "domcontentloaded" }, {
+    description: "打开作家后台",
+  });
   await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
   if (!(await 是登录页(page))) {
     记录日志("检测到已登录状态");
     return;
   }
 
+  if (options.headless) {
+    throw 创建需要登录修复错误();
+  }
+
   记录日志("检测到未登录状态，请直接在打开的浏览器里完成番茄作家登录，脚本会自动等待。");
   if (!(await 自动等待登录完成(page))) {
     throw new Error("等待番茄作家登录超时，终止上传");
   }
-  await page.goto(startUrl, { waitUntil: "domcontentloaded" });
+  await 带重试打开页面(page, startUrl, { waitUntil: "domcontentloaded" }, {
+    description: "登录后重新打开作家后台",
+  });
   await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
   if (await 是登录页(page)) {
     throw new Error("仍处于未登录状态，终止上传");
   }
 }
 
-async function 选择作品并打开创建页(context, page, startUrl, bookTitle) {
+async function 选择作品并打开创建页(context, page, startUrl, bookTitle, loginOptions = {}) {
   void context;
   记录日志(`准备直达《${bookTitle}》创建章节页`);
-  await 确保已登录(page, startUrl);
+  await 确保已登录(page, startUrl, loginOptions);
   const routes = await 获取作品路由(page, startUrl, bookTitle);
   if (!routes.publishUrl) {
     throw new Error(`未找到《${bookTitle}》的创建章节地址`);
   }
 
-  await page.goto(routes.publishUrl, { waitUntil: "domcontentloaded" });
+  await 带重试打开页面(page, routes.publishUrl, { waitUntil: "domcontentloaded" }, {
+    description: `进入《${bookTitle}》创建章节页`,
+  });
   await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
   await 校验当前发布页作品(page, bookTitle);
   记录日志(`已进入创建章节页: ${page.url()}`);
@@ -1318,7 +1944,52 @@ async function 填写编辑器(page, chapter) {
     记录日志(`剪贴板写入失败，改用逐字输入: ${clipboardResult?.message ?? "未知错误"}`);
   }
 
-  await page.waitForTimeout(1000);
+  try {
+    await page.waitForTimeout(1000);
+  } catch (error) {
+    if (是页面关闭错误(error)) {
+      throw new Error(`第${chapter.number}章正文写入后编辑页被关闭`);
+    }
+    throw error;
+  }
+
+  const readbackDeadline = Date.now() + 15000;
+  let readback = {
+    number: "",
+    title: "",
+    body: "",
+  };
+  while (Date.now() < readbackDeadline) {
+    readback = {
+      number: await numberInput.inputValue().catch(() => ""),
+      title: await titleInput.inputValue().catch(() => ""),
+      body: await editor.innerText().catch(() => ""),
+    };
+    if (
+      String(readback.number).trim() === String(chapter.number) &&
+      规范空白(readback.title) === 规范空白(chapter.title) &&
+      紧凑文本(readback.body) === 紧凑文本(chapter.body)
+    ) {
+      break;
+    }
+    await page.waitForTimeout(500);
+  }
+  if (String(readback.number).trim() !== String(chapter.number)) {
+    throw new Error(
+      `第${chapter.number}章编辑器回读章号不一致：实际=${JSON.stringify(readback.number)}`,
+    );
+  }
+  if (规范空白(readback.title) !== 规范空白(chapter.title)) {
+    throw new Error(
+      `第${chapter.number}章编辑器回读标题不一致：期望=${JSON.stringify(chapter.title)}，实际=${JSON.stringify(readback.title)}`,
+    );
+  }
+  if (紧凑文本(readback.body) !== 紧凑文本(chapter.body)) {
+    throw new Error(
+      `第${chapter.number}章编辑器回读正文不一致：期望=${紧凑文本(chapter.body).length}字，实际=${紧凑文本(readback.body).length}字`,
+    );
+  }
+
   const editorValidationError = await 读取编辑页校验错误(page);
   if (editorValidationError) {
     throw new Error(`第${chapter.number}章编辑页校验失败: ${editorValidationError}`);
@@ -1340,6 +2011,180 @@ function 获取AI使用选择配置(aiUsage) {
     locatorPattern: /没有使用AI|未使用AI|不使用AI|否/,
     description: "已选择 AI 使用为否",
   };
+}
+
+function 写入上传前审计报告(args, report, suffix = "selected") {
+  确保目录存在(args.artifactsDir);
+  const outputPath = path.join(args.artifactsDir, `preflight_${suffix}.json`);
+  const payload = {
+    generatedAt: new Date().toISOString(),
+    bookTitle: args.bookTitle,
+    chaptersDir: args.chaptersDir,
+    strictReaderFacing: !args.allowWeakTitle,
+    selectedChapters: report.selectedRows.map((row) => ({
+      number: row.fileNumber,
+      title: row.title,
+      heading: row.heading,
+      bodyChars: row.bodyChars,
+      bodySha256: row.bodySha256,
+      issues: row.issues,
+      filePath: row.filePath,
+    })),
+    missingSelected: report.missingSelected,
+    errors: report.errors,
+  };
+  fs.writeFileSync(outputPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  return outputPath;
+}
+
+function 写入远端审计报告(args, remoteRows, errors) {
+  确保目录存在(args.artifactsDir);
+  const outputPath = path.join(args.artifactsDir, "preflight_remote.json");
+  const payload = {
+    generatedAt: new Date().toISOString(),
+    bookTitle: args.bookTitle,
+    strictReaderFacing: !args.allowWeakTitle,
+    chapterCount: remoteRows.length,
+    latestChapter: Math.max(0, ...remoteRows.map((row) => row.chapterNumber || 0)),
+    chapters: remoteRows.map((row) => ({
+      number: row.chapterNumber,
+      title: row.chapterTitle,
+      status: row.status,
+      publishTime: row.publishTime,
+    })),
+    errors,
+  };
+  fs.writeFileSync(outputPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  return outputPath;
+}
+
+function 校验本地章节完整性(args, chapterNumbers, suffix = "selected") {
+  const report = auditLocalProject({
+    chaptersDir: args.chaptersDir,
+    selectedNumbers: chapterNumbers,
+    strictReaderFacing: !args.allowWeakTitle,
+  });
+  const reportPath = 写入上传前审计报告(args, report, suffix);
+  const errors = [
+    ...report.missingSelected.map((number) => `缺少第${number}章章节文件`),
+    ...report.errors,
+  ];
+  if (errors.length) {
+    throw new Error(
+      `上传前本地完整性校验失败，已停止发布；报告=${reportPath}\n${errors.slice(0, 30).join("\n")}`,
+    );
+  }
+  记录日志(
+    `本地完整性校验通过：${chapterNumbers.length}章，标题、章号、正文、state 和 manifest 一致；报告=${reportPath}`,
+  );
+  return report;
+}
+
+const 发布流程提示正则 = /请选择内容检测方式|仅基础检测|全面检测|内容风险|风险检测|开启检测|定时发布|发布时间|确认发布|发布章节|立即发布|发布提示|是否确定提交|错别字未修改|我已阅读|我确认|跳过.*错别字|跳过.*检测|忽略.*错别字|继续发布|直接发布|放弃检测|提交|使用AI|没有使用AI|未使用AI|不使用AI|AI\s*使用|AI使用|有使用AI|已使用AI/;
+const 发布流程浮层选择器 = [
+  "[role='alert']",
+  "[role='dialog']",
+  ".arco-message",
+  ".arco-modal",
+  ".arco-modal-wrapper",
+  "[class*='message']",
+  "[class*='toast']",
+  "[class*='notice']",
+  "[class*='modal']",
+  "[class*='dialog']",
+  "[class*='popup']",
+  "[class*='drawer']",
+].join(",");
+
+function 是否发布流程提示文本(pageText) {
+  const text = 规范空白(pageText);
+  return 发布流程提示正则.test(text);
+}
+
+async function 读取发布流程上下文(page) {
+  return await page.evaluate(({ overlaySelectors, promptPattern }) => {
+    const promptRe = new RegExp(promptPattern.source, promptPattern.flags);
+    const normalize = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
+    const isVisible = (el) => {
+      if (!(el instanceof Element)) {
+        return false;
+      }
+      const style = window.getComputedStyle(el);
+      if (!style || style.display === "none" || style.visibility === "hidden") {
+        return false;
+      }
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    };
+    const parseZIndex = (value) => {
+      const parsed = Number.parseInt(String(value ?? ""), 10);
+      return Number.isFinite(parsed) ? parsed : 0;
+    };
+
+    const bodyText = normalize(document.body?.innerText || document.body?.textContent || "");
+    let bestOverlay = null;
+    const overlays = Array.from(document.querySelectorAll(overlaySelectors));
+    for (let index = 0; index < overlays.length; index += 1) {
+      const el = overlays[index];
+      if (!(el instanceof Element) || !isVisible(el)) {
+        continue;
+      }
+      if (el.closest(".warning-tip, .editor-tip, .warning-tip-content")) {
+        continue;
+      }
+
+      const text = normalize(el.innerText || el.textContent || "");
+      if (!text || !promptRe.test(text)) {
+        continue;
+      }
+
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      const candidate = {
+        text,
+        zIndex: parseZIndex(style?.zIndex),
+        area: Math.max(rect.width, 0) * Math.max(rect.height, 0),
+        domIndex: index,
+      };
+
+      if (
+        !bestOverlay ||
+        candidate.zIndex > bestOverlay.zIndex ||
+        (
+          candidate.zIndex === bestOverlay.zIndex &&
+          candidate.area < bestOverlay.area
+        ) ||
+        (
+          candidate.zIndex === bestOverlay.zIndex &&
+          candidate.area === bestOverlay.area &&
+          candidate.domIndex > bestOverlay.domIndex
+        )
+      ) {
+        bestOverlay = candidate;
+      }
+    }
+
+    return {
+      bodyText,
+      promptOverlayText: bestOverlay?.text ?? "",
+    };
+  }, {
+    overlaySelectors: 发布流程浮层选择器,
+    promptPattern: 序列化正则(发布流程提示正则),
+  }).catch(() => ({
+    bodyText: "",
+    promptOverlayText: "",
+  }));
+}
+
+function 裁剪日志文本(value, maxLength = 160) {
+  const text = 规范空白(String(value ?? ""));
+  if (!text) {
+    return "";
+  }
+  return 统计文本字符数(text) > maxLength
+    ? `${Array.from(text).slice(0, maxLength).join("")}...`
+    : text;
 }
 
 async function 读取编辑页校验错误(page) {
@@ -1386,6 +2231,14 @@ async function 读取编辑页校验错误(page) {
 async function 处理错别字和AI弹窗(page, chapter, { draftOnly, debug, aiUsage }) {
   记录日志("开始处理发布确认弹窗");
   const aiUsageOption = 获取AI使用选择配置(aiUsage);
+  const 发布设置动作历史 = new Map();
+  const 已执行发布设置动作 = (contextSignature, actionKey) =>
+    发布设置动作历史.get(contextSignature)?.has(actionKey) ?? false;
+  const 标记发布设置动作已执行 = (contextSignature, actionKey) => {
+    const next = 发布设置动作历史.get(contextSignature) ?? new Set();
+    next.add(actionKey);
+    发布设置动作历史.set(contextSignature, next);
+  };
   if (debug) {
     const debugSnapshot = await page.evaluate(() => {
       const pick = (selector) =>
@@ -1414,6 +2267,7 @@ async function 处理错别字和AI弹窗(page, chapter, { draftOnly, debug, aiU
 
   const deadline = Date.now() + 90000;
   let publishClicked = false;
+  let lastContextSignature = "";
 
   while (Date.now() < deadline) {
     if (page.isClosed()) {
@@ -1429,14 +2283,102 @@ async function 处理错别字和AI弹窗(page, chapter, { draftOnly, debug, aiU
       throw new Error(`编辑页校验失败，未进入发布确认步骤: ${editorValidationError}`);
     }
 
-    const pageText = await page.locator("body").innerText().catch(() => "");
+    const publishContext = await 读取发布流程上下文(page);
+    const pageText = publishContext.promptOverlayText || publishContext.bodyText;
+    const hasPublishSettingsDialog = /发布设置|是否使用AI|定时发布|确认发布/.test(
+      publishContext.promptOverlayText || "",
+    );
+    const contextSignature = `${publishClicked ? "1" : "0"}::${pageText}`;
+    if (contextSignature !== lastContextSignature) {
+      lastContextSignature = contextSignature;
+      记录日志(
+        `发布流程上下文: overlay=${publishContext.promptOverlayText ? `"${裁剪日志文本(publishContext.promptOverlayText)}"` : "<none>"} body=${publishContext.bodyText ? `"${裁剪日志文本(publishContext.bodyText)}"` : "<empty>"}`,
+      );
+    }
     if (/已到达当日发布字数上限，无法继续发布|已到达当日发布字数上限/.test(pageText)) {
       throw new Error("平台限制：已到达当日发布字数上限，无法继续发布");
+    }
+    if (/提交字数超出每日上限|每日上限/.test(pageText)) {
+      const error = new Error("平台限制：提交字数超出每日上限");
+      error.exitCode = 30;
+      throw error;
     }
     if (/本书中存在重复标题|重复标题，请修改后再发布/.test(pageText)) {
       throw new Error("发布设置校验失败：本书中存在重复标题，请修改后再发布");
     }
-    const hasRiskDialog = /内容风险|风险检测|开启检测/.test(pageText);
+    const hasPublishPrompt = 是否发布流程提示文本(pageText);
+    if (!hasPublishPrompt) {
+      if (!(await 动作后等待(page, 1000, publishClicked))) {
+        return;
+      }
+      continue;
+    }
+    const hasDetectionModeDialog = /请选择内容检测方式|仅基础检测|全面检测/.test(pageText);
+    if (
+      hasDetectionModeDialog &&
+      (
+        await 点击首个可见元素(
+          page,
+          [
+            (p) => p.getByRole("button", { name: /^仅基础检测$/u }),
+            (p) => p.locator("button").filter({ hasText: /^仅基础检测$/u }),
+            (p) => p.locator("[role='button']").filter({ hasText: /^仅基础检测$/u }),
+            (p) => p.getByRole("button", { name: /仅基础检测|基础检测/ }),
+            (p) => p.locator("button").filter({ hasText: /仅基础检测|基础检测/ }),
+            (p) => p.locator("[role='button']").filter({ hasText: /仅基础检测|基础检测/ }),
+          ],
+          "已选择仅基础检测",
+        ) ||
+        await 点击作用域内可见文本(page, {
+          selectors: "button, [role='button'], label, [role='radio'], span",
+          scopePattern: /请选择内容检测方式|基础检测|全面检测/,
+          targetPattern: /^仅基础检测$/u,
+          description: "已选择仅基础检测",
+          skipIfSelected: true,
+          rootSelectors: 发布流程浮层选择器,
+          rootPattern: 发布流程提示正则,
+        })
+      )
+    ) {
+      progressed = true;
+      if (!(await 动作后等待(page, 1200, publishClicked))) {
+        return;
+      }
+      continue;
+    }
+
+    if (
+      /发布提示|是否确定提交|错别字未修改/.test(pageText) &&
+      (
+        await 点击作用域内可见文本(page, {
+          selectors: "button, [role='button'], span",
+          scopePattern: /发布提示|是否确定提交|错别字未修改/,
+          targetPattern: /^提交$/u,
+          description: "已确认错别字提示并提交",
+          skipIfSelected: true,
+          rootSelectors: 发布流程浮层选择器,
+          rootPattern: 发布流程提示正则,
+        }) ||
+        await 点击首个可见元素(
+          page,
+          [
+            (p) => p.getByRole("button", { name: /^提交$/u }),
+            (p) => p.locator("button").filter({ hasText: /^提交$/u }),
+            (p) => p.locator("[role='button']").filter({ hasText: /^提交$/u }),
+          ],
+          "已确认错别字提示并提交",
+        )
+      )
+    ) {
+      progressed = true;
+      publishClicked = true;
+      if (!(await 动作后等待(page, 1500, publishClicked))) {
+        return;
+      }
+      continue;
+    }
+
+    const hasRiskDialog = !hasDetectionModeDialog && /内容风险|风险检测|开启检测/.test(pageText);
 
     if (
       hasRiskDialog &&
@@ -1454,17 +2396,24 @@ async function 处理错别字和AI弹窗(page, chapter, { draftOnly, debug, aiU
       if (!(await 动作后等待(page, 1000, publishClicked))) {
         return;
       }
+      continue;
     }
 
-    if (
-      /AI|人工智能|智能生成/.test(pageText) &&
+    const aiUsageActionKey = `ai_usage:${aiUsageOption.description}`;
+    const 可尝试AI选择 = !已执行发布设置动作(contextSignature, aiUsageActionKey);
+    const 已处理AI选择 =
+      可尝试AI选择 &&
+      hasPublishSettingsDialog &&
+      /使用AI|没有使用AI|未使用AI|不使用AI|AI\s*使用|AI使用|有使用AI|已使用AI/.test(pageText) &&
       (
         await 点击作用域内可见文本(page, {
           selectors: "label, [role='radio'], button, [role='button'], span",
-          scopePattern: /AI|人工智能|智能生成/,
+          scopePattern: /使用AI|没有使用AI|未使用AI|不使用AI|AI\s*使用|AI使用|有使用AI|已使用AI/,
           targetPattern: aiUsageOption.targetPattern,
           description: aiUsageOption.description,
           skipIfSelected: true,
+          rootSelectors: 发布流程浮层选择器,
+          rootPattern: 发布流程提示正则,
         }) ||
         await 点击首个可见元素(
           page,
@@ -1476,15 +2425,21 @@ async function 处理错别字和AI弹窗(page, chapter, { draftOnly, debug, aiU
           ],
           aiUsageOption.description,
         )
-      )
-    ) {
+      );
+    if (已处理AI选择) {
+      标记发布设置动作已执行(contextSignature, aiUsageActionKey);
       progressed = true;
       if (!(await 动作后等待(page, 800, publishClicked))) {
         return;
       }
+      continue;
     }
 
-    if (
+    const publishModeActionKey = "publish_mode:immediate";
+    const 可尝试发布方式选择 = !已执行发布设置动作(contextSignature, publishModeActionKey);
+    const 已处理发布方式 =
+      可尝试发布方式选择 &&
+      hasPublishSettingsDialog &&
       /定时发布/.test(pageText) &&
       (
         await 点击作用域内可见文本(page, {
@@ -1493,6 +2448,8 @@ async function 处理错别字和AI弹窗(page, chapter, { draftOnly, debug, aiU
           targetPattern: /^(?:立即发布|不定时发布|否)$/u,
           description: "已选择非定时发布",
           skipIfSelected: true,
+          rootSelectors: 发布流程浮层选择器,
+          rootPattern: 发布流程提示正则,
         }) ||
         await 点击首个可见元素(
           page,
@@ -1504,12 +2461,14 @@ async function 处理错别字和AI弹窗(page, chapter, { draftOnly, debug, aiU
           ],
           "已选择非定时发布",
         )
-      )
-    ) {
+      );
+    if (已处理发布方式) {
+      标记发布设置动作已执行(contextSignature, publishModeActionKey);
       progressed = true;
       if (!(await 动作后等待(page, 800, publishClicked))) {
         return;
       }
+      continue;
     }
 
     if (
@@ -1527,9 +2486,12 @@ async function 处理错别字和AI弹窗(page, chapter, { draftOnly, debug, aiU
       if (!(await 动作后等待(page, 1000, publishClicked))) {
         return;
       }
+      continue;
     }
 
     if (
+      hasPublishSettingsDialog &&
+      !已执行发布设置动作(contextSignature, aiUsageActionKey) &&
       await 点击首个可见元素(
         page,
         [
@@ -1542,10 +2504,12 @@ async function 处理错别字和AI弹窗(page, chapter, { draftOnly, debug, aiU
         aiUsageOption.description,
       )
     ) {
+      标记发布设置动作已执行(contextSignature, aiUsageActionKey);
       progressed = true;
       if (!(await 动作后等待(page, 800, publishClicked))) {
         return;
       }
+      continue;
     }
 
     if (
@@ -1562,6 +2526,7 @@ async function 处理错别字和AI弹窗(page, chapter, { draftOnly, debug, aiU
       if (!(await 动作后等待(page, 500, publishClicked))) {
         return;
       }
+      continue;
     }
 
     if (!draftOnly) {
@@ -1569,9 +2534,11 @@ async function 处理错别字和AI弹窗(page, chapter, { draftOnly, debug, aiU
         (
           await 点击作用域内可见文本(page, {
             selectors: "button, [role='button']",
-            scopePattern: /AI|人工智能|定时发布|确认发布|声明|我已阅读|我确认|发布/,
+            scopePattern: /定时发布|发布时间|确认发布|发布章节|立即发布|我已阅读|我确认|继续发布|直接发布|放弃检测|跳过.*错别字|跳过.*检测|忽略.*错别字/,
             targetPattern: /^(?:确认发布|发布章节|立即发布|发布)$/u,
             description: publishClicked ? "已继续确认发布" : "已点击发布",
+            rootSelectors: 发布流程浮层选择器,
+            rootPattern: 发布流程提示正则,
           }) ||
           await 点击首个可见元素(
             page,
@@ -1589,6 +2556,7 @@ async function 处理错别字和AI弹窗(page, chapter, { draftOnly, debug, aiU
         if (!(await 动作后等待(page, 1500, publishClicked))) {
           return;
         }
+        continue;
       }
     }
 
@@ -1597,7 +2565,7 @@ async function 处理错别字和AI弹窗(page, chapter, { draftOnly, debug, aiU
       : "";
     if (successHint) {
       记录日志(`检测到发布完成提示: ${successHint}`);
-      return;
+      return successHint;
     }
 
     if (!progressed) {
@@ -1612,21 +2580,35 @@ async function 处理错别字和AI弹窗(page, chapter, { draftOnly, debug, aiU
   }
 }
 
-async function 在工作台校验已发布(page, startUrl, bookTitle, chapter) {
+async function 在工作台校验已发布(page, startUrl, bookTitle, chapter, loginOptions = {}) {
   记录日志(`转到章节管理校验第${chapter.number}章是否已显示`);
-  await 确保已登录(page, startUrl);
+  await 确保已登录(page, startUrl, loginOptions);
   const routes = await 获取作品路由(page, startUrl, bookTitle);
   if (!routes.chapterManageUrl) {
     throw new Error(`未找到《${bookTitle}》的章节管理地址`);
   }
   const expected = 规范空白(`第${chapter.number}章 ${chapter.title}`);
-  await page.goto(routes.chapterManageUrl, { waitUntil: "domcontentloaded" });
+  await 带重试打开页面(page, routes.chapterManageUrl, { waitUntil: "domcontentloaded" }, {
+    description: "转到章节管理校验已发布章节",
+  });
   记录日志("已进入章节管理");
   await page.waitForLoadState("domcontentloaded");
   await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
-  if (await 章节管理已显示目标章节(page, expected, 20000)) {
-    记录日志(`章节管理已显示目标章节: ${expected}`);
-    return;
+  const targetRow = await 等待章节管理目标明细(page, chapter, 30000);
+  if (targetRow) {
+    记录日志(`章节管理已显示目标章节: ${expected}，状态=${targetRow.status || "未知"}`);
+    try {
+      await 校验官网预览正文(page, chapter, targetRow.previewUrl);
+    } catch (error) {
+      if (/审核中/u.test(targetRow.status || "")) {
+        记录日志(
+          `第${chapter.number}章仍在审核中，官网预览暂不可完整复核；已通过提交前编辑器逐字回读、发布成功信号和章节管理标题三重校验，等待审核后由后续审计复核。原因=${String(error?.message ?? error).split("\n")[0]}`,
+        );
+      } else {
+        throw error;
+      }
+    }
+    return targetRow;
   }
   throw new Error(`章节管理中未找到目标章节: ${expected}`);
 }
@@ -1634,25 +2616,29 @@ async function 在工作台校验已发布(page, startUrl, bookTitle, chapter) {
 async function 上传单章(session, args, chapter) {
   记录日志(`为第${chapter.number}章打开新的工作页`);
   const dashboardPage = await session.context.newPage();
-  dashboardPage.on("dialog", async (dialog) => {
-    记录日志(`检测到浏览器对话框: ${dialog.message()}`);
-    await dialog.accept().catch(() => {});
-  });
+  绑定页面诊断(dashboardPage, `chapter_${chapter.number}_dashboard`);
 
   let activePage = dashboardPage;
   try {
-    await 确保已登录(dashboardPage, args.startUrl);
+    await 确保已登录(dashboardPage, args.startUrl, args);
     const editorPage = await 选择作品并打开创建页(
       session.context,
       dashboardPage,
       args.startUrl,
       args.bookTitle,
+      args,
     );
     activePage = editorPage;
+    绑定页面诊断(editorPage, `chapter_${chapter.number}_editor`);
 
     const shouldCloseEditor = editorPage !== dashboardPage;
     try {
-      await 校验上一章匹配(editorPage, chapter, args.chaptersDir);
+      await 校验上一章匹配(
+        editorPage,
+        chapter,
+        args.chaptersDir,
+        args.verifiedRemoteTitlesByNumber,
+      );
       await 填写编辑器(editorPage, chapter);
       if (!(await 点击首个可见元素(
         editorPage,
@@ -1664,9 +2650,19 @@ async function 上传单章(session, args, chapter) {
       ))) {
         throw new Error("未找到“下一步”按钮");
       }
-      await 处理错别字和AI弹窗(editorPage, chapter, args);
+      const publishSuccessHint = await 处理错别字和AI弹窗(editorPage, chapter, args);
       if (!args.draftOnly) {
-        await 在工作台校验已发布(dashboardPage, args.startUrl, args.bookTitle, chapter);
+        try {
+          await 在工作台校验已发布(dashboardPage, args.startUrl, args.bookTitle, chapter, args);
+        } catch (error) {
+          if (publishSuccessHint && 是可重试页面跳转错误(error)) {
+            记录日志(`发布后复核遇到可重试网络错误，但已取得明确发布成功信号，按成功继续: ${String(error?.message ?? error).split("\n")[0]}`);
+          } else {
+            throw error;
+          }
+        }
+        args.verifiedRemoteTitlesByNumber ??= new Map();
+        args.verifiedRemoteTitlesByNumber.set(chapter.number, chapter.title);
       }
     } catch (error) {
       if (!error?.artifactsSaved) {
@@ -1768,9 +2764,22 @@ async function 主程序() {
     const jobs = args.autoNextCount > 0
       ? await 解析自动续传任务(session, args)
       : await 加载章节任务(args.chaptersDir, args.from, args.to);
+    校验本地章节完整性(
+      args,
+      jobs.map((chapter) => chapter.number),
+      "selected",
+    );
+    await 校验待上传章节标题不重复(session, args, jobs);
 
     if (!jobs.length) {
       记录日志("本次无需上传，任务结束");
+      return;
+    }
+
+    if (args.preflightOnly) {
+      记录日志(
+        `只读预检通过：将上传第${jobs[0].number}章至第${jobs[jobs.length - 1].number}章；未打开编辑器，未创建草稿，未提交发布`,
+      );
       return;
     }
 
@@ -1787,6 +2796,6 @@ async function 主程序() {
 
 主程序().catch((error) => {
   console.error(error?.stack || String(error));
-  process.exitCode = 1;
+  process.exitCode = Number(error?.exitCode) || 1;
 });
 

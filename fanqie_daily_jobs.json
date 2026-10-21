@@ -1,7 +1,7 @@
 {
   "taskSchedule": {
     "taskName": "LongNovelFanqieDailyUpload",
-    "startTime": "08:00",
+    "startTime": "01:00",
     "days": [
       "MON",
       "TUE",
@@ -14,9 +14,9 @@
   },
   "authorCheckIn": {
     "enabled": true,
-    "runAfterUpload": true,
+    "runAfterUpload": false,
     "taskName": "LongNovelFanqieAuthorCheckIn",
-    "startTime": "08:00",
+    "startTime": "02:50",
     "days": [
       "MON",
       "TUE",
@@ -42,34 +42,53 @@
     "seedProfileDir": ".run/fanqie_writer_seed_profile",
     "profileRoot": ".run/fanqie_daily_profiles",
     "artifactsRoot": ".run/fanqie_daily_artifacts",
-    "publishWindowMinutes": 120,
-    "publishTime": "08:00",
+    "publishWindowMinutes": 0,
+    "publishTime": "01:00",
     "chaptersPerRunByWeekday": {
-      "mon": 3,
-      "tue": 3,
-      "wed": 3,
-      "thu": 3,
-      "fri": 3,
-      "sat": 3,
-      "sun": 3
+      "mon": 4,
+      "tue": 4,
+      "wed": 4,
+      "thu": 4,
+      "fri": 4,
+      "sat": 4,
+      "sun": 4
     }
   },
   "jobs": [
+    {
+      "id": "lychee_prelude",
+      "enabled": false,
+      "bookTitle": "她还不会爱人",
+      "aiUsage": "no",
+      "chaptersDir": "auto_projects/lychee_prelude/manuscript/chapters_txt",
+      "publishTime": "01:00",
+      "publishWindowMinutes": 0,
+      "chaptersPerRunByWeekday": {
+        "mon": 4,
+        "tue": 4,
+        "wed": 4,
+        "thu": 4,
+        "fri": 4,
+        "sat": 4,
+        "sun": 4
+      }
+    },
     {
       "id": "inscribed_immortal",
       "enabled": true,
       "bookTitle": "删史成仙",
       "aiUsage": "no",
       "chaptersDir": "auto_projects/inscribed_immortal/manuscript/chapters_txt",
-      "publishTime": "08:00",
+      "publishTime": "01:00",
+      "publishWindowMinutes": 0,
       "chaptersPerRunByWeekday": {
-        "mon": 3,
-        "tue": 3,
-        "wed": 3,
-        "thu": 3,
-        "fri": 3,
-        "sat": 3,
-        "sun": 3
+        "mon": 4,
+        "tue": 4,
+        "wed": 4,
+        "thu": 4,
+        "fri": 4,
+        "sat": 4,
+        "sun": 4
       }
     },
     {
@@ -78,15 +97,16 @@
       "bookTitle": "众生黑匣",
       "aiUsage": "no",
       "chaptersDir": "auto_projects/crowd_blackbox/manuscript/chapters_txt",
-      "publishTime": "08:00",
+      "publishTime": "01:00",
+      "publishWindowMinutes": 0,
       "chaptersPerRunByWeekday": {
-        "mon": 3,
-        "tue": 3,
-        "wed": 3,
-        "thu": 3,
-        "fri": 3,
-        "sat": 3,
-        "sun": 3
+        "mon": 4,
+        "tue": 4,
+        "wed": 4,
+        "thu": 4,
+        "fri": 4,
+        "sat": 4,
+        "sun": 4
       }
     }
   ]

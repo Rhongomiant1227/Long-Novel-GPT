@@ -6,7 +6,21 @@ import readline from "node:readline";
 import { spawn } from "node:child_process";
 
 const DEFAULT_START_URL = "https://fanqienovel.com/main/writer/?enter_from=author_zone";
+const LOGIN_REPAIR_EXIT_CODE = 20;
+const DAILY_LIMIT_EXIT_CODE = 30;
+const DEFAULT_LOGIN_STATUS_FILE = path.resolve(".run", "fanqie_login_status.json");
 const WEEKDAY_KEYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+const HONG_KONG_TIME_ZONE = "Asia/Hong_Kong";
+const HONG_KONG_DATETIME_FORMATTER = new Intl.DateTimeFormat("en-GB", {
+  timeZone: HONG_KONG_TIME_ZONE,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+});
 
 function printHelp() {
   console.log(`番茄小说日更调度器
@@ -88,9 +102,20 @@ function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
 }
 
+function formatHongKongDateTime(value = new Date()) {
+  const date = value instanceof Date ? value : new Date(value);
+  const parts = Object.create(null);
+  for (const part of HONG_KONG_DATETIME_FORMATTER.formatToParts(date)) {
+    if (part.type !== "literal") {
+      parts[part.type] = part.value;
+    }
+  }
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
+}
+
 function logFactory(logFile) {
   return (message) => {
-    const stamp = new Date().toISOString().replace("T", " ").slice(0, 19);
+    const stamp = formatHongKongDateTime();
     const line = `${stamp} | ${message}`;
     console.log(line);
     fs.appendFileSync(logFile, `${line}\n`, "utf8");
@@ -161,6 +186,14 @@ function computePublishAnchor(now, publishTime) {
   const { hours, minutes } = parsePublishTime(publishTime);
   const anchor = new Date(now);
   anchor.setHours(hours, minutes, 0, 0);
+  return anchor;
+}
+
+function computeNextDayOccurrence(now, publishTime) {
+  const anchor = computePublishAnchor(now, publishTime);
+  if (anchor <= now) {
+    anchor.setDate(anchor.getDate() + 1);
+  }
   return anchor;
 }
 
@@ -273,6 +306,19 @@ function buildUploaderArgs(repoRoot, job, chapterCount) {
   return args;
 }
 
+function buildLoginHelperArgs(repoRoot, job, statusPath) {
+  const args = [
+    path.join(repoRoot, "scripts", "fanqie_login_seed_helper.mjs"),
+    "--login-url", job.startUrl,
+    "--profile-dir", job.seedProfileDir,
+    "--status-path", statusPath,
+  ];
+  if (job.chromePath) {
+    args.push("--chrome-path", job.chromePath);
+  }
+  return args;
+}
+
 async function loadJson(filePath, fallbackValue) {
   try {
     return JSON.parse(await fsp.readFile(filePath, "utf8"));
@@ -287,6 +333,15 @@ async function loadJson(filePath, fallbackValue) {
 async function saveJson(filePath, value) {
   ensureDir(path.dirname(filePath));
   await fsp.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+async function fileExists(filePath) {
+  try {
+    await fsp.access(filePath, fs.constants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function normalizeJob(configDir, defaults, rawJob) {
@@ -386,6 +441,66 @@ async function runUploaderForJob(repoRoot, log, job, dryRun, runDate, chapterCou
   });
 }
 
+async function runLoginRepairForJob(repoRoot, log, job) {
+  if (!job.seedProfileDir) {
+    log(`[${job.id}] 缺少 seedProfileDir，无法自动修复登录态`);
+    return false;
+  }
+
+  const statusPath = DEFAULT_LOGIN_STATUS_FILE;
+  const helperArgs = buildLoginHelperArgs(repoRoot, job, statusPath);
+  const displayCommand = [process.execPath, ...helperArgs].join(" ");
+  log(`[${job.id}] 检测到登录态失效，启动可见登录修复窗口: ${displayCommand}`);
+  await fsp.rm(statusPath, { force: true }).catch(() => {});
+
+  const child = spawn(process.execPath, helperArgs, {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      PYTHONIOENCODING: "utf-8",
+      PYTHONUTF8: "1",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: false,
+  });
+
+  const bindStream = (stream, label) => {
+    const rl = readline.createInterface({ input: stream });
+    rl.on("line", (line) => {
+      log(`[${job.id}] login-helper ${label}${line}`);
+    });
+  };
+  bindStream(child.stdout, "");
+  bindStream(child.stderr, "ERR ");
+
+  const deadline = Date.now() + 15 * 60 * 1000;
+  while (Date.now() < deadline) {
+    const exited = child.exitCode;
+    if (await fileExists(statusPath)) {
+      const status = await loadJson(statusPath, null);
+      if (status?.loggedIn && status?.phase === "logged_in") {
+        log(`[${job.id}] 登录修复成功，准备重跑上传`);
+        return true;
+      }
+      if (status?.phase === "timeout" || status?.phase === "error") {
+        log(`[${job.id}] 登录修复失败，phase=${status.phase}`);
+        break;
+      }
+    }
+    if (exited !== null) {
+      break;
+    }
+    await sleep(2000);
+  }
+
+  if (child.exitCode === null) {
+    try {
+      child.kill();
+    } catch {}
+  }
+  return false;
+}
+
 function getRandomizedExecutionState(entry, job, now, log) {
   const anchor = computePublishAnchor(now, job.publishTime);
   const dateKey = formatLocalDateKey(anchor);
@@ -408,7 +523,7 @@ function getRandomizedExecutionState(entry, job, now, log) {
     delayMinutes,
     executeAt: executeAt.toISOString(),
   };
-  log(`[${job.id}] 已生成随机延迟：${delayMinutes} 分钟，预计执行时间 ${executeAt.toLocaleString("zh-CN", { hour12: false })}`);
+  log(`[${job.id}] 已生成随机延迟：${delayMinutes} 分钟，预计执行时间 ${formatHongKongDateTime(executeAt)}`);
   return entry.randomizedExecution;
 }
 
@@ -416,8 +531,20 @@ function clearRandomizedExecution(entry) {
   delete entry.randomizedExecution;
 }
 
-function isJobDue(stateEntry, now, runNow) {
+function hasSuccessfulRunSinceAnchor(stateEntry, anchor) {
+  if (!stateEntry?.lastSuccessAt) {
+    return false;
+  }
+  const successAt = new Date(stateEntry.lastSuccessAt);
+  return Number.isFinite(successAt.getTime()) && successAt >= anchor;
+}
+
+function isJobDue(stateEntry, job, now, runNow) {
   if (runNow) {
+    return true;
+  }
+  const anchor = computePublishAnchor(now, job.publishTime);
+  if (now >= anchor && !hasSuccessfulRunSinceAnchor(stateEntry, anchor)) {
     return true;
   }
   if (!stateEntry.nextRunAt) {
@@ -473,7 +600,19 @@ async function main() {
   const now = new Date();
   for (const job of jobs) {
     const entry = state.jobs[job.id] ?? {};
-    if (!args.runNow) {
+    const currentNextRun = entry.nextRunAt ? new Date(entry.nextRunAt) : null;
+    if (
+      !args.runNow &&
+      (
+        !entry.nextRunAt ||
+        !Number.isFinite(currentNextRun?.getTime?.()) ||
+        (
+          entry.lastKnownPublishTime &&
+          entry.lastKnownPublishTime !== job.publishTime &&
+          currentNextRun > now
+        )
+      )
+    ) {
       entry.nextRunAt = computeNextOccurrence(now, job.publishTime).toISOString();
     }
     entry.lastKnownPublishTime = job.publishTime;
@@ -496,7 +635,7 @@ async function main() {
         entry.nextRunAt = computeNextOccurrence(loopNow, job.publishTime).toISOString();
         latestState.jobs[job.id] = entry;
       }
-      if (!isJobDue(entry, loopNow, forceRunNow)) {
+      if (!isJobDue(entry, job, loopNow, forceRunNow)) {
         continue;
       }
 
@@ -514,7 +653,7 @@ async function main() {
         if (executeAt > delayNow) {
           if (args.once) {
             const waitMs = executeAt.getTime() - delayNow.getTime();
-            log(`[${job.id}] 等待随机窗口，到 ${executeAt.toLocaleString("zh-CN", { hour12: false })} 后执行`);
+            log(`[${job.id}] 等待随机窗口，到 ${formatHongKongDateTime(executeAt)} 后执行`);
             await sleep(waitMs);
           } else {
             entry.nextRunAt = randomized.executeAt;
@@ -525,7 +664,7 @@ async function main() {
         }
       }
 
-      const exitCode = await runUploaderForJob(
+      let exitCode = await runUploaderForJob(
         repoRoot,
         log,
         job,
@@ -533,13 +672,36 @@ async function main() {
         new Date(),
         args.chapterCount,
       );
+      if (!args.dryRun && exitCode === LOGIN_REPAIR_EXIT_CODE) {
+        const repaired = await runLoginRepairForJob(repoRoot, log, job);
+        if (repaired) {
+          log(`[${job.id}] 登录修复后立即重跑上传任务`);
+          exitCode = await runUploaderForJob(
+            repoRoot,
+            log,
+            job,
+            args.dryRun,
+            new Date(),
+            args.chapterCount,
+          );
+        } else {
+          log(`[${job.id}] 登录修复未完成，本轮仍按失败处理`);
+        }
+      }
       if (exitCode === 0) {
         entry.lastSuccessAt = new Date().toISOString();
         entry.lastExitCode = 0;
         entry.retryAttemptCount = 0;
         entry.nextRunAt = computeNextOccurrence(new Date(), job.publishTime).toISOString();
         clearRandomizedExecution(entry);
-        log(`[${job.id}] 本轮任务成功，下一次执行时间 ${entry.nextRunAt}`);
+        log(`[${job.id}] 本轮任务成功，下一次执行时间 ${formatHongKongDateTime(entry.nextRunAt)}`);
+      } else if (exitCode === DAILY_LIMIT_EXIT_CODE) {
+        entry.lastFailureAt = new Date().toISOString();
+        entry.lastExitCode = exitCode;
+        entry.retryAttemptCount = 0;
+        entry.nextRunAt = computeNextDayOccurrence(new Date(), job.publishTime).toISOString();
+        clearRandomizedExecution(entry);
+        log(`[${job.id}] 命中平台当日上限，改为次日重试：${formatHongKongDateTime(entry.nextRunAt)}`);
       } else {
         hasFailure = true;
         failedJobs.push(`${job.id}:${exitCode}`);
@@ -554,7 +716,7 @@ async function main() {
         );
         entry.nextRunAt = new Date(Date.now() + retryDelayMinutes * 60 * 1000).toISOString();
         log(`[${job.id}] retry scheduled: attempt=${entry.retryAttemptCount}, delayMinutes=${retryDelayMinutes}`);
-        log(`[${job.id}] 本轮任务失败，exit=${exitCode}，将在 ${entry.nextRunAt} 重试`);
+        log(`[${job.id}] 本轮任务失败，exit=${exitCode}，将在 ${formatHongKongDateTime(entry.nextRunAt)} 重试`);
       }
       latestState.jobs[job.id] = entry;
       await saveJson(statePath, latestState);
@@ -563,7 +725,7 @@ async function main() {
     forceRunNow = false;
 
     if (args.once) {
-      if (hasFailure && args.retryUntilSuccess) {
+      if (args.retryUntilSuccess) {
         const pendingRetryJobs = getPendingRetryJobs(jobs, latestState.jobs);
         const nextRetry = pendingRetryJobs
           .slice()
@@ -574,7 +736,7 @@ async function main() {
           const retrySummary = pendingRetryJobs
             .map(({ job, retryAttemptCount, nextRetryAt }) => {
               const attemptLabel = retryAttemptCount > 0 ? retryAttemptCount : 1;
-              return `${job.id}(retry=${attemptLabel}, at=${nextRetryAt.toISOString()})`;
+              return `${job.id}(retry=${attemptLabel}, at=${formatHongKongDateTime(nextRetryAt)})`;
             })
             .join(", ");
           log(`retry-until-success active: ${retrySummary}`);

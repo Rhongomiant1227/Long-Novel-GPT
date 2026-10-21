@@ -138,17 +138,40 @@ def run_yield_func(func, *args, **kwargs):
         return e.value
 
 def split_text_into_chunks(text, max_chunk_size, min_chunk_n, min_chunk_size=1, max_chunk_n=1000):
+    def hard_split_paragraph(para):
+        if len(para) < 2:
+            raise Exception("没有找到分割点!")
+
+        target = len(para) // 2
+        left_min = max(1, min(min_chunk_size, len(para) - 1))
+        right_min = max(1, min(min_chunk_size, len(para) - 1))
+
+        start = max(left_min, 1)
+        end = min(len(para) - right_min, len(para) - 1)
+        if start > end:
+            start = 1
+            end = len(para) - 1
+
+        split_at = min(range(start, end + 1), key=lambda idx: abs(idx - target))
+        return para[:split_at], para[split_at:]
+
     def split_paragraph(para):
         mid = len(para) // 2
         split_pattern = r'[。？；]'
         split_points = [m.end() for m in re.finditer(split_pattern, para)]
         
         if not split_points:
-            raise Exception("没有找到分割点!")
+            if len(para) < 2:
+                raise Exception("没有找到分割点!")
+            fallback = max(1, min(len(para) - 1, mid))
+            return para[:fallback], para[fallback:]
         
         closest_point = min(split_points, key=lambda x: abs(x - mid))
         if not para[:closest_point].strip() or not para[closest_point:].strip():
-            raise Exception("没有找到分割点!")
+            if len(para) < 2:
+                raise Exception("没有找到分割点!")
+            fallback = max(1, min(len(para) - 1, mid))
+            return para[:fallback], para[fallback:]
         
         return para[:closest_point], para[closest_point:]
 
@@ -181,7 +204,9 @@ def split_text_into_chunks(text, max_chunk_size, min_chunk_n, min_chunk_size=1, 
         longest_para_i = max(range(len(paragraphs)), key=lambda i: len(paragraphs[i]))
         part1, part2 = split_paragraph(paragraphs[longest_para_i])
         if len(part1) < min_chunk_size or len(part2) < min_chunk_size or len(paragraphs) + 1 > max_chunk_n:
-            raise Exception("没有找到合适的分割点!")
+            part1, part2 = hard_split_paragraph(paragraphs[longest_para_i])
+            if len(part1) < 1 or len(part2) < 1 or len(paragraphs) + 1 > max_chunk_n:
+                raise Exception("没有找到合适的分割点!")
         paragraphs[longest_para_i:longest_para_i+1] = [part1, part2]
     
     return paragraphs
