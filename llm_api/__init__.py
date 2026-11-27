@@ -4,6 +4,7 @@ from .mongodb_cache import llm_api_cache
 from .baidu_api import stream_chat_with_wenxin, wenxin_model_config
 from .doubao_api import stream_chat_with_doubao, doubao_model_config
 from .chat_messages import ChatMessages
+from .generation_speed import measure_visible_stream
 from .openai_api import stream_chat_with_gpt, gpt_model_config
 from .zhipuai_api import stream_chat_with_zhipuai, zhipuai_model_config
 from .anthropic_api import stream_chat_with_anthropic, anthropic_model_config
@@ -75,8 +76,9 @@ def stream_chat(model_config: ModelConfig, messages: list, response_json=False) 
 
     yield messages
 
+    provider_stream = None
     if model_config["model"] in wenxin_model_config:
-        result = yield from stream_chat_with_wenxin(
+        provider_stream = stream_chat_with_wenxin(
             messages,
             model=model_config["model"],
             ak=model_config["ak"],
@@ -85,7 +87,7 @@ def stream_chat(model_config: ModelConfig, messages: list, response_json=False) 
             response_json=response_json,
         )
     elif model_config["model"] in doubao_model_config:
-        result = yield from stream_chat_with_doubao(
+        provider_stream = stream_chat_with_doubao(
             messages,
             model=model_config["model"],
             endpoint_id=model_config["endpoint_id"],
@@ -94,7 +96,7 @@ def stream_chat(model_config: ModelConfig, messages: list, response_json=False) 
             response_json=response_json,
         )
     elif model_config["model"] in zhipuai_model_config:
-        result = yield from stream_chat_with_zhipuai(
+        provider_stream = stream_chat_with_zhipuai(
             messages,
             model=model_config["model"],
             api_key=model_config["api_key"],
@@ -102,7 +104,7 @@ def stream_chat(model_config: ModelConfig, messages: list, response_json=False) 
             response_json=response_json,
         )
     elif model_config.get("wire_api") == "anthropic_messages" or model_config["model"] in anthropic_model_config:
-        result = yield from stream_chat_with_anthropic(
+        provider_stream = stream_chat_with_anthropic(
             messages,
             model=model_config["model"],
             api_key=model_config["api_key"],
@@ -136,6 +138,8 @@ def stream_chat(model_config: ModelConfig, messages: list, response_json=False) 
             response_json=response_json,
         )
 
+    if provider_stream is not None:
+        result = yield from measure_visible_stream(provider_stream)
     result.finished = True
     yield result
 

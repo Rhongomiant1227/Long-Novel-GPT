@@ -25,7 +25,7 @@ COPY prompts/ ./prompts/
 COPY custom/ ./custom/
 
 # Copy frontend files
-COPY frontend/index.html /usr/share/nginx/html/
+COPY frontend/index.html frontend/classic.html /usr/share/nginx/html/
 COPY frontend/js/ /usr/share/nginx/html/js/
 COPY frontend/styles/ /usr/share/nginx/html/styles/
 COPY frontend/data/ /usr/share/nginx/html/data/
@@ -39,4 +39,4 @@ RUN chmod +x start.sh
 
 # EXPOSE $FRONTEND_PORT
 
-CMD ["./start.sh"] 
+CMD ["./start.sh"]

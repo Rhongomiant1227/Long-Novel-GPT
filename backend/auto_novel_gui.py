@@ -7,11 +7,15 @@ import re
 import subprocess
 import sys
 import time
+from functools import lru_cache
+from itertools import chain
 from pathlib import Path
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, Response, jsonify, request
 
+from backend.workspace_books import library_book, list_library_books
 from config import DEFAULT_MAIN_MODEL, DEFAULT_SUB_MODEL
+from split_full_novel import parse_heading_line
 
 
 auto_novel_gui_bp = Blueprint('auto_novel_gui', __name__)
@@ -61,7 +65,7 @@ def read_json(path: Path, default: dict | list | None = None):
     if not path.exists():
         return {} if default is None else default
     try:
-        return json.loads(path.read_text(encoding='utf-8'))
+        return json.loads(path.read_text(encoding='utf-8-sig'))
     except Exception:
         return {} if default is None else default
 
@@ -121,8 +125,14 @@ def is_pid_running(pid: int) -> bool:
         process_handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
         if not process_handle:
             return False
-        ctypes.windll.kernel32.CloseHandle(process_handle)
-        return True
+        try:
+            exit_code = ctypes.c_ulong()
+            return bool(
+                ctypes.windll.kernel32.GetExitCodeProcess(process_handle, ctypes.byref(exit_code))
+                and exit_code.value == 259
+            )
+        finally:
+            ctypes.windll.kernel32.CloseHandle(process_handle)
     try:
         os.kill(pid, 0)
         return True
@@ -165,6 +175,10 @@ def detect_file_type(path: str) -> str:
         return 'series_bible_short'
     if basename == 'story_memory.md':
         return 'memory'
+    if basename == 'completion_report.md':
+        return 'report'
+    if basename == 'research_notes.md':
+        return 'research'
     if basename == 'state.json':
         return 'state'
     if basename == 'project_config.json':
@@ -204,6 +218,10 @@ def pretty_file_label(path: str, chapter_number: int | None = None) -> str:
         return '系列圣经（短）'
     if file_type == 'memory':
         return '剧情记忆'
+    if file_type == 'report':
+        return '完结评估'
+    if file_type == 'research':
+        return '调研笔记'
     if file_type == 'state':
         return '运行状态'
     if file_type == 'config':
@@ -265,10 +283,11 @@ def save_project_config(project_dir: Path, config: dict) -> dict:
     return merged
 
 
-def load_project_snapshot(project_dir: Path) -> dict:
+def load_project_snapshot(project_dir: Path, live_stage: dict | None = None) -> dict:
     state = read_json(project_dir / 'state.json', {})
     heartbeat = read_json(project_dir / 'logs' / 'runner_heartbeat.json', {})
-    live_stage = read_json(project_dir / 'logs' / 'live_stage.json', {})
+    if live_stage is None:
+        live_stage = read_json(project_dir / 'logs' / 'live_stage.json', {})
     watchdog = read_watchdog_status(project_dir)
     config = load_project_config(project_dir)
 
@@ -284,7 +303,7 @@ def load_project_snapshot(project_dir: Path) -> dict:
     grace_seconds = int(config.get('runner_heartbeat_grace_seconds', 90) or 90)
     runner_alive = bool(heartbeat_pid and is_pid_running(heartbeat_pid))
     running = watchdog['running'] or runner_alive
-    if not running and status == 'running' and heartbeat_age is not None and heartbeat_age <= grace_seconds * 2:
+    if not running and not heartbeat_pid and status == 'running' and heartbeat_age is not None and heartbeat_age <= grace_seconds * 2:
         running = True
 
     return {
@@ -293,6 +312,7 @@ def load_project_snapshot(project_dir: Path) -> dict:
         'display_name': state.get('book_title') or config.get('display_name') or project_dir.name,
         'path': str(project_dir),
         'status': status,
+        'has_state': bool(state),
         'running': running,
         'watchdog_pid': watchdog['pid'],
         'runner_pid': heartbeat_pid,
@@ -325,7 +345,25 @@ def project_sort_key(project: dict):
 
 def list_projects() -> list[dict]:
     ensure_auto_projects_dir()
-    projects = [load_project_snapshot(path) for path in AUTO_PROJECTS_DIR.iterdir() if path.is_dir()]
+    projects = []
+    for path in AUTO_PROJECTS_DIR.iterdir():
+        if not path.is_dir():
+            continue
+        project = load_project_snapshot(path)
+        if not project['has_state']:
+            chapters = 0
+            characters = 0
+            for draft in path.glob('volumes/vol_*/chapters/ch_*/draft.md'):
+                try:
+                    stat = draft.stat()
+                except FileNotFoundError:
+                    continue
+                _, length = read_draft_info(draft, stat.st_mtime_ns, stat.st_size)
+                if length:
+                    chapters += 1
+                    characters += length
+            project.update(archived_chapters=chapters, archived_chars=characters)
+        projects.append(project)
     projects.sort(key=project_sort_key)
     return projects
 
@@ -341,6 +379,17 @@ def chapter_title_map(project_dir: Path) -> dict[int, str]:
     return mapping
 
 
+@lru_cache(maxsize=4096)
+def read_draft_info(path: Path, modified_ns: int, size: int) -> tuple[str, int]:
+    try:
+        text = path.read_text(encoding='utf-8-sig', errors='replace').strip()
+    except OSError:
+        return '', 0
+    first_line = text.partition('\n')[0].lstrip('# ').strip()
+    _, title = parse_heading_line(first_line)
+    return title, len(text)
+
+
 def build_project_tree(project_dir: Path) -> list[dict]:
     chapter_titles = chapter_title_map(project_dir)
     tree: list[dict] = []
@@ -350,21 +399,32 @@ def build_project_tree(project_dir: Path) -> list[dict]:
             tree.append({'label': label, 'type': type_name, 'kind': 'group', 'children': children})
 
     overview_children = []
-    for relative_path in ['brief.md', 'manuscript/full_novel.txt', 'state.json', PROJECT_CONFIG_PATH]:
+    overview_paths = ['brief.md', 'manuscript/full_novel.txt', 'state.json', PROJECT_CONFIG_PATH]
+    overview_paths.extend(
+        path.name for path in sorted(project_dir.iterdir())
+        if path.suffix.lower() in {'.md', '.txt'} and path.name != 'brief.md'
+    )
+    for relative_path in overview_paths:
         full_path = project_dir / relative_path
-        if full_path.exists():
+        if full_path.is_file():
             overview_children.append({
                 'label': pretty_file_label(relative_path),
                 'path': relative_path,
                 'type': detect_file_type(relative_path),
                 'kind': 'file',
+                'size': full_path.stat().st_size,
             })
     add_group('项目概览', 'overview', overview_children)
 
     memory_children = []
-    for relative_path in ['memory/series_bible.md', 'memory/series_bible_short.md', 'memory/story_memory.md']:
-        full_path = project_dir / relative_path
-        if full_path.exists():
+    memory_paths = ['memory/series_bible.md', 'memory/series_bible_short.md', 'memory/story_memory.md']
+    memory_paths.extend(
+        path.relative_to(project_dir).as_posix()
+        for path in sorted((project_dir / 'memory').rglob('*.md'))
+        if path.relative_to(project_dir).as_posix() not in memory_paths
+    )
+    for relative_path in memory_paths:
+        if (project_dir / relative_path).is_file():
             memory_children.append({
                 'label': pretty_file_label(relative_path),
                 'path': relative_path,
@@ -380,12 +440,12 @@ def build_project_tree(project_dir: Path) -> list[dict]:
         volume_number_match = re.search(r'vol_(\d+)', volume_dir.name)
         volume_number = int(volume_number_match.group(1)) if volume_number_match else 0
         volume_children = []
-        plan_path = volume_dir / 'plan.md'
-        if plan_path.exists():
+        for plan_path in sorted(volume_dir.glob('*.md'), key=lambda path: (path.name != 'plan.md', path.name)):
+            relative_path = plan_path.relative_to(project_dir).as_posix()
             volume_children.append({
-                'label': '卷计划',
-                'path': str(plan_path.relative_to(project_dir)).replace('\\', '/'),
-                'type': 'plan',
+                'label': pretty_file_label(relative_path),
+                'path': relative_path,
+                'type': detect_file_type(relative_path),
                 'kind': 'file',
             })
 
@@ -396,24 +456,36 @@ def build_project_tree(project_dir: Path) -> list[dict]:
                 continue
             chapter_match = re.search(r'ch_(\d+)', chapter_dir.name)
             chapter_number = int(chapter_match.group(1)) if chapter_match else 0
-            title_suffix = chapter_titles.get(chapter_number, '').strip()
-            title_text = f' · {title_suffix}' if title_suffix else ''
+            title = chapter_titles.get(chapter_number, '').strip()
+            parsed_number, parsed_title = parse_heading_line(title)
+            if parsed_number is not None:
+                title = parsed_title
             chapter_children = []
             for filename in ['draft.md', 'plot.md', 'outline.md', 'summary.md']:
                 file_path = chapter_dir / filename
                 if not file_path.exists():
                     continue
                 relative_path = str(file_path.relative_to(project_dir)).replace('\\', '/')
-                chapter_children.append({
+                file_node = {
                     'label': pretty_file_label(relative_path, chapter_number),
                     'path': relative_path,
                     'type': detect_file_type(relative_path),
                     'kind': 'file',
                     'chapter_number': chapter_number,
-                })
+                }
+                if filename == 'draft.md':
+                    try:
+                        stat = file_path.stat()
+                    except FileNotFoundError:
+                        continue
+                    draft_title, characters = read_draft_info(file_path, stat.st_mtime_ns, stat.st_size)
+                    title = title or draft_title
+                    file_node['characters'] = characters
+                chapter_children.append(file_node)
             if chapter_children:
                 chapter_groups.append({
-                    'label': f'第{chapter_number}章{title_text}',
+                    'label': f'第{chapter_number}章 · {title}' if title else f'第{chapter_number}章',
+                    'title': title,
                     'type': 'chapter',
                     'kind': 'chapter',
                     'chapter_number': chapter_number,
@@ -508,6 +580,8 @@ def build_start_command(project_dir: Path, config: dict) -> list[str]:
         '--memory-refresh-interval', str(int(config['memory_refresh_interval'])),
         '--main-model', str(config['main_model']),
         '--sub-model', str(config['sub_model']),
+        '--critic-model', str(config['main_model']),
+        '--ending-polish-model', str(config['main_model']),
         '--planner-reasoning-effort', str(config['planner_reasoning_effort']),
         '--writer-reasoning-effort', str(config['writer_reasoning_effort']),
         '--sub-reasoning-effort', str(config['sub_reasoning_effort']),
@@ -549,8 +623,9 @@ def stop_project_process(project_dir: Path) -> dict:
     for pid in [int(watchdog.get('pid', 0) or 0), int(heartbeat.get('pid', 0) or 0)]:
         if not pid or not is_pid_running(pid):
             continue
-        subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], capture_output=True, text=True)
-        killed_pid = pid
+        result = subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], capture_output=True)
+        if result.returncode == 0 or not is_pid_running(pid):
+            killed_pid = pid
         break
     return {'stopped': bool(killed_pid), 'pid': killed_pid}
 
@@ -564,8 +639,8 @@ def project_response(project_dir: Path) -> dict:
 def parse_project_request(data: dict) -> dict:
     return {
         'display_name': str(data.get('project_name') or data.get('display_name') or '').strip() or '未命名项目',
-        'target_chars': int(data.get('target_chars') or DEFAULT_AUTO_CONFIG['target_chars']),
-        'chapter_char_target': int(data.get('chapter_char_target') or DEFAULT_AUTO_CONFIG['chapter_char_target']),
+        'target_chars': int(data.get('target_chars', DEFAULT_AUTO_CONFIG['target_chars'])),
+        'chapter_char_target': int(data.get('chapter_char_target', DEFAULT_AUTO_CONFIG['chapter_char_target'])),
         'chapters_per_volume': int(data.get('chapters_per_volume') or DEFAULT_AUTO_CONFIG['chapters_per_volume']),
         'chapters_per_batch': int(data.get('chapters_per_batch') or DEFAULT_AUTO_CONFIG['chapters_per_batch']),
         'memory_refresh_interval': int(data.get('memory_refresh_interval') or DEFAULT_AUTO_CONFIG['memory_refresh_interval']),
@@ -591,9 +666,25 @@ def parse_project_request(data: dict) -> dict:
 def get_auto_novel_projects():
     return jsonify({
         'projects': list_projects(),
+        'library_books': list_library_books(),
         'defaults': dict(DEFAULT_AUTO_CONFIG),
         'projects_root': DEFAULT_PROJECTS_ROOT,
     })
+
+
+@auto_novel_gui_bp.get('/auto_novel/library/<book_id>/tree')
+@auto_novel_gui_bp.get('/auto_novel/library/<book_id>/content')
+def get_library_document(book_id: str):
+    try:
+        _, tree, documents = library_book(book_id)
+    except (OSError, ValueError) as exc:
+        return jsonify({'error': str(exc)}), 404
+    if request.path.endswith('/tree'):
+        return jsonify({'tree': tree})
+    file = documents.get(request.args.get('path', ''))
+    if file is None:
+        return jsonify({'error': '作品中没有这份文档'}), 404
+    return jsonify(file)
 
 
 @auto_novel_gui_bp.route('/auto_novel/projects', methods=['POST'])
@@ -605,24 +696,43 @@ def create_auto_novel_project():
 
     project_name = str(data.get('project_name') or '').strip() or '未命名项目'
     project_dir = get_project_path_for_create(project_name)
-    if project_dir.exists():
+    try:
+        config = parse_project_request(data)
+        if config['target_chars'] <= 0 or config['chapter_char_target'] <= 0:
+            raise ValueError
+    except (ValueError, TypeError, OverflowError):
+        return jsonify({'error': '请填写有效的创作参数，目标字数和单章字数须为正整数。'}), 400
+    try:
+        project_dir.mkdir()
+    except FileExistsError:
         return jsonify({'error': f'项目已存在：{project_dir.name}'}), 409
+    except OSError:
+        return jsonify({'error': '无法创建作品目录，请检查书名是否可用。'}), 400
 
-    project_dir.mkdir(parents=True, exist_ok=True)
-    (project_dir / 'logs').mkdir(parents=True, exist_ok=True)
-    (project_dir / 'memory').mkdir(parents=True, exist_ok=True)
-    (project_dir / 'volumes').mkdir(parents=True, exist_ok=True)
-    (project_dir / 'manuscript').mkdir(parents=True, exist_ok=True)
-    (project_dir / 'brief.md').write_text(brief_text, encoding='utf-8')
+    brief_path = project_dir / 'brief.md'
+    config_path = project_dir / PROJECT_CONFIG_PATH
+    try:
+        brief_path.write_text(brief_text, encoding='utf-8')
+        config = save_project_config(project_dir, config)
+    except (OSError, ValueError):
+        for path in (brief_path, config_path, config_path.with_suffix('.json.tmp')):
+            path.unlink(missing_ok=True)
+        project_dir.rmdir()
+        return jsonify({'error': '无法保存作品，请检查项目目录的写入权限。'}), 500
 
-    config = save_project_config(project_dir, parse_project_request(data))
     auto_start = bool(data.get('auto_start', True))
     started = None
+    start_error = ''
     if auto_start:
-        started = spawn_project(project_dir, config)
+        try:
+            started = spawn_project(project_dir, config)
+        except OSError as exc:
+            start_error = str(exc)
 
     payload = project_response(project_dir)
     payload['started'] = started
+    if start_error:
+        payload['start_error'] = start_error
     return jsonify(payload), 201
 
 
@@ -637,6 +747,12 @@ def continue_auto_novel_project(project_id: str):
     if snapshot['running']:
         snapshot['started'] = {'spawned': False, 'reason': 'already_running'}
         return jsonify(snapshot)
+
+    if not snapshot['has_state']:
+        manuscript = project_dir / 'manuscript' / 'full_novel.txt'
+        drafts = (project_dir / 'volumes').glob('vol_*/chapters/ch_*/draft.md')
+        if any(path.is_file() and path.stat().st_size > 0 for path in chain((manuscript,), drafts)):
+            return jsonify({'error': '项目已有正文，但缺少续写状态文件 state.json。恢复该文件后才能继续生成。'}), 409
 
     data = request.get_json(silent=True) or {}
     config = save_project_config(project_dir, parse_project_request({**snapshot['config'], **data}))
@@ -706,10 +822,86 @@ def get_auto_novel_project_live(project_id: str):
         return jsonify({'error': str(exc)}), 404
 
     snapshot = load_project_snapshot(project_dir)
+    if request.args.get('compact') == '1':
+        stage = snapshot.pop('live_stage')
+        return jsonify({'project': snapshot, 'live_stage': stage})
     return jsonify({
         'project': snapshot,
-        'live_stage': read_json(project_dir / 'logs' / 'live_stage.json', {}),
+        'live_stage': snapshot['live_stage'],
         'runner_log_tail': tail_text(project_dir / 'logs' / 'runner.log'),
         'watchdog_log_tail': tail_text(project_dir / 'logs' / 'watchdog.log'),
         'events_tail': tail_text(project_dir / 'logs' / 'events.log'),
     })
+
+
+def project_live_event(previous: dict | None, current: dict) -> dict:
+    text = current.get('text') or ''
+    previous_text = (previous or {}).get('text') or ''
+    identity = ('label', 'stage_type', 'chapter_number')
+    append = (
+        previous is not None
+        and not current.get('reset')
+        and all(previous.get(key) == current.get(key) for key in identity)
+        and text.startswith(previous_text)
+    )
+    return {
+        'stage': {key: value for key, value in current.items() if key != 'text'},
+        'text': text[len(previous_text):] if append else text,
+        'append': append,
+    }
+
+
+def stream_project_updates(project_dir: Path):
+    live_path = project_dir / 'logs' / 'live_stage.json'
+    previous_version = None
+    live_stage = None
+    project_key = None
+    next_status = 0.0
+    deadline = time.monotonic() + 50
+    next_keepalive = time.monotonic() + 12
+    yield 'retry: 1000\n\n'
+    while (now := time.monotonic()) < deadline:
+        try:
+            stat = live_path.stat()
+            version = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            version = (0, 0)
+        if version != previous_version:
+            candidate = read_json(live_path)
+            if candidate or version == (0, 0):
+                previous_version = version
+                if candidate != live_stage:
+                    event = json.dumps(project_live_event(live_stage, candidate), ensure_ascii=False)
+                    live_stage = candidate
+                    yield f'event: live\ndata: {event}\n\n'
+
+        if now >= next_status:
+            next_status = now + 2
+            snapshot = load_project_snapshot(project_dir, live_stage or {})
+            del snapshot['live_stage']
+            # The age changes every second. A new heartbeat or another state change warrants an update.
+            key = {key: value for key, value in snapshot.items() if key not in {
+                'heartbeat_age_seconds', 'stage_runtime_seconds',
+            }}
+            if key != project_key:
+                project_key = key
+                event = json.dumps(snapshot, ensure_ascii=False)
+                yield f'event: status\ndata: {event}\n\n'
+
+        if now >= next_keepalive:
+            next_keepalive = now + 12
+            yield ': keepalive\n\n'
+        time.sleep(0.4)
+
+
+@auto_novel_gui_bp.route('/auto_novel/projects/<project_id>/stream', methods=['GET'])
+def stream_auto_novel_project(project_id: str):
+    try:
+        project_dir = get_project_dir(project_id)
+    except FileNotFoundError as exc:
+        return jsonify({'error': str(exc)}), 404
+    return Response(
+        stream_project_updates(project_dir),
+        mimetype='text/event-stream',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+    )

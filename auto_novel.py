@@ -1677,6 +1677,7 @@ class AutoNovelRunner:
         self.completion_report_path = self.memory_dir / 'completion_report.md'
         self.logger = self._build_logger()
         self._stream_cache: dict[str, str] = {}
+        self._generation_speed = None
         self._last_stage_state_save_ts = 0.0
         self.heartbeat_path = self.logs_dir / 'runner_heartbeat.json'
         self._stop_heartbeat = threading.Event()
@@ -1684,7 +1685,7 @@ class AutoNovelRunner:
         self._heartbeat_error_logged = False
         self._last_heartbeat_write_ts = 0.0
         self._last_live_stage_write_ts = 0.0
-        self._last_live_stage_payload_key = ''
+        self._last_live_stage = {}
         self._live_stream_available = True
         self._live_stream_error_logged = False
         self._live_stream_line_open = False
@@ -2179,14 +2180,14 @@ class AutoNovelRunner:
             return 'draft'
         if '剧情' in label or 'plot' in lower_label:
             return 'plot'
+        if '摘要' in label or '总结' in label or 'summary' in lower_label:
+            return 'summary'
         if '章节' in label or '大纲' in label or 'outline' in lower_label:
             return 'outline'
         if '设定' in label or '圣经' in label or 'bible' in lower_label:
             return 'series_bible'
         if '记忆' in label or 'memory' in lower_label:
             return 'memory'
-        if '摘要' in label or '总结' in label or 'summary' in lower_label:
-            return 'summary'
         if '规划' in label or '计划' in label or 'plan' in lower_label:
             return 'plan'
         return 'llm'
@@ -2200,6 +2201,9 @@ class AutoNovelRunner:
         finish: bool = False,
         force: bool = False,
     ) -> None:
+        current_time = time.monotonic()
+        if not (force or reset or finish) and current_time - self._last_live_stage_write_ts < 0.4:
+            return
         snapshot = {
             'project': self.project_dir.name,
             'label': label,
@@ -2207,6 +2211,7 @@ class AutoNovelRunner:
             'chapter_number': self._extract_stage_chapter_number(label),
             'text': full_text or '',
             'text_length': len(full_text or ''),
+            'generation_speed': self._generation_speed,
             'active': bool(label) and not finish,
             'finished': finish,
             'reset': reset,
@@ -2215,23 +2220,19 @@ class AutoNovelRunner:
             'generated_chars': self.state.get('generated_chars', 0),
             'updated_at': now_str(),
         }
-        payload_key = json.dumps({k: v for k, v in snapshot.items() if k != 'updated_at'}, ensure_ascii=False, sort_keys=True)
-        current_time = time.time()
-        if not force:
-            if payload_key == self._last_live_stage_payload_key and current_time - self._last_live_stage_write_ts < 0.4:
-                return
-            if current_time - self._last_live_stage_write_ts < 0.4 and not reset and not finish:
-                return
         try:
             tmp_path = self.live_stage_path.with_suffix('.json.tmp')
             tmp_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding='utf-8')
             replace_with_retry(tmp_path, self.live_stage_path)
             self._last_live_stage_write_ts = current_time
-            self._last_live_stage_payload_key = payload_key
+            self._last_live_stage = snapshot
         except Exception as exc:
             self._log_event_only(f'[live_stage] 写入失败：{exc}')
 
     def _stream_text(self, label: str, full_text: str, reset: bool = False, finish: bool = False) -> None:
+        last = self._last_live_stage
+        if finish and label not in self._stream_cache and last.get('label') == label and last.get('finished'):
+            return
         full_text = clean_live_draft_stream_text(self._sanitize_text(full_text or ''))
         if reset or label not in self._stream_cache:
             self._stream_cache[label] = ''
@@ -2247,7 +2248,7 @@ class AutoNovelRunner:
             self.live_print(delta)
             self._stream_cache[label] = full_text
 
-        if reset or delta or finish:
+        if reset or delta or finish or self._generation_speed != last.get('generation_speed'):
             self._write_live_stage_snapshot(label, self._stream_cache.get(label, full_text), reset=reset, finish=finish)
 
         if finish and label in self._stream_cache:
@@ -2710,12 +2711,14 @@ class AutoNovelRunner:
         current_time = time.time()
         current_label = self.state.get('current_stage', '')
         if force or current_label != label:
+            self._generation_speed = None
+            self._stream_cache.pop(label, None)
             self.state['current_stage'] = label
             self.state['stage_started_at'] = now_str()
             self.state['last_stage_heartbeat_at'] = now_str()
             self._save_state()
             self._write_heartbeat(force=True)
-            self._write_live_stage_snapshot(label, self._stream_cache.get(label, ''), reset=True, force=True)
+            self._write_live_stage_snapshot(label, '', reset=True, force=True)
             self._last_stage_state_save_ts = current_time
             return
 
@@ -2733,7 +2736,9 @@ class AutoNovelRunner:
             self.state['last_stage_heartbeat_at'] = now_str()
             self._save_state()
             self._write_heartbeat(force=True)
-            self._write_live_stage_snapshot(previous_label, self._stream_cache.get(previous_label, ''), finish=True, force=True)
+            last = self._last_live_stage
+            if last.get('label') != previous_label or not last.get('finished'):
+                self._write_live_stage_snapshot(previous_label, self._stream_cache.get(previous_label, ''), finish=True, force=True)
             self._last_stage_state_save_ts = time.time()
 
     def _sync_manuscript(self) -> None:
@@ -2950,10 +2955,13 @@ class AutoNovelRunner:
                     reason = getattr(current, 'stream_fallback_reason', '') or 'stream transport error'
                     self.log(f'[{label}] 流式链路异常，已自动降级为非流式补全：{reason}')
                     fallback_logged = True
-                if response_text and stream_output:
+                self._generation_speed = current.generation_speed
+                speed_changed = self._generation_speed != self._last_live_stage.get('generation_speed')
+                if stream_output and (response_text or speed_changed):
                     self._stream_text(label, response_text)
-                    self.mark_stage(label)
-                elif response_text:
+                elif speed_changed:
+                    self._write_live_stage_snapshot(label, '')
+                if response_text or speed_changed:
                     self.mark_stage(label)
                 if response_text and time.time() - last_log_time >= 8 and len(response_text) != last_length:
                     self.log(f'[{label}] 正在生成，当前约 {len(response_text)} 字')
@@ -2964,6 +2972,7 @@ class AutoNovelRunner:
             raise RuntimeError(f'{label} 未返回有效内容。')
 
         response = self._sanitize_text(final_messages.response or '').strip()
+        self._generation_speed = final_messages.generation_speed
         if stream_output:
             self._stream_text(label, response, finish=True)
         self.clear_stage()
@@ -3539,13 +3548,14 @@ class AutoNovelRunner:
                     self._stream_text(phase_label, self._stream_cache.get(phase_label, ''), finish=True)
                 else:
                     current_stream_label = phase_label
-                    self._stream_text(current_stream_label, '', reset=True)
                     self.mark_stage(current_stream_label, force=True)
+                    self._stream_text(current_stream_label, '', reset=True)
                 self.log(f'[{label}] {name} {status}')
                 continue
 
             if isinstance(item, list):
                 merged_parts = []
+                responses = []
                 for entry in item:
                     if not entry:
                         continue
@@ -3553,16 +3563,27 @@ class AutoNovelRunner:
                     if not output:
                         continue
                     response_msgs = output.get('response_msgs') if isinstance(output, dict) else None
+                    if response_msgs is not None:
+                        responses.append(response_msgs)
                     text_part = output.get('text', '') if isinstance(output, dict) else ''
                     if not text_part and response_msgs is not None:
                         text_part = getattr(response_msgs, 'response', '')
                     if text_part and '正在建立映射关系' not in text_part:
                         merged_parts.append(text_part)
                 merged_text = '\n'.join(part for part in merged_parts if part)
-                if merged_text.strip():
-                    # Mapping/json stages are internal program steps; showing raw token text
-                    # leaks tool-oriented responses into the live novel stream.
-                    if '映射文本' not in current_stream_label:
+                if responses:
+                    # Show the latest active request. Finished chunks stay in the writer's batch.
+                    current = [response for response in responses if not response.finished] or responses
+                    self._generation_speed = max(
+                        (response.generation_speed for response in current if response.generation_speed),
+                        key=lambda speed: speed['sampled_at'], default=None,
+                    )
+                speed_changed = self._generation_speed != self._last_live_stage.get('generation_speed')
+                if merged_text.strip() or speed_changed:
+                    if '映射文本' in current_stream_label:
+                        if speed_changed:
+                            self._write_live_stage_snapshot(current_stream_label, '')
+                    else:
                         self._stream_text(current_stream_label, self._sanitize_text(merged_text))
                     self.mark_stage(current_stream_label)
 

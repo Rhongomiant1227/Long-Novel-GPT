@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>手动编辑器 · Long Novel</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="styles/tooltip.css">
+    <link rel="stylesheet" href="styles/toast.css">
+    <link rel="stylesheet" href="styles/styles.css">
+    <link rel="stylesheet" href="styles/chat_messages.css">
+    <link rel="stylesheet" href="styles/examples.css">
+    <link rel="stylesheet" href="styles/guide.css">
+    <link rel="stylesheet" href="styles/novel_select.css">
+    <link rel="stylesheet" href="styles/settings.css">
+    <link rel="stylesheet" href="styles/bottom_bar.css">
+    <link rel="stylesheet" href="styles/auto_novel.css">
+    <script>
+        window._env_ = window._env_ || {};
+        window._env_.SERVER_URL = window._env_.SERVER_URL || (
+            (window.location.protocol === 'file:' || ((window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost') && window.location.port && window.location.port !== '80' && window.location.port !== '443'))
+                ? 'http://127.0.0.1:7869'
+                : '/api'
+        );
+    </script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <a href="./">← 返回创作工作站</a>
+            <h1>Long-Novel-GPT V2.2</h1>
+            <h2>AI一键生成长篇小说</h2>
+        </header>
+        <div class="mode-chapter-wrapper">
+            <div class="mode-selection">
+                <select id="writeMode" style="display: none;">
+                    <option value="novel">选择小说</option>
+                    <option value="outline">创作章节</option>
+                    <option value="plot">创作剧情</option>
+                    <option value="draft">创作正文</option>
+                    <option value="settings">设置</option>
+                    <option value="auto">&#33258;&#21160;&#38271;&#31687;</option>
+                </select>
+                <div class="mode-tabs">
+                    <div class="mode-tab" data-value="novel">选择小说</div>
+                    <div class="mode-tab active" data-value="outline">创作章节</div>
+                    <div class="mode-tab" data-value="plot">创作剧情</div>
+                    <div class="mode-tab" data-value="draft">创作正文</div>
+                    <div class="mode-tab" data-value="auto">&#33258;&#21160;&#38271;&#31687;</div>
+                    <div class="mode-tab" data-value="settings">设置</div>
+                </div>
+            </div>
+            <div class="chapter-selection">
+                <div class="select-wrapper">
+                    <select id="chapterSelect">
+                        <option value="1">第1章</option>
+                        <option value="2">第2章</option>
+                        <option value="3">第3章</option>
+                        <option value="4">第4章</option>
+                        <option value="5">第5章</option>
+                        <option value="6">第6章</option>
+                        <option value="7">第7章</option>
+                        <option value="8">第8章</option>
+                        <option value="9">第9章</option>
+                        <option value="10">第10章</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+        <div class="prompt-section">
+            <div class="prompt-actions">
+                <button class="action-btn">开始创作</button>
+                <button class="show-prompt-btn">查看Prompt</button>
+                <div class="batch-actions hidden">
+                    <button class="batch-accept-btn">全部接受</button>
+                    <button class="batch-reject-btn">全部拒绝</button>
+                </div>
+                <div class="dropdown-group">
+                    <div class="select-wrapper" title="选择创作时的提示词">
+                        <select>
+                            <option>新建章节</option>
+                            <option>扩写章节</option>
+                            <option>润色章节</option>
+                        </select>
+                    </div>
+                    <div class="select-wrapper" title="设置AI创作时每个窗口的大小">
+                        <select class="context-window-select">
+                            <!-- Window size options will be populated by JavaScript -->
+                        </select>
+                    </div>
+                </div>
+            </div>
+            <div class="prompt-input">
+                <textarea placeholder="输入你的Prompt..."></textarea>
+            </div>
+        </div>
+        <div class="guide-section">
+            <div class="guide-header">
+                <h3>使用指南</h3>
+                <button class="toggle-guide">
+                    <span class="toggle-icon">▼</span>
+                </button>
+            </div>
+            <div class="guide-container">
+                <div class="guide-item">
+                    <h4>快捷操作</h4>
+                    <ul>
+                        <li><span class="key-combo">单击</span> 选中需要创作的文本块</li>
+                        <li><span class="key-combo">Ctrl + 点击</span> 多选文本块进行批量操作</li>
+                        <li><span class="key-combo">Shift + 点击</span> 选择连续的文本块</li>
+                        <li>点击<span class="key-combo">▼</span>可以折叠使用指南和创作示例</li>
+                    </ul>
+                </div>
+                <div class="guide-item">
+                    <h4>创作提示</h4>
+                    <ul>
+                        <li>选择更小的窗口更有利于扩充内容</li>
+                        <li>可以<span class="key-combo">自行输入提示词</span>，提示词越精确，生成的内容越符合预期</li>
+                        <li>使用右侧下拉菜单切换不同的 AI 模型和窗口大小</li>
+                    </ul>
+                </div>
+                <div class="guide-item">
+                    <h4>注意事项</h4>
+                    <ul>
+                        <li>在线Demo限制了最大线程数，<span class="key-combo">只有5个窗口</span>可以同时创作</li>
+                        <li>在设置中可以更改模型</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+        <div class="examples-section">
+            <div class="examples-header">
+                <h3>创作示例</h3>
+                <button class="toggle-examples">
+                    <span class="toggle-icon">▼</span>
+                </button>
+            </div>
+            <div class="examples-container">
+            </div>
+        </div>
+        <div class="content-section">
+            <div class="column-headers">
+                <div class="left-header">
+                    <div class="column-header-wrapper">
+                        <span>小说简介</span>
+                        <button class="copy-btn" data-column="left">复制</button>
+                    </div>
+                </div>
+                <div class="right-header">
+                    <div class="column-header-wrapper">
+                        <span>章节</span>
+                        <button class="copy-btn" data-column="right">复制</button>
+                    </div>
+                </div>
+            </div>
+            <div id="chunkContainer">
+            </div>
+        </div>
+        <div id="autoNovelSection" class="auto-novel-section" style="display: none;">
+            <div class="auto-toolbar">
+                <div class="auto-toolbar-left">
+                    <button type="button" class="auto-toolbar-btn auto-refresh-btn">å·æ°</button>
+                    <button type="button" class="auto-toolbar-btn auto-continue-btn">ç»§ç»­åä½</button>
+                    <button type="button" class="auto-toolbar-btn auto-stop-btn danger">åæ­¢é¡¹ç®</button>
+                    <label class="auto-realtime-toggle">
+                        <input type="checkbox" id="autoNovelRealtime" checked>
+                        <span>å®æ¶æ¨¡å¼</span>
+                    </label>
+                </div>
+                <div class="auto-toolbar-right">
+                    <span class="auto-current-project">å½åæªéæ©é¡¹ç®</span>
+                </div>
+            </div>
+            <div class="auto-layout">
+                <aside class="auto-sidebar">
+                    <section class="auto-card auto-create-card">
+                        <div class="auto-card-title-row">
+                            <h3>æ°å»ºé¡¹ç®</h3>
+                            <span class="auto-card-hint">è¾å¥ä¸æ¬¡è®¾å®åå¯èªå¨é¿è·</span>
+                        </div>
+                        <input id="autoProjectName" class="auto-input" type="text" placeholder="é¡¹ç®å / ä½åå">
+                        <textarea id="autoProjectBrief" class="auto-textarea" placeholder="è¾å¥å°è¯´æ»è®¾å®ãé£æ ¼ãç®æ å­æ°ãä¸»è§ä¿¡æ¯ç­ï¼ä¸æ¬¡æ§å¼åã"></textarea>
+                        <div class="auto-create-grid">
+                            <label class="auto-field">
+                                <span>ç®æ å­æ°</span>
+                                <input id="autoTargetChars" class="auto-input" type="number" min="10000" step="1000">
+                            </label>
+                            <label class="auto-field">
+                                <span>åç« ç®æ </span>
+                                <input id="autoChapterChars" class="auto-input" type="number" min="500" step="100">
+                            </label>
+                            <label class="auto-field auto-field-wide">
+                                <span>ä¸»æ¨¡å</span>
+                                <input id="autoMainModel" class="auto-input" type="text">
+                            </label>
+                            <label class="auto-field auto-field-wide">
+                                <span>å¯æ¨¡å</span>
+                                <input id="autoSubModel" class="auto-input" type="text">
+                            </label>
+                        </div>
+                        <div class="auto-create-actions">
+                            <label class="auto-checkbox">
+                                <input type="checkbox" id="autoStartImmediately" checked>
+                                <span>åå»ºåç«å³å¼å§</span>
+                            </label>
+                            <button type="button" class="auto-create-btn">åå»ºé¡¹ç®</button>
+                        </div>
+                    </section>
+                    <section class="auto-card auto-projects-card">
+                        <div class="auto-card-title-row">
+                            <h3>é¡¹ç®åè¡¨</h3>
+                            <span class="auto-card-hint">æ¯æå¤é¡¹ç®æå¼ãç»§ç»­åä½æçº¯è§ç</span>
+                        </div>
+                        <div class="auto-project-list"></div>
+                    </section>
+                    <section class="auto-card auto-tree-card">
+                        <div class="auto-card-title-row">
+                            <h3>åå®¹ç®å½</h3>
+                            <span class="auto-card-hint">æ­£æ / å§æ / è®¾å® / æ¥å¿ åå¼å±ç¤º</span>
+                        </div>
+                        <div class="auto-tree"></div>
+                    </section>
+                </aside>
+                <main class="auto-main">
+                    <section class="auto-card auto-status-card">
+                        <div class="auto-card-title-row">
+                            <h3>é¡¹ç®ç¶æ</h3>
+                            <span class="auto-status-subtitle">å®æ¶æ¾ç¤ºè¿åº¦ãé¶æ®µä¸å¿è·³</span>
+                        </div>
+                        <div class="auto-status-grid"></div>
+                        <div class="auto-status-error"></div>
+                    </section>
+                    <section class="auto-card auto-live-card">
+                        <div class="auto-card-title-row">
+                            <h3>å®æ¶è¾åº</h3>
+                            <span class="auto-live-meta"></span>
+                        </div>
+                        <div class="auto-live-placeholder">éæ©é¡¹ç®åå³å¯æ¥çå½åææ°æµå¼è¾åºã</div>
+                        <pre class="auto-live-content"></pre>
+                    </section>
+                    <section class="auto-card auto-reader-card">
+                        <div class="auto-reader-header">
+                            <div>
+                                <h3 class="auto-reader-title">éè¯»åº</h3>
+                                <div class="auto-reader-meta">å³é­å®æ¶æ¨¡å¼åï¼å¯ç¹å»å·¦ä¾§åå²åå®¹èªç±æµè§ã</div>
+                            </div>
+                        </div>
+                        <pre class="auto-reader-content"></pre>
+                    </section>
+                </main>
+            </div>
+        </div>
+    </div>
+    <script type="module" src="js/content_section.js"></script>
+    <script type="module" src="js/prompt_section.js"></script>
+    <script type="module" src="js/chat_messages.js"></script>
+    <script type="module" src="js/auto_novel_gui.js"></script>
+</body>
+</html>

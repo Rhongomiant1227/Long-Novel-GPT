@@ -12,3 +12,4 @@ flask-cors
 numpy
 chardet
 python-dotenv
+PyYAML

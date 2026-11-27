@@ -11,6 +11,7 @@ from urllib.parse import urlparse, urlunparse
 import httpx
 from openai import OpenAI
 from .chat_messages import ChatMessages
+from .generation_speed import GenerationSpeed
 
 # Pricing reference: https://openai.com/api/pricing/
 gpt_model_config = {
@@ -604,9 +605,11 @@ def _build_openai_client(api_key=None, base_url=None, proxies=None, timeout=None
     if default_headers:
         client_params['default_headers'] = default_headers
 
+    count_base = _normalize_base_url(os.getenv('NOVEL_TOKEN_COUNT_BASE_URL'))
+    simultaneous_count = streaming and count_base and count_base == _normalize_base_url(base_url)
     httpx_kwargs = {
         'http2': False,
-        'limits': httpx.Limits(max_connections=1, max_keepalive_connections=0),
+        'limits': httpx.Limits(max_connections=2 if simultaneous_count else 1, max_keepalive_connections=0),
         'headers': {
             'Connection': 'close',
             'Accept-Encoding': 'identity',
@@ -866,6 +869,20 @@ def _should_fallback_from_responses_error(exc, base_url):
     return not _is_official_openai_base_url(base_url)
 
 
+def _stream_speed_meter(client, base_url, model):
+    count_base = _normalize_base_url(os.getenv('NOVEL_TOKEN_COUNT_BASE_URL'))
+    if not count_base or count_base != _normalize_base_url(base_url):
+        return GenerationSpeed()
+
+    def count_tokens(text):
+        result = client.post('/messages/count_tokens', cast_to=object, body={
+            'model': model, 'messages': [{'role': 'user', 'content': text}],
+        }, options={'timeout': 0.5, 'max_retries': 0})
+        return result['input_tokens']
+
+    return GenerationSpeed(count_tokens)
+
+
 def _create_with_chat_completions_api(
     request_messages,
     result_messages,
@@ -903,8 +920,14 @@ def _create_with_chat_completions_api(
         streaming=False,
     )
 
+    meter = GenerationSpeed()
+    result_messages.generation_speed = None
     try:
         response = completion_client.chat.completions.create(**request_kwargs)
+        result_messages.generation_speed = meter.observe(
+            timings=getattr(response, 'timings', None),
+            output_tokens=getattr(getattr(response, 'usage', None), 'completion_tokens', None),
+        )
         content = _extract_response_content(response, n)
         if n == 1:
             _ensure_valid_model_response(content)
@@ -956,16 +979,29 @@ def _stream_chat_with_chat_completions_api(
     )
 
     content = ['' for _ in range(n)]
+    meter = _stream_speed_meter(stream_client, base_url, model)
     try:
         try:
             chatstream = stream_client.chat.completions.create(**request_kwargs)
             for part in chatstream:
+                fragments = []
+                visible = False
                 for choice in part.choices:
                     delta = _content_to_text(getattr(choice.delta, 'content', ''))
-                    if not delta:
-                        continue
-                    content[choice.index] += delta
+                    reasoning = getattr(choice.delta, 'reasoning_content', None)
+                    if isinstance(reasoning, str):
+                        fragments.append(reasoning)
+                    if delta:
+                        fragments.append(delta)
+                        content[choice.index] += delta
+                        visible = True
+                speed = meter.observe(
+                    ''.join(fragments), timings=getattr(part, 'timings', None),
+                    output_tokens=getattr(getattr(part, 'usage', None), 'completion_tokens', None),
+                )
+                if visible or speed is not result_messages.generation_speed:
                     result_messages[-1]['content'] = content if n > 1 else content[0]
+                    result_messages.generation_speed = speed
                     yield result_messages
             if any((item or '').strip() for item in content):
                 for item in content:
@@ -1028,8 +1064,10 @@ def _create_with_responses_api(
         streaming=False,
     )
 
+    meter = GenerationSpeed()
     try:
         response = response_client.responses.create(**request_kwargs)
+        result_messages.generation_speed = meter.observe(output_tokens=getattr(getattr(response, 'usage', None), 'output_tokens', None))
         final_text = _extract_responses_output_text(response)
         _ensure_valid_model_response(final_text)
         result_messages[-1]['content'] = final_text
@@ -1098,6 +1136,7 @@ def _stream_chat_with_responses_api(
     )
 
     content = ''
+    meter = GenerationSpeed()
     try:
         with response_client.responses.stream(**request_kwargs) as stream:
             for event in stream:
@@ -1108,9 +1147,11 @@ def _stream_chat_with_responses_api(
                     continue
                 content += delta
                 result_messages[-1]['content'] = content
+                result_messages.generation_speed = meter.observe(delta)
                 yield result_messages
 
             final_response = stream.get_final_response()
+            result_messages.generation_speed = meter.observe(output_tokens=getattr(getattr(final_response, 'usage', None), 'output_tokens', None))
             final_text = getattr(final_response, 'output_text', '') or content
             _ensure_valid_model_response(final_text)
             result_messages[-1]['content'] = final_text

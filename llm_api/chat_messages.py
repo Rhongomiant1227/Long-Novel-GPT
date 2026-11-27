@@ -35,6 +35,7 @@ class ChatMessages(list):
         super().__init__(*args)
         self.model = kwargs['model'] if 'model' in kwargs else None
         self.finished = False
+        self.generation_speed = None
         
         assert 'currency_symbol' not in kwargs
 
