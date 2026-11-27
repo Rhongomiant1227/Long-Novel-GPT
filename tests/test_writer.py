@@ -79,8 +79,13 @@ def test_update_map(plot, text):
 
 def run_gradio_interface():
     # Load examples from YAML file
-    with open('prompts/text-plot-examples.yaml', 'r', encoding='utf-8') as file:
-        examples_data = yaml.safe_load(file)
+    example_path = os.path.join('prompts', 'text-plot-examples.yaml')
+    if os.path.exists(example_path):
+        with open(example_path, 'r', encoding='utf-8') as file:
+            examples_data = yaml.safe_load(file) or {}
+    else:
+        examples_data = {}
+    examples_data.setdefault('examples', [{'plot': '', 'text': ''}])
     
     # Get the first example
     first_example = examples_data['examples'][0]

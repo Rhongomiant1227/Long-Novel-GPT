@@ -17,7 +17,7 @@ function createNovelSelectPopup() {
         <div class="novel-select-header">
             <div class="header-content">
                 <h3>选择小说</h3>
-                <p class="subtitle">成功从模仿开始，选择一本经典小说来作为模板进行创作！</p>
+                <p class="subtitle">选择本地示例，或导入自己的作品。</p>
             </div>
             <button class="novel-select-close">&times;</button>
         </div>
@@ -96,13 +96,20 @@ export function hideNovelSelect() {
 // Load novels from example_novels directory
 async function loadNovels() {
     try {
-        const novelFiles = ['斗破苍穹.yaml', '凡人修仙传.yaml',];
+        const listing = await fetch('data/example_novels/index.json');
+        const fileNames = listing.ok && !listing.headers.get('content-type')?.includes('text/html')
+            ? await listing.json() : [];
+        const novelFiles = Array.isArray(fileNames) ? fileNames.filter(name =>
+            typeof name === 'string' && name.endsWith('.yaml') && !/[\\/]/.test(name)
+        ) : [];
         
         const novels = await Promise.all(novelFiles.map(async (fileName) => {
             try {
-                const response = await fetch(`data/example_novels/${fileName}`);
+                const response = await fetch(`data/example_novels/${encodeURIComponent(fileName)}`);
+                if (!response.ok) return null;
                 const yamlText = await response.text();
                 const novelData = jsyaml.load(yamlText);
+                if (!novelData?.outline || !novelData?.plot || !novelData?.draft) return null;
                 return {
                     title: fileName.replace('.yaml', ''),
                     data: novelData,
@@ -127,14 +134,19 @@ function displayNovels(novels) {
     if (!novelList) return;
     
     novelList.innerHTML = '';
+    if (!novels.length) {
+        novelList.textContent = '没有本地示例，可直接导入 TXT。';
+        return;
+    }
     
     novels.forEach(novel => {
         const novelItem = document.createElement('div');
         novelItem.className = 'novel-item';
-        novelItem.innerHTML = `
-            <h4>${novel.title}</h4>
-            <p>${novel.description || '暂无简介'}</p>
-        `;
+        const title = document.createElement('h4');
+        title.textContent = novel.title;
+        const description = document.createElement('p');
+        description.textContent = novel.description || '暂无简介';
+        novelItem.append(title, description);
         
         novelItem.addEventListener('click', () => {
             selectNovel(novel);

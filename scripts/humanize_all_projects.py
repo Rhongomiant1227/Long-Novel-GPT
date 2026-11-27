@@ -19,9 +19,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_EXCLUDED = {"lychee_prelude", "inscribed_immortal", "crowd_blackbox"}
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from core.project_overrides import load_project_overrides
+
+_LOCAL_EXCLUSIONS = load_project_overrides().get("humanizer_excluded_projects")
+DEFAULT_EXCLUDED = (
+    {item for item in _LOCAL_EXCLUSIONS if isinstance(item, str)}
+    if isinstance(_LOCAL_EXCLUSIONS, list) else set()
+)
 BOOK_TITLE_RE = re.compile(r"《([^》]+)》")
 
 

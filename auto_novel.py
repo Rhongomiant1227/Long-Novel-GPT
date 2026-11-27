@@ -29,26 +29,34 @@ from core.humanizer import (
 from core.novel_memory_retrieval import NovelMemoryRetrieval
 from core.outline_writer import OutlineWriter
 from core.plot_writer import PlotWriter
+from core.project_overrides import load_project_overrides, override_mapping
+from core.webnovel_craft import (
+    continuity_review_guidance,
+    draft_craft_guidance,
+    outline_craft_guidance,
+    plot_craft_guidance,
+    supported_continuity_alerts,
+)
 from core.writer_utils import KeyPointMsg
 from llm_api import ModelConfig, stream_chat
 from llm_api.chat_messages import ChatMessages
 from split_full_novel import normalize_heading_line, split_full_novel
 
 
+_PROJECT_OVERRIDES = load_project_overrides()
 PROJECT_TEXT_REPLACEMENTS: dict[str, tuple[tuple[str, str], ...]] = {
-    'lychee_prelude': (
-        ('\u82b1\u82bd\u8354\u679d', '\u8354\u679d'),
-        ('\u82b1\u82bd', '\u8354\u679d'),
-    ),
+    project: tuple(
+        (pair[0], pair[1]) for pair in replacements
+        if isinstance(pair, list) and len(pair) == 2
+        and isinstance(pair[0], str) and pair[0] and isinstance(pair[1], str)
+    )
+    for project, replacements in override_mapping(_PROJECT_OVERRIDES.get('text_replacements')).items()
+    if isinstance(replacements, list)
 }
-
 PROJECT_ROLE_ONLY_RULES: dict[str, dict[str, Any]] = {
-    'watcher_origin_short': {
-        'allowed_names': ('神木',),
-        'preserved_labels': ('守夜人',),
-        'role_labels': ('主管', '风控员', '值班同事', '接线员', '求助者', '审计员', '急救员', '男人', '对方'),
-        'fallback_label': '那名同事',
-    },
+    project: value
+    for project, value in override_mapping(_PROJECT_OVERRIDES.get('role_only_rules')).items()
+    if isinstance(value, dict)
 }
 
 
@@ -703,7 +711,7 @@ TITLE_UNIQUE_FALLBACK_PREFIXES = (
 )
 DRAFT_CODE_FENCE_RE = re.compile(r'`{3,}')
 DRAFT_BODY_LABEL_RE = re.compile(r'^\s*[【\[]?(?:正文|小说正文)[】\]]?\s*[:：]?\s*')
-DRAFT_SENTENCE_RE = re.compile(r'[^\n。！？!?；;]+(?:[。！？!?；;]+|$)|\n+')
+DRAFT_SENTENCE_RE = re.compile(r'[^\n。！？!?；;]*[。！？!?；;]+[”’」』）】》]*|[^\n。！？!?；;]+|\n+')
 
 
 def parse_chinese_number_token(text: str) -> int | None:
@@ -1158,7 +1166,7 @@ def collapse_repeated_sentences(text: str, *, min_sentence_len: int = 14, window
             continue
         if unit.startswith('\n'):
             if parts and not parts[-1].endswith('\n'):
-                parts.append('\n')
+                parts.append('\n\n' if len(unit) > 1 else '\n')
             continue
         candidate = unit.strip()
         if not candidate:
@@ -1166,7 +1174,7 @@ def collapse_repeated_sentences(text: str, *, min_sentence_len: int = 14, window
         normalized = normalize_draft_compare_text(candidate)
         if len(normalized) >= min_sentence_len and normalized in recent:
             continue
-        parts.append(candidate)
+        parts.append(unit)
         if len(normalized) >= min_sentence_len:
             recent.append(normalized)
             if len(recent) > window_size:
@@ -2110,12 +2118,9 @@ class AutoNovelRunner:
             lines.append(
                 f'除“{allowed_names}”外，若正文里出现任何其他角色专有姓名，按客观硬伤处理。'
             )
-        if self.project_dir.name == 'watcher_origin_short' or self.project_dir.name.startswith('watcher_origin_short_'):
-            lines.append('正文中必须真实出现一次完整字样“守夜人”，若全文未出现则按客观硬伤处理。')
-            lines.append('“守夜人”必须出现在正文后段的自然叙事句子里，不能只出现在说明、备注或标题中。')
-            lines.append('“守夜人”必须至少有一次出现在带引号的对白中，否则按客观硬伤处理。')
-            lines.append('正文里第一次出现“守夜人”的位置，必须位于全文最后1200字内，否则按客观硬伤处理。')
-            lines.append('从第一次出现“守夜人”的段落开始，到正文结尾，最多只允许保留4个非空段落，否则按客观硬伤处理。')
+            extra_rules = config.get('critic_hard_rules')
+            if isinstance(extra_rules, list):
+                lines.extend(rule.strip() for rule in extra_rules if isinstance(rule, str) and rule.strip())
         if self._draft_heading_mode() == 'title_only':
             book_title = self._project_book_title()
             if book_title:
@@ -3181,6 +3186,8 @@ class AutoNovelRunner:
                 if raw_issue.get('objective', True) is False:
                     continue
                 issue_type = str(raw_issue.get('type', 'objective_logic')).strip() or 'objective_logic'
+                if issue_type in {'cross_chapter', 'continuity_alert'}:
+                    continue
                 severity = str(raw_issue.get('severity', 'medium')).strip().lower()
                 if severity not in {'high', 'medium', 'low'}:
                     severity = 'medium'
@@ -3235,6 +3242,33 @@ class AutoNovelRunner:
                 }
             )
         return operations
+
+    def _continuity_review_sources(self, chapter_number: int) -> dict[str, str]:
+        sources: dict[str, str] = {}
+        brief = read_text(self.brief_path).strip()
+        if brief:
+            sources['brief'] = brief[:1800]
+        remaining = 2
+        for item in reversed(self.state.get('completed_chapters', [])):
+            try:
+                number = int(item.get('chapter_number', 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if not 0 < number < chapter_number or not item.get('draft_file') or f'chapter_{number}' in sources:
+                continue
+            try:
+                draft = read_text(Path(item['draft_file'])).strip()
+            except (OSError, UnicodeError):
+                continue
+            if draft:
+                sources[f'chapter_{number}'] = draft[-1800:]
+                remaining -= 1
+                if not remaining:
+                    break
+        return sources
+
+    def _uses_webnovel_skill(self) -> bool:
+        return not getattr(self.args, 'disable_webnovel_skill', False)
 
     def critic_review_draft(self, chapter: dict, plot_text: str, draft_text: str, pass_index: int = 1) -> dict[str, Any]:
         project_hard_rules = self._project_critic_hard_rules()
@@ -3294,12 +3328,21 @@ class AutoNovelRunner:
 【本章正文】
 {draft_text.strip()}
 """
+        sources = {}
+        if self._uses_webnovel_skill() and pass_index == 1:
+            sources = self._continuity_review_sources(int(chapter['chapter_number']))
+            prompt += continuity_review_guidance(sources)
         payload = self.call_llm_json(
             f'第{chapter["chapter_number"]}章审校第{pass_index}轮',
             prompt,
             self.critic_model,
             system_prompt='你是只抓客观语言逻辑硬伤的严格审校员。',
         )
+        for alert in supported_continuity_alerts(payload.get('continuity_alerts'), sources, draft_text):
+            self.log(
+                f'[第{chapter["chapter_number"]}章跨章提示，仅供复核] {alert["source_id"]}：'
+                f'「{alert["source_excerpt"]}」 / 本章「{alert["draft_excerpt"]}」；{alert["explanation"]}'
+            )
         return self._normalize_critic_report(payload)
 
     def critic_rewrite_draft(
@@ -5309,6 +5352,8 @@ class AutoNovelRunner:
 
 直到第 {chapter_end} 章。
 """
+        if self._uses_webnovel_skill() and not self._is_title_only_story():
+            outline_prompt += f'\n{outline_craft_guidance(next_chapter, chapter_end)}\n'
         project_role_rule = self._project_role_only_rule()
         if project_role_rule:
             outline_prompt += f"\n补充硬规则：\n- {project_role_rule}\n"
@@ -5458,6 +5503,8 @@ class AutoNovelRunner:
 - 目标长度：400~900 字
 {finale_plot_rules}
 """
+        if self._uses_webnovel_skill():
+            prompt += f'\n{plot_craft_guidance()}\n'
         if self._is_title_only_story():
             prompt += """
 
@@ -5589,6 +5636,8 @@ class AutoNovelRunner:
 - 若是最后一段，必须完成主冲突闭环、人物代价和最后一屏；最后一段不要替读者下结论，要收在具体画面、动作或残响上。
 {finale_draft_rules}
 """.strip()
+            if self._uses_webnovel_skill():
+                prompt += f'\n\n{draft_craft_guidance()}\n'
             role_only_rule = self._project_role_only_rule()
             if role_only_rule:
                 prompt += f"\n\n补充硬规则：\n- {role_only_rule}\n"
@@ -5752,6 +5801,8 @@ class AutoNovelRunner:
 - 目标字数：{target_chars} 字左右，至少 {min_chars} 字，建议不超过 {max_chars} 字
 {finale_draft_rules}
 """
+            if self._uses_webnovel_skill():
+                prompt += f'\n{draft_craft_guidance()}\n'
             if self._is_title_only_story():
                 prompt += """
 
@@ -6777,6 +6828,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--disable-memory-retrieval', action='store_true')
     parser.add_argument('--memory-retrieval-hits', type=int, default=4)
     parser.add_argument('--memory-retrieval-max-chars', type=int, default=1200)
+    parser.add_argument('--disable-webnovel-skill', action='store_true')
     parser.add_argument('--planner-reasoning-effort', default='high')
     parser.add_argument('--writer-reasoning-effort', default='high')
     parser.add_argument('--sub-reasoning-effort', default='medium')

@@ -1,0 +1,20 @@
+{
+  "taskSchedule": {
+    "taskName": "LongNovelFanqieDailyUpload",
+    "startTime": "01:00",
+    "days": ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+  },
+  "authorCheckIn": {
+    "enabled": false,
+    "runAfterUpload": false
+  },
+  "defaults": {
+    "publishTime": "01:00",
+    "publishWindowMinutes": 0,
+    "chaptersPerRun": 3,
+    "headless": true,
+    "aiUsage": "yes",
+    "seedProfileDir": ".run/fanqie_writer_seed_profile"
+  },
+  "jobs": []
+}

@@ -37,6 +37,20 @@
 - `state.json`
 - 已生成的单章 `outline.md` / `plot.md` / `draft.md` / `summary.md`
 
+## 写作 Skill
+
+自动长篇默认启用 [webnovel-writing](skills/webnovel-writing/SKILL.md)：规划时检查开篇兑现和待回收伏笔，写作时检查场景推进、对白筹码和既有规则。原有审稿的第一轮加入 `brief` 和最近两章的原文片段；跨章提示要有可回查的两侧引文，只记日志，不进入自动修订项。Humanizer 仍是独立的可选语言润色环节。
+
+CLI 和可见守护进程均支持 `--disable-webnovel-skill`，用于同模型、同剧情的对照。对照时使用两个新项目目录，避免复用缓存稿。
+
+## 本地数据
+
+作品目录、单本启停脚本、导入快照与实际 `fanqie_daily_jobs.json` 不随仓库发布。上传调度可参考没有启用任何任务的 `fanqie_daily_jobs.example.json`。
+
+项目专用覆盖项放在 `.run/project_overrides.json`，或用 `LONG_NOVEL_PROJECT_OVERRIDES` 指定文件。支持 `text_replacements`、`role_only_rules` 和 `humanizer_excluded_projects`。兼容模型使用环境变量 `LOCAL_BASE_URL`、`LOCAL_API_KEY`、`LOCAL_AVAILABLE_MODELS`，无需在源码里放端点或密钥。
+
+部分本地兼容端点会将思考 token 计入输出额度。确认端点支持 `chat_template_kwargs` 后，可显式设置 `LOCAL_ENABLE_THINKING=false`；留空则不改变服务端默认行为。
+
 ## 当前默认参数
 
 - 目标字数：`2000000`

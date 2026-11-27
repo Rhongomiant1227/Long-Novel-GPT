@@ -380,6 +380,9 @@ API_SETTINGS = {
     'local': {
         'base_url': os.getenv('LOCAL_BASE_URL', ''),
         'api_key': os.getenv('LOCAL_API_KEY', ''),
+        'enable_thinking': {'true': True, 'false': False}.get(
+            os.getenv('LOCAL_ENABLE_THINKING', '').strip().lower()
+        ),
         'available_models': os.getenv('LOCAL_AVAILABLE_MODELS', '').split(','),
         **_default_token_limits('local', os.getenv('LOCAL_AVAILABLE_MODELS', '').split(',')),
     }

@@ -14,10 +14,10 @@ function printHelp() {
 
 Usage:
   node scripts/fanqie_export_remote_chapters.mjs \
-    --project lychee_prelude \
-    --book-title "她还不会爱人" \
-    --from 240 \
-    --to 272
+    --project local-project-id \
+    --book-title "Book title" \
+    --from 1 \
+    --to 10
 
 Options:
   --project <name>          Project identifier, required

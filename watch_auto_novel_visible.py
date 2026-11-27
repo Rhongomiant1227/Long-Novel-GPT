@@ -288,6 +288,8 @@ def build_child_command(args: argparse.Namespace) -> list[str]:
         command.extend(['--max-chapters', str(args.max_chapters)])
     if args.title_only_story:
         command.append('--title-only-story')
+    if getattr(args, 'disable_webnovel_skill', False):
+        command.append('--disable-webnovel-skill')
     return command
 
 
@@ -516,6 +518,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--retry-backoff-seconds', type=int, default=3600)
     parser.add_argument('--max-chapters', type=int, default=0)
     parser.add_argument('--title-only-story', action='store_true')
+    parser.add_argument('--disable-webnovel-skill', action='store_true')
     parser.add_argument('--stall-timeout-seconds', type=int, default=600)
     parser.add_argument('--restart-delay-seconds', type=int, default=3600)
     parser.add_argument('--heartbeat-interval-seconds', type=int, default=30)

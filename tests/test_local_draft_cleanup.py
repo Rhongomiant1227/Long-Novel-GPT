@@ -53,6 +53,13 @@ class LocalDraftCleanupTest(unittest.TestCase):
         self.assertNotIn("【正文】", cleaned)
         self.assertIn("陆关抬眼看向深网神龛。", cleaned)
 
+    def test_normalization_preserves_dialogue_closers_and_sentence_fragments(self):
+        body = "“稍等。”他说，“半炷香就好。”\n门缝的灯\n\n她不说话，只把铜扣放在桌上"
+        self.assertEqual(
+            normalize_chapter_draft_text(3, "灯下问路", body),
+            f"第3章 灯下问路\n\n{body}",
+        )
+
     def test_split_text_into_chunks_hard_splits_long_unpunctuated_text(self):
         text = "甲" * 120
         chunks = split_text_into_chunks(

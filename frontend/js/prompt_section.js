@@ -28,6 +28,11 @@ function updateTextArea(content) {
 async function loadExamples() {
     try {
         const response = await fetch('data/examples.yaml');
+        if (response.status === 404 || response.headers.get('content-type')?.includes('text/html')) {
+            examples = {};
+            return;
+        }
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const yamlText = await response.text();
         examples = jsyaml.load(yamlText);
     } catch (error) {

@@ -128,6 +128,7 @@ def stream_chat(model_config: ModelConfig, messages: list, response_json=False) 
             api_chain_rate_limit_retries=model_config.get("api_chain_rate_limit_retries"),
             proxies=model_config.get("proxies"),
             reasoning_effort=model_config.get("reasoning_effort"),
+            enable_thinking=model_config.get("enable_thinking"),
             temperature=model_config.get("temperature"),
             top_p=model_config.get("top_p"),
             timeout=model_config.get("timeout"),

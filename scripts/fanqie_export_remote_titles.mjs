@@ -13,10 +13,7 @@ function printHelp() {
   console.log(`Export remote Fanqie chapter titles.
 
 Usage:
-  node scripts/fanqie_export_remote_titles.mjs \\
-    --book "lychee_prelude|她还不会爱人" \\
-    --book "inscribed_immortal|删史成仙" \\
-    --book "crowd_blackbox|众生黑匣"
+  node scripts/fanqie_export_remote_titles.mjs --book "project-id|Book title"
 
 Options:
   --book <project|title>    Repeatable. Format: project|bookTitle

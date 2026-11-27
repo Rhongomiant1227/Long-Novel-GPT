@@ -35,7 +35,7 @@ function 打印帮助() {
   console.log(`番茄小说章节上传脚本
 
 用法:
-  node scripts/fanqie_upload.mjs --book-title 删史成仙 --chapters-dir D:\\Long-Novel-GPT\\auto_projects\\inscribed_immortal\\manuscript\\chapters_txt --from 8
+  node scripts/fanqie_upload.mjs --book-title "Book title" --chapters-dir "path/to/chapters_txt" --from 1
 
 常用参数:
   --book-title <title>      作品名，必填

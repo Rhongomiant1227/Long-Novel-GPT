@@ -692,7 +692,10 @@ def _prepare_responses_input(messages):
     return '\n\n'.join(instructions).strip(), input_items
 
 
-def _build_request_kwargs(messages, model, max_output_tokens, n, response_json, reasoning_effort, temperature, top_p, stream):
+def _build_request_kwargs(
+    messages, model, max_output_tokens, n, response_json, reasoning_effort,
+    temperature, top_p, stream, enable_thinking=None,
+):
     request_kwargs = {
         'model': model,
         'messages': messages,
@@ -704,7 +707,10 @@ def _build_request_kwargs(messages, model, max_output_tokens, n, response_json, 
     if response_json:
         request_kwargs['response_format'] = {'type': 'json_object'}
 
-    if reasoning_effort:
+    if enable_thinking is not None:
+        request_kwargs['extra_body'] = {'chat_template_kwargs': {'enable_thinking': enable_thinking}}
+
+    if reasoning_effort and enable_thinking is not False:
         request_kwargs['reasoning_effort'] = reasoning_effort
 
     if temperature not in (None, ''):
@@ -898,6 +904,7 @@ def _create_with_chat_completions_api(
     max_retries,
     response_json=False,
     n=1,
+    enable_thinking=None,
 ):
     request_kwargs = _build_request_kwargs(
         request_messages,
@@ -909,6 +916,7 @@ def _create_with_chat_completions_api(
         temperature,
         top_p,
         False,
+        enable_thinking=enable_thinking,
     )
 
     completion_client = _build_openai_client(
@@ -956,6 +964,7 @@ def _stream_chat_with_chat_completions_api(
     top_p,
     timeout,
     max_retries,
+    enable_thinking=None,
 ):
     request_kwargs = _build_request_kwargs(
         request_messages,
@@ -967,6 +976,7 @@ def _stream_chat_with_chat_completions_api(
         temperature,
         top_p,
         True,
+        enable_thinking=enable_thinking,
     )
 
     stream_client = _build_openai_client(
@@ -1026,6 +1036,7 @@ def _stream_chat_with_chat_completions_api(
             max_retries=max_retries,
             response_json=response_json,
             n=n,
+            enable_thinking=enable_thinking,
         )
         return result_messages
     finally:
@@ -1209,6 +1220,7 @@ def _stream_chat_with_gpt_single_endpoint(
     top_p=None,
     timeout=None,
     max_retries=None,
+    enable_thinking=None,
 ):
     output_token_limit = int(max_output_tokens or max_tokens)
     request_messages = _prepare_request_messages(messages, model)
@@ -1221,7 +1233,7 @@ def _stream_chat_with_gpt_single_endpoint(
     )
     yield result_messages
 
-    if _should_use_responses_api(model, response_json, n, base_url=base_url):
+    if enable_thinking is None and _should_use_responses_api(model, response_json, n, base_url=base_url):
         if _should_bypass_responses_stream(reasoning_effort, output_token_limit):
             yield from _create_with_responses_api(
                 request_messages=request_messages,
@@ -1269,6 +1281,7 @@ def _stream_chat_with_gpt_single_endpoint(
         top_p=top_p,
         timeout=timeout,
         max_retries=max_retries,
+        enable_thinking=enable_thinking,
     )
     return result_messages
 
@@ -1289,6 +1302,7 @@ def _stream_chat_with_gpt_via_api_chain(
     top_p=None,
     timeout=None,
     max_retries=None,
+    enable_thinking=None,
 ):
     normalized_chain = _normalize_api_chain(api_chain)
     if not normalized_chain:
@@ -1358,6 +1372,7 @@ def _stream_chat_with_gpt_via_api_chain(
                     top_p=top_p,
                     timeout=timeout,
                     max_retries=effective_max_retries,
+                    enable_thinking=enable_thinking,
                 )
                 _clear_api_chain_endpoint_cooldown(
                     chain_signature,
@@ -1439,6 +1454,7 @@ def stream_chat_with_gpt(
     top_p=None,
     timeout=None,
     max_retries=None,
+    enable_thinking=None,
 ):
     normalized_chain = _normalize_api_chain(api_chain, api_key=api_key, base_url=base_url, proxies=proxies)
     if normalized_chain and api_chain is not None:
@@ -1458,6 +1474,7 @@ def stream_chat_with_gpt(
             top_p=top_p,
             timeout=timeout,
             max_retries=max_retries,
+            enable_thinking=enable_thinking,
         )
         return result
 
@@ -1484,6 +1501,7 @@ def stream_chat_with_gpt(
             top_p=top_p,
             timeout=timeout,
             max_retries=max_retries,
+            enable_thinking=enable_thinking,
         )
         _apply_api_chain_metadata(
             result,
